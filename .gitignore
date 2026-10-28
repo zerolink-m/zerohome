@@ -235,3 +235,6 @@ motion_files/
 
 # Motion Detection Model
 yolov8n.pt
+
+# Backup files
+*.bak
