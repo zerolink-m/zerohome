@@ -116,6 +116,9 @@ class Settings(BaseSettings):
     # --- logging ---
     LOGGING_LEVEL: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
     LOGGING_SCOPE: str = "general"  # general, motion_detection
+    # One INFO line per motion-detection inference (1/s per camera): every YOLO detection before
+    # filtering and why it was dropped / whether an event was created. Off by default.
+    MOTION_DEBUG_LOG: bool = False
 
     @property
     def database_url(self) -> str:

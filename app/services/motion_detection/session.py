@@ -62,6 +62,20 @@ def _hub_decoder_args() -> list[str]:
     ]
 
 
+def _trace_box(results, box, cls: int, conf: float, fate: str, obj_size: float | None = None) -> str:
+    """One raw YOLO detection for the MOTION_DEBUG_LOG line (only called when it is on)."""
+    names = getattr(results, "names", None)
+    name = names.get(cls) if isinstance(names, dict) else None
+    name = YOLO_CLASSES.get(cls) or name or f"cls{cls}"
+    try:
+        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].cpu().numpy())
+        where = f" bbox=({x1},{y1},{x2 - x1},{y2 - y1})"
+    except Exception:
+        where = ""
+    size = f" size={obj_size:.4f}" if obj_size is not None else ""
+    return f"{name}(id={cls}) conf={conf:.2f}{where}{size} {fate}"
+
+
 class MotionDetectionSession:
     """Motion detection session for a camera.
 
@@ -428,10 +442,21 @@ class MotionDetectionSession:
         the event time are not skewed by delivery."""
         if frame_ts is None:
             frame_ts = time.time()
+        # MOTION_DEBUG_LOG: one INFO line per inference (see _log_frame_debug); nothing is
+        # collected or formatted when the switch is off.
+        trace: list | None = [] if settings.MOTION_DEBUG_LOG else None
+        verdict: list[str] = ["no_event: error"]
+        infer_ms = 0.0
+        events = 0
+        results = None
         try:
             # Run YOLO detection
             logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Running YOLO inference...")
+            if trace is not None:
+                _t0 = time.perf_counter()
             results = model(frame, verbose=False)[0]
+            if trace is not None:
+                infer_ms = (time.perf_counter() - _t0) * 1000
 
             # Extract detections
             detections = []
@@ -444,6 +469,8 @@ class MotionDetectionSession:
 
                 # Check if it's a class we care about
                 if cls not in YOLO_CLASSES:
+                    if trace is not None:
+                        trace.append(_trace_box(results, box, cls, conf, "dropped: class not in monitored list"))
                     logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Skipping class_id={cls} (not in monitored classes)")
                     continue
 
@@ -451,6 +478,8 @@ class MotionDetectionSession:
 
                 # Check if user wants this type
                 if not self._should_detect_type(object_type):
+                    if trace is not None:
+                        trace.append(_trace_box(results, box, cls, conf, "dropped: type disabled in user settings"))
                     logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Skipping {object_type} (user settings disabled)")
                     continue
 
@@ -468,17 +497,25 @@ class MotionDetectionSession:
                 min_size = self._get_min_object_size()
 
                 if conf < min_confidence:
+                    if trace is not None:
+                        trace.append(_trace_box(results, box, cls, conf, f"dropped: conf<{min_confidence:.2f}", obj_size))
                     logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: {object_type} filtered (conf={conf:.2f} < {min_confidence:.2f})")
                     continue
 
                 if obj_size < min_size:
+                    if trace is not None:
+                        trace.append(_trace_box(results, box, cls, conf, f"dropped: size<{min_size:.4f}", obj_size))
                     logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: {object_type} filtered (size={obj_size:.4f} < {min_size:.4f})")
                     continue
 
                 logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Detected {object_type} conf={conf:.2f} size={obj_size:.4f} bbox=({x},{y},{w},{h})")
                 detections.append((object_type, (x, y, w, h), conf, obj_size))
+                if trace is not None:
+                    trace.append(_trace_box(results, box, cls, conf, "passed filters", obj_size))
 
             if not detections:
+                verdict[0] = ("no_event: yolo found nothing" if not raw_detections_count
+                              else "no_event: all detections dropped by filters")
                 logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: No valid detections after filtering")
                 return
 
@@ -491,6 +528,8 @@ class MotionDetectionSession:
             # Get moving objects
             moving_objects = self.tracker.get_moving_objects(min_tracking_time=0.5, now=frame_ts)
             logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Tracker reports {len(moving_objects)} moving objects")
+            verdict[0] = ("no_event: tracker - no moving object (needs tracked >=0.5s and >50px x-shift "
+                          "between first and last bbox)")
 
             # Process each moving object
             for tracked_obj in moving_objects:
@@ -499,6 +538,7 @@ class MotionDetectionSession:
                 # Check cooldown
                 if not self._check_cooldown(tracked_obj.object_type, frame_ts):
                     logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: {tracked_obj.object_type} in cooldown, skipping notification")
+                    verdict[0] = f"no_event: cooldown ({tracked_obj.object_type})"
                     continue
 
                 # Get latest bbox and confidence
@@ -534,9 +574,29 @@ class MotionDetectionSession:
                     license_plate,
                     frame_ts,
                 )
+                events += 1  # the save was attempted (a DB/disk failure is logged by _save_and_notify)
+                verdict[0] = ""
 
         except Exception as exc:
+            verdict[0] = f"no_event: error {exc!r}"
             logger.error(f"[Cam {self.cam.id}] Frame #{frame_count}: Processing error: {exc}", exc_info=True)
+        finally:
+            if trace is not None:
+                self._log_frame_debug(frame, frame_count, infer_ms, trace, verdict[0], events)
+
+    def _log_frame_debug(self, frame, frame_count: int, infer_ms: float, trace: list, verdict: str,
+                         events: int) -> None:
+        """MOTION_DEBUG_LOG: what YOLO said for this frame (before filtering) and what became of it."""
+        try:
+            h, w = frame.shape[:2]
+            dets = "; ".join(trace) if trace else ""
+            result = verdict or "event"
+            logger.info(f"[Cam {self.cam.id}] Frame #{frame_count} yolo {w}x{h} infer_ms={infer_ms:.0f} "
+                        f"detections={len(trace)}" + (f" [{dets}]" if dets else "")
+                        + f" -> {result} events={events}"
+                        f" (min_conf={self._get_min_confidence():.2f} min_size={self._get_min_object_size():.4f})")
+        except Exception:
+            logger.exception(f"[Cam {self.cam.id}] debug log failed")
 
     def _should_detect_type(self, object_type: str) -> bool:
         """Check if any user wants to detect this object type."""
