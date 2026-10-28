@@ -158,6 +158,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+venv_old_*
 
 # Spyder project settings
 .spyderproject
@@ -218,3 +219,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude
+.claude/
+
+# PyTest
+.pytest_cache/
+
+# Markdowns
+NOTES.md
+
+# Storage dirs
+caching/
+motion_files/
+
+# Motion Detection Model
+yolov8n.pt
