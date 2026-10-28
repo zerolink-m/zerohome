@@ -16,6 +16,11 @@ class TrackedObject:
     positions: list[Tuple[int, int, int, int]]  # (x, y, w, h) history
     confidences: list[float]
 
+    @property
+    def age(self) -> float:
+        """Track lifetime in seconds (last_seen - first_seen)."""
+        return self.last_seen - self.first_seen
+
     def is_moving(self, movement_threshold: float = 50.0) -> bool:
         """Check if object has moved significantly."""
         if len(self.positions) < 2:
