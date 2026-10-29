@@ -51,10 +51,10 @@ async def webrtc_stream(
 
     # Auth + camera access: same rules as stream/ptz (owner/admin/invited, or a
     # matching 'stream' share token) via the shared helpers.
-    from app.deps.auth import _extract_token, authorize_device_token
+    from app.deps.auth import extract_token_flexible, authorize_device_token
 
     try:
-        raw = _extract_token(None, token)
+        raw = extract_token_flexible(None, token)
         ctx = await authorize_device_token(raw, "cams", "stream", id, db)
         cam = await _get_cam_for_access(id, ctx, db)
     except AppError as e:

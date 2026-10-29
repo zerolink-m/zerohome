@@ -37,7 +37,7 @@ def get_bearer_token_or_query(
 ) -> str:
     """Same as get_bearer_token, but also accepts ?token= — for endpoints embedded
 directly into <video>/<img> src, where an Authorization header can't be set."""
-    return _extract_token(authorization, token)
+    return extract_token_flexible(authorization, token)
 
 
 def _extract_token(authorization: str | None, token: str | None) -> str:
@@ -174,9 +174,7 @@ where the share meaningfully grants active control of one device:
         token: str | None = Query(None),
         db: AsyncSession = Depends(get_db),
     ) -> AccessContext:
-        # Декодируем дефисы из query-токена (если есть)
-        decoded = _decode_dashed(token) if token else None
-        raw = _extract_token(authorization, decoded)
+        raw = extract_token_flexible(authorization, token)
         return await authorize_device_token(raw, device_type, share_type, id, db)
 
     return _resolve
@@ -211,6 +209,43 @@ inserting a separator every 10 characters keeps every run under that limit."""
     return "".join(out)
 
 
+def _query_token_candidates(token: str) -> list[str]:
+    """Variants of a ?token= value, in the order they are tried: as-is first (a plain
+token; base64url JWTs may contain a literal '-', so it must not be stripped blindly),
+then the de-dashed form. Deduplicated; the last one is the 'dashed' reading."""
+    decoded = _decode_dashed(token)
+    return [token, decoded] if decoded != token else [token]
+
+
+def _is_verifiable_token(candidate: str) -> bool:
+    if _try_decode_any(candidate) is not None:
+        return True
+    try:
+        decode_share_token(candidate)
+        return True
+    except AppError:
+        return False
+
+
+def extract_token_flexible(authorization: str | None, token: str | None) -> str:
+    """Like _extract_token, but a ?token= value may be plain OR dash-encoded (see
+_decode_dashed). A valid Authorization header always wins and is never altered. For
+the query value, each variant is checked against the real signature/expiry
+verification, so nothing is weakened; if none verifies, the de-dashed reading is
+returned, so downstream produces the same error as before."""
+    if authorization and authorization.startswith("Bearer "):
+        candidate = authorization[len("Bearer "):].strip()
+        if candidate:
+            return candidate
+    if not token:
+        raise AppError(TOKEN_MISSING, "Токен отсутствует", error_headers=_AUTH_HDR)
+    candidates = _query_token_candidates(token)
+    for c in candidates:
+        if len(candidates) == 1 or _is_verifiable_token(c):
+            return c
+    return candidates[-1]
+
+
 async def resolve_record_access(
     id: int,
     recording_id: str,
@@ -223,8 +258,7 @@ cam+filename (grants that one recording's file/snapshot/meta only). The token tr
 as ?token= (query, not a path segment) with a '-' inserted every 10 characters by the
 client to dodge the CDN/WAF's long-alphanumeric-run filter — see _decode_dashed.
 Authorization header still works too, is not dash-encoded, and takes priority."""
-    decoded = _decode_dashed(token) if token else None
-    raw = _extract_token(authorization, decoded)
+    raw = extract_token_flexible(authorization, token)
 
     payload = _try_decode_any(raw)
     if payload is not None and payload.kind in ("access", "access-admin"):
