@@ -23,11 +23,19 @@ def spawn(url=URL, tag=None, binary=FAKE, extra_env=None):
         [binary, "-i", url, "pipe:1"], env=env, start_new_session=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    for _ in range(200):  # wait for exec of the script (cmdline shows the script)
+    # The script starts through `#!/usr/bin/env python3`: until env has exec'd python,
+    # cmdline is [env, python3, script, ...] (it already contains the script path), after
+    # it [python3, script, ...]. Wait for the final form so cmdline reads are stable.
+    cmd = []
+    for _ in range(500):  # up to ~5 s on a slow CI machine
         cmd = ow.read_cmdline(proc.pid) or []
-        if any(FAKE == a for a in cmd):
+        if cmd and os.path.basename(cmd[0]) != "env" and any(binary == a for a in cmd):
             break
         time.sleep(0.01)
+    else:
+        proc.kill()
+        proc.wait()
+        pytest.fail(f"spawned process did not finish exec within 5 s, cmdline={cmd!r}")
     return proc
 
 
