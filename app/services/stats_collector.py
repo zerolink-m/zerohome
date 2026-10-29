@@ -196,6 +196,39 @@ def get_performance_stats() -> dict:
     }
 
 
+def get_ingest_stats() -> dict | None:
+    """Per-camera ingest hub state keyed by cam id, or None when ingest is off/not started.
+    Only whitelisted scalar fields are exposed: never URLs or credentials."""
+    from app.core.config import settings
+    from app.services.ingest import lifecycle
+    import re
+
+    if not settings.INGEST_ENABLED:
+        return None
+    try:
+        supervisor = lifecycle.peek_supervisor()
+        if supervisor is None:
+            return None
+        out: dict = {}
+        for cam_id, st in supervisor.get_status().items():
+            err = st.get("last_error")
+            out[str(cam_id)] = {
+                "running": bool(st.get("running")),
+                "state": st.get("state") or "offline",
+                "last_error": re.sub(r"(?i)\b[a-z][a-z0-9+.-]*://\S+", "<url>", str(err)) if err else None,
+                "restarts": int(st.get("restarts") or 0),
+                "seconds_since_data": st.get("last_data_age"),
+                "uptime_seconds": st.get("uptime"),
+                "consumers": int(st.get("subscribers") or 0),
+                "has_init": bool(st.get("has_init")),
+                "has_gop": bool(st.get("gop_fragments")),
+            }
+        return out
+    except Exception:
+        logger.exception("stats: cannot read ingest status")
+        return None
+
+
 async def get_camera_stats(db: AsyncSession) -> dict:
     """Get camera statistics from database"""
     total_cams = await db.scalar(select(func.count(Cam.id)))
@@ -211,6 +244,7 @@ async def get_camera_stats(db: AsyncSession) -> dict:
         "onvif_enabled": onvif_cams or 0,
         "ptz_enabled": ptz_cams or 0,
         "recording_enabled": recording_cams or 0,
+        "ingest": get_ingest_stats(),
     }
 
 

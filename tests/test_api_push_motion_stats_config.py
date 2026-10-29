@@ -179,6 +179,76 @@ async def test_stats_all_and_bad_period(client, setup, monkeypatch):
     assert r.status_code == 400 and "period" in r.json()["error"]["query"]
 
 
+class _StubSupervisor:
+    def __init__(self, status):
+        self._status = status
+
+    def get_status(self):
+        return self._status
+
+
+_OLD_CAM_KEYS = {"total", "enabled", "disabled", "onvif_enabled", "ptz_enabled", "recording_enabled"}
+_INGEST_KEYS = {"running", "state", "last_error", "restarts", "seconds_since_data",
+                "uptime_seconds", "consumers", "has_init", "has_gop"}
+
+
+async def test_stats_cameras_ingest_block(client, setup, monkeypatch):
+    from app.core.config import settings
+    from app.services.ingest import lifecycle
+    _, _, admin, cam = setup
+    secret = "rtsp://admin:S3cretPw@10.0.0.5:554/Streaming/1"
+    status = {
+        cam: {
+            "state": "online", "subscribers": 2, "last_data_age": 0.5, "restarts": 3,
+            "last_error": f"ffmpeg exited: Error opening {secret}", "bytes_in": 10,
+            "has_init": True, "gop_fragments": 4, "gop_bytes": 99,
+            "running": True, "pid": 4242, "uptime": 12.5, "next_planned_restart_in": 100.0,
+        },
+        999: {"state": "offline", "subscribers": 0, "last_data_age": None, "restarts": 0,
+              "last_error": None, "has_init": False, "gop_fragments": 0, "running": False,
+              "pid": None, "uptime": None},
+    }
+    monkeypatch.setattr(settings, "INGEST_ENABLED", True)
+    monkeypatch.setattr(lifecycle, "_supervisor", _StubSupervisor(status))
+    r = await client.get("/v1/stats/cameras", headers=bearer(tok(admin, "admin")))
+    assert r.json()["code"] == "000"
+    cams = r.json()["data"]["cameras"]
+    assert _OLD_CAM_KEYS <= set(cams) and cams["total"] == 1
+    ing = cams["ingest"]
+    assert set(ing) == {str(cam), "999"}
+    one = ing[str(cam)]
+    assert set(one) == _INGEST_KEYS
+    assert one["last_error"] == "ffmpeg exited: Error opening <url>"
+    assert one["running"] is True and one["state"] == "online" and one["restarts"] == 3
+    assert one["seconds_since_data"] == 0.5 and one["uptime_seconds"] == 12.5
+    assert one["consumers"] == 2 and one["has_init"] is True and one["has_gop"] is True
+    idle = ing["999"]
+    assert idle["seconds_since_data"] is None and idle["uptime_seconds"] is None
+    assert idle["last_error"] is None and idle["has_gop"] is False and idle["running"] is False
+    body = r.text
+    for leak in ("S3cretPw", "admin:", "rtsp://", "4242", "10.0.0.5"):
+        assert leak not in body
+
+
+async def test_stats_cameras_ingest_disabled(client, setup, monkeypatch):
+    from app.core.config import settings
+    from app.services.ingest import lifecycle
+    _, _, admin, _ = setup
+    monkeypatch.setattr(settings, "INGEST_ENABLED", False)
+    monkeypatch.setattr(lifecycle, "_supervisor", _StubSupervisor({1: {"state": "online"}}))
+    r = await client.get("/v1/stats/cameras", headers=bearer(tok(admin, "admin")))
+    cams = r.json()["data"]["cameras"]
+    assert cams["ingest"] is None
+    assert cams == {"total": 1, "enabled": cams["enabled"], "disabled": cams["disabled"],
+                    "onvif_enabled": 0, "ptz_enabled": 0, "recording_enabled": cams["recording_enabled"],
+                    "ingest": None}
+    # enabled but supervisor never started
+    monkeypatch.setattr(settings, "INGEST_ENABLED", True)
+    monkeypatch.setattr(lifecycle, "_supervisor", None)
+    r = await client.get("/v1/stats/cameras", headers=bearer(tok(admin, "admin")))
+    assert r.json()["data"]["cameras"]["ingest"] is None
+
+
 # ---------------- config ----------------
 @pytest.fixture
 def fv(tmp_path, monkeypatch):

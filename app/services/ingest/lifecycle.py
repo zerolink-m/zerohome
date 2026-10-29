@@ -31,6 +31,11 @@ def get_supervisor() -> IngestSupervisor:
     return _supervisor
 
 
+def peek_supervisor() -> IngestSupervisor | None:
+    """The singleton if it exists; never creates one."""
+    return _supervisor
+
+
 def reset_supervisor() -> None:
     """Forgets the singleton (tests)."""
     global _supervisor

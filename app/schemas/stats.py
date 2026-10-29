@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -18,6 +18,18 @@ class StreamStats(BaseModel):
     total_clients: int
 
 
+class IngestCamStats(BaseModel):
+    running: bool
+    state: str
+    last_error: Optional[str] = None
+    restarts: int
+    seconds_since_data: Optional[float] = None
+    uptime_seconds: Optional[float] = None
+    consumers: int
+    has_init: bool
+    has_gop: bool
+
+
 class CameraStats(BaseModel):
     total: int
     enabled: int
@@ -25,6 +37,8 @@ class CameraStats(BaseModel):
     onvif_enabled: int
     ptz_enabled: int
     recording_enabled: int
+    # per-camera persistent ingest hub state keyed by cam id; null when ingest is disabled
+    ingest: Optional[Dict[str, IngestCamStats]] = None
 
 
 class RecordingStats(BaseModel):
