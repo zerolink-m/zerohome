@@ -528,7 +528,7 @@ class MotionDetectionSession:
             # Get moving objects
             moving_objects = self.tracker.get_moving_objects(min_tracking_time=0.5, now=frame_ts)
             logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Tracker reports {len(moving_objects)} moving objects")
-            verdict[0] = ("no_event: tracker - no moving object (needs tracked >=0.5s and >50px x-shift "
+            verdict[0] = ("no_event: tracker - no moving object (needs tracked >=0.5s and >50px x/y shift "
                           "between first and last bbox)")
 
             # Process each moving object

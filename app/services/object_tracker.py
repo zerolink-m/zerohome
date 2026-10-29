@@ -22,7 +22,7 @@ class TrackedObject:
         return self.last_seen - self.first_seen
 
     def is_moving(self, movement_threshold: float = 50.0) -> bool:
-        """Check if object has moved significantly."""
+        """Check if object has moved significantly (Euclidean x/y shift between first and last bbox)."""
         if len(self.positions) < 2:
             return False
 
@@ -30,7 +30,7 @@ class TrackedObject:
         first_x, first_y, _, _ = self.positions[0]
         last_x, last_y, _, _ = self.positions[-1]
 
-        distance = ((last_x - first_x) ** 2 + (last_y - last_y) ** 2) ** 0.5
+        distance = ((last_x - first_x) ** 2 + (last_y - first_y) ** 2) ** 0.5
         return distance > movement_threshold
 
     def get_average_confidence(self) -> float:
