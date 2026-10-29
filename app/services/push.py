@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import httpx
 from sqlalchemy import func, select
@@ -16,10 +17,28 @@ from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
+# httpx logs every request URL at INFO, and the Telegram URL contains the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 _SEND_TIMEOUT_SECONDS = 5.0
+_PHOTO_TIMEOUT_SECONDS = 20.0
+_CAPTION_LIMIT = 1024
 
 
-async def _send_telegram(bot_token, telegram_id, message) -> None:
+def _mask(text, bot_token) -> str:
+    """Strip the bot token from any text that may end up in logs."""
+    text = str(text)
+    if bot_token:
+        text = text.replace(str(bot_token), "***")
+    return text
+
+
+def _read_file(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+async def _send_text(bot_token, telegram_id, message) -> None:
     url = f"{settings.TELEGRAM_API_BASE}/bot{bot_token}/sendMessage"
     try:
         async with httpx.AsyncClient(timeout=_SEND_TIMEOUT_SECONDS) as client:
@@ -31,24 +50,63 @@ async def _send_telegram(bot_token, telegram_id, message) -> None:
             logger.warning(
                 "telegram push failed: status=%s body=%s",
                 resp.status_code,
-                resp.text[:200],
+                _mask(resp.text[:200], bot_token),
             )
-    except httpx.HTTPError as exc:
-        logger.warning("telegram push failed: %s", exc)
+    except Exception as exc:
+        logger.warning("telegram push failed: %s", _mask(exc, bot_token))
 
 
-async def notify_user(user, message):
+async def _send_photo(bot_token, telegram_id, message, photo_path) -> bool:
+    """Returns True if the photo was delivered; False means caller should fall back to text."""
+    try:
+        if not os.path.isfile(photo_path):
+            logger.warning("telegram sendPhoto skipped: file not found")
+            return False
+        data = await asyncio.to_thread(_read_file, photo_path)
+        url = f"{settings.TELEGRAM_API_BASE}/bot{bot_token}/sendPhoto"
+        async with httpx.AsyncClient(timeout=_PHOTO_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                url,
+                data={"chat_id": str(telegram_id), "caption": message[:_CAPTION_LIMIT]},
+                files={"photo": (os.path.basename(photo_path), data, "image/jpeg")},
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "telegram sendPhoto failed: status=%s body=%s",
+                resp.status_code,
+                _mask(resp.text[:200], bot_token),
+            )
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("telegram sendPhoto failed: %s", _mask(exc, bot_token))
+        return False
+
+
+async def _send_telegram(bot_token, telegram_id, message, photo_path: str | None = None) -> None:
+    try:
+        if photo_path and await _send_photo(bot_token, telegram_id, message, photo_path):
+            return
+        await _send_text(bot_token, telegram_id, message)
+    except Exception as exc:
+        logger.warning("telegram push failed: %s", _mask(exc, bot_token))
+
+
+async def notify_user(user, message, photo_path: str | None = None):
     """Best-effort push delivery — never raises, never blocks the caller's transaction."""
-    if user.push == "telegram":
-        meta = user.pushmeta if isinstance(user.pushmeta, dict) else {}
-        telegram = meta.get("telegram") if isinstance(meta.get("telegram"), dict) else None
-        if not telegram:
-            return
-        bot_token = telegram.get("bot_token")
-        telegram_id = telegram.get("telegram_id")
-        if not bot_token or not isinstance(telegram_id, int):
-            return
-        await _send_telegram(bot_token, telegram_id, message)
+    try:
+        if user.push == "telegram":
+            meta = user.pushmeta if isinstance(user.pushmeta, dict) else {}
+            telegram = meta.get("telegram") if isinstance(meta.get("telegram"), dict) else None
+            if not telegram:
+                return
+            bot_token = telegram.get("bot_token")
+            telegram_id = telegram.get("telegram_id")
+            if not bot_token or not isinstance(telegram_id, int):
+                return
+            await _send_telegram(bot_token, telegram_id, message, photo_path)
+    except Exception as exc:
+        logger.warning("push failed: %s", type(exc).__name__)
 
 
 async def _notify_recipients(db, device_type: str, device_id: int, owner_id: int, message: str):

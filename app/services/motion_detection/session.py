@@ -733,7 +733,7 @@ class MotionDetectionSession:
             for user_id in user_ids:
                 user = await db.get(User, user_id)
                 if user:
-                    await push.notify_user(user, message)
+                    await push.notify_user(user, message, photo_path=photo_path)
 
         except Exception as exc:
             logger.error(f"Error notifying users: {exc}")
