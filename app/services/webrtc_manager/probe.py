@@ -58,6 +58,43 @@ def parse_probe_json(text: str) -> StreamInfo:
     return StreamInfo(width, height, fps)
 
 
+def _boxes(data: bytes, start: int = 0, end: int | None = None):
+    """(type, payload_start, payload_end) of the ISO-BMFF boxes in data[start:end]."""
+    end = len(data) if end is None else end
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        head = 8
+        if size == 1 and pos + 16 <= end:  # 64-bit size
+            size, head = int.from_bytes(data[pos + 8:pos + 16], "big"), 16
+        elif size == 0:  # to the end
+            size = end - pos
+        if size < head or pos + size > end:
+            return
+        yield kind, pos + head, pos + size
+        pos += size
+
+
+def has_audio(init: bytes) -> bool:
+    """True when the fMP4 init segment declares an audio track (moov/trak/mdia/hdlr = "soun").
+    Pure byte parsing: no process, the init segment carries the track list (empty_moov)."""
+    for kind, s, e in _boxes(init):
+        if kind != b"moov":
+            continue
+        for k2, s2, e2 in _boxes(init, s, e):
+            if k2 != b"trak":
+                continue
+            for k3, s3, e3 in _boxes(init, s2, e2):
+                if k3 != b"mdia":
+                    continue
+                for k4, s4, e4 in _boxes(init, s3, e3):
+                    # hdlr payload: version/flags(4) pre_defined(4) handler_type(4)
+                    if k4 == b"hdlr" and init[s4 + 8:s4 + 12] == b"soun":
+                        return True
+    return False
+
+
 async def probe_fmp4(init: bytes, fragments: list[bytes] | None = None) -> StreamInfo:
     """Width/height/fps of the video stream in `init` (+ leading `fragments`)."""
     key = hashlib.sha1(init).hexdigest()

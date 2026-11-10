@@ -80,6 +80,7 @@ class Settings(BaseSettings):
     WEBRTC_HIDE_PRIVATE_CANDIDATES: bool = True  # strip private/loopback/link-local addresses from SDP sent to clients
     WEBRTC_FIRST_FRAME_TIMEOUT_SECONDS: float = 15.0  # no first decoded frame this long -> session ends
     WEBRTC_STALL_SECONDS: float = 10.0  # decoder silent this long mid-stream -> session ends
+    WEBRTC_AUDIO_ENABLED: bool = True  # send the camera's audio (Opus, mono 48 kHz) when the stream has any
     WEBRTC_MAX_LATENCY_MS: int = 500  # frames queued beyond this are dropped (live edge wins)
 
     # --- ingest: one persistent ffmpeg (RTSP -> fMP4, -c copy) per enabled camera ---

@@ -15,8 +15,9 @@ from av import VideoFrame
 from app.core.config import settings
 from app.services.rtsp_url import mask_credentials
 from app.services.webrtc_manager import process as procs
+from app.services.webrtc_manager.audio import AudioPipe, MediaClock
 from app.services.webrtc_manager.ice import WebRTCStreamError
-from app.services.webrtc_manager.probe import DEFAULT_FPS, ProbeError, StreamInfo, probe_fmp4
+from app.services.webrtc_manager.probe import DEFAULT_FPS, ProbeError, StreamInfo, has_audio, probe_fmp4
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,15 @@ async def _hub_ready(cam_id: int):
         return None
 
 
+async def hub_has_audio(cam_id: int) -> bool:
+    """Whether the camera's hub stream carries audio (decided before the SDP offer: no audio,
+    no audio transceiver). False when the hub is not available (direct RTSP is video only)."""
+    if not (settings.WEBRTC_AUDIO_ENABLED and cam_id):
+        return False
+    hub = await _hub_ready(cam_id)
+    return hub is not None and hub.init_segment is not None and has_audio(hub.init_segment)
+
+
 class RTSPVideoStreamTrack(VideoStreamTrack):
     """Raw video from a decoding ffmpeg -> aiortc.
 
@@ -68,16 +78,20 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
     session can be expected to work at once (the hub restarted) or not."""
 
     def __init__(self, rtsp_url: str, cam_id: int | None = None,
-                 on_end: Callable[["RTSPVideoStreamTrack"], None] | None = None):
+                 on_end: Callable[["RTSPVideoStreamTrack"], None] | None = None,
+                 audio: bool = False):
         super().__init__()
         self.rtsp_url = rtsp_url
         self.cam_id = cam_id if cam_id is not None else 0
         self.on_end = on_end
+        self.want_audio = audio  # the session has an audio track: decode the hub's audio too
         self.source: str = "direct"
         self.end_reason: str | None = None
         self.reconnect: bool = False
         self.owned: procs.OwnedProcess | None = None
         self.sub = None  # hub Subscription feeding the decoder's stdin
+        self.audio: AudioPipe | None = None  # audio decoder fed with the same chunks (hub source only)
+        self.clock = MediaClock()  # shared with the session's audio track: one timeline
         self._frames: deque[bytes] = deque()
         self._wake = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -99,7 +113,6 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
         self._burst = 0  # frames that arrived back to back (a whole fragment is decoded at once)
         self._max_burst = 0
         self._last_arrival = 0.0
-        self._t0: float | None = None  # wall clock of the first frame handed to aiortc
         self._last_sent = 0.0
         self._last_pts = -1
 
@@ -163,6 +176,9 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
         self._wake.clear()
         self._frames_in = 0
         self._term_task = None
+        if self.audio is not None:
+            audio, self.audio = self.audio, None
+            await audio.aclose()
 
     def _set_geometry(self, info: StreamInfo) -> None:
         self._width, self._height, self._fps = info.width, info.height, info.fps
@@ -234,7 +250,22 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
             raise
         self.source = "hub"
         self.sub = sub
+        self.audio = await self._start_audio(init)
         self._begin(owned)
+
+    async def _start_audio(self, init: bytes) -> AudioPipe | None:
+        """The audio decoder, fed by _feed() with the chunks the video decoder gets (so both
+        see the same init segment and GOP). Any failure here only means no sound."""
+        if not (self.want_audio and settings.WEBRTC_AUDIO_ENABLED and has_audio(init)):
+            return None
+        pipe = AudioPipe(self.cam_id)
+        try:
+            await pipe.start()
+        except Exception as exc:
+            logger.warning("webrtc: cam %s audio decoder not started (%s), no sound", self.cam_id, exc)
+            pipe.stop()
+            return None
+        return pipe
 
     async def _start_direct(self) -> None:
         probe_args = [
@@ -329,6 +360,8 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
         sub = self.sub
         try:
             async for chunk in sub:
+                if self.audio is not None:
+                    self.audio.push(chunk)
                 stdin.write(chunk)
                 await asyncio.wait_for(stdin.drain(), timeout=_STDIN_DRAIN_TIMEOUT_SECONDS)
             if self._ended:  # we closed the subscription ourselves (_finish/stop)
@@ -348,6 +381,8 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
         sub.close()
         with contextlib.suppress(Exception):
             stdin.close()
+        if self.audio is not None:
+            self.audio.end_input()
         self._finish(reason)
 
     async def _read_frames(self) -> None:
@@ -451,9 +486,7 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
 
         now = time.monotonic()
         self._last_sent = now
-        if self._t0 is None:
-            self._t0 = now
-        pts = max(self._last_pts + 1, int((now - self._t0) * VIDEO_CLOCK_RATE))
+        pts = max(self._last_pts + 1, self.clock.stamp(now, VIDEO_CLOCK_RATE))
         self._last_pts = pts
         self._frames_out += 1
 
@@ -478,9 +511,13 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
                 task.cancel()
         if self.sub is not None:
             self.sub.close()
+        if self.audio is not None:
+            self.audio.stop()
         self._terminate_soon()
 
     def _terminate_soon(self) -> None:
+        if self.audio is not None:
+            self.audio.stop()  # the audio dies with the video, quietly
         if self.owned is None or self._term_task is not None:
             return
         try:
@@ -495,6 +532,8 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
     async def aclose(self, timeout: float = 5.0) -> None:
         """stop() and wait (bounded) until the decoder process is gone."""
         self.stop()
+        if self.audio is not None:
+            await self.audio.aclose(timeout)
         task = self._term_task
         if task is None:
             return

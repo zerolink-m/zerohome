@@ -11,9 +11,15 @@ def box(box_type: bytes, payload: bytes = b"") -> bytes:
     return struct.pack(">I", 8 + len(payload)) + box_type + payload
 
 
-def init_segment(extra: int = 64) -> bytes:
+def trak(handler: bytes) -> bytes:
+    """Minimal moov/trak/mdia/hdlr declaring a `vide` or `soun` track."""
+    hdlr = box(b"hdlr", b"\0" * 8 + handler + b"\0" * 13)
+    return box(b"trak", box(b"mdia", hdlr))
+
+
+def init_segment(extra: int = 64, tracks: tuple[bytes, ...] = ()) -> bytes:
     ftyp = box(b"ftyp", b"isom" + struct.pack(">I", 512) + b"isomiso2avc1mp41")
-    moov = box(b"moov", box(b"mvhd", b"\0" * 100) + b"\0" * extra)
+    moov = box(b"moov", box(b"mvhd", b"\0" * 100) + b"".join(trak(t) for t in tracks) + b"\0" * extra)
     return ftyp + moov
 
 

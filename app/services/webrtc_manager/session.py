@@ -24,7 +24,8 @@ from app.services.webrtc_manager import process as procs
 from app.services.webrtc_manager.ice import WebRTCStreamError, generate_turn_credentials, get_ice_servers
 from app.services.webrtc_manager.portrange import configure_port_range
 from app.services.webrtc_manager.sdp import sanitize_local_sdp
-from app.services.webrtc_manager.track import RTSPVideoStreamTrack
+from app.services.webrtc_manager.audio import RTSPAudioStreamTrack
+from app.services.webrtc_manager.track import RTSPVideoStreamTrack, hub_has_audio
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class WebRTCSession:
     peer_connection: RTCPeerConnection
     video_track: RTSPVideoStreamTrack
     created_at: float
+    audio_track: RTSPAudioStreamTrack | None = None
 
 
 _sessions: dict[str, WebRTCSession] = {}  # session_id -> WebRTCSession
@@ -65,10 +67,20 @@ async def create_session(
 
     # Create and add video track immediately
     rtsp_url = _build_rtsp_url(cam)
-    video_track = RTSPVideoStreamTrack(rtsp_url, cam_id=cam.id, on_end=on_end)
+    # Audio only when the camera's stream has it: decided here, before the offer is made
+    try:
+        with_audio = await hub_has_audio(cam.id)
+    except Exception:
+        logger.exception("webrtc: audio check failed for cam %s, no audio", cam.id)
+        with_audio = False
+    video_track = RTSPVideoStreamTrack(rtsp_url, cam_id=cam.id, on_end=on_end, audio=with_audio)
 
     # Add track with sendonly transceiver
     pc.addTransceiver(video_track, direction="sendonly")
+    audio_track = None
+    if with_audio:
+        audio_track = RTSPAudioStreamTrack(video_track)
+        pc.addTransceiver(audio_track, direction="sendonly")
 
     # Store session
     session = WebRTCSession(
@@ -76,6 +88,7 @@ async def create_session(
         peer_connection=pc,
         video_track=video_track,
         created_at=time.time(),
+        audio_track=audio_track,
     )
 
     async with _guard:
@@ -211,9 +224,14 @@ async def close_session(session_id: str) -> None:
         session.video_track.stop()
         if session.video_track.owned is not None:
             session.video_track.owned.kill_now()
+        audio = session.video_track.audio
+        if audio is not None and audio.owned is not None:
+            audio.owned.kill_now()
 
 
 async def _shutdown(session: WebRTCSession) -> None:
+    if session.audio_track is not None:
+        session.audio_track.stop()
     await session.video_track.aclose()
     await session.peer_connection.close()
 

@@ -16,6 +16,10 @@ paced at fps. From an rtsp URL it starts at once, paced. $FAKE_WEBRTC_MODE:
     hang    like stall but ignores SIGTERM
     reject  exits 1 at once (like ffmpeg refusing its options)
 $FAKE_FFMPEG_ARGS_LOG: JSON argv per start; $FAKE_FFMPEG_LOG: "<pid> <time>" per start.
+Audio decoder (argv has `s16le`): after the first stdin bytes writes mono 48 kHz s16le PCM,
+$FAKE_WEBRTC_ABURST_MS ms at once (the replayed GOP, default 1000), then 20 ms per 20 ms.
+Every 20 ms frame (960 samples) is filled with the value seq+1 (seq counts frames).
+$FAKE_WEBRTC_AUDIO_MODE: ok | crash (3 frames, exit 1) | silent (no output) | reject (exit 1 at once).
 The process exits by itself after 60 s whatever happens.
 """
 import json
@@ -61,10 +65,61 @@ def probe(argv):
     return 0
 
 
+def audio_main(argv):
+    import struct
+
+    mode = os.environ.get("FAKE_WEBRTC_AUDIO_MODE", "ok")
+    log_start(argv)
+    if mode == "reject":
+        sys.stderr.write("fake audio: Stream map '0:a:0' matches no streams\n")
+        return 1
+    deadline = time.time() + 60
+    started = threading.Event()
+    eof = threading.Event()
+
+    def reader():
+        while os.read(0, 65536):
+            started.set()
+        eof.set()
+        started.set()
+
+    threading.Thread(target=reader, daemon=True).start()
+    started.wait(deadline - time.time())
+    out = sys.stdout.buffer
+    seq = 0
+
+    def emit():
+        nonlocal seq
+        out.write(struct.pack("<h", seq + 1) * 960)
+        out.flush()
+        seq += 1
+
+    try:
+        if mode == "silent":
+            while time.time() < deadline:
+                time.sleep(0.1)
+            return 0
+        for _ in range(int(os.environ.get("FAKE_WEBRTC_ABURST_MS", "1000")) // 20):
+            emit()
+        while time.time() < deadline:
+            if eof.is_set():
+                return 0
+            if mode == "crash" and seq >= 3:
+                sys.stderr.write("fake audio: boom\n")
+                return 1
+            emit()
+            time.sleep(0.02)
+    except BrokenPipeError:
+        return 0
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     if "-show_entries" in argv:
         return probe(argv)
+    if "s16le" in argv:
+        return audio_main(argv)
     mode = os.environ.get("FAKE_WEBRTC_MODE", "ok")
     log_start(argv)
     if mode == "reject":
