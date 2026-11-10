@@ -288,7 +288,7 @@ Share-токен не даёт доступа к остальным эндпои
 | `*_read` (users, cams, switches, connections, shares, invitations, push_settings, motion) | 60 / 60 | чтение |
 | `*_write` (users, cams, switches, shares, invitations, push_settings) | 20 / 20 | запись |
 | `connections_write` · `motion_write` · `motion_control` · `motion_photo` | 10 / 10 · 30 / 30 · 10 / 10 · 100 / 60 | |
-| `stats` · `config` | 20 / 20 · 20 / 120 | |
+| `stats` · `config` · `config_time` | 20 / 20 · 20 / 120 · 20 / 120 | `config_time`: `GET /config/time` |
 | `auth_register` / `auth_login` / `auth_access` / `auth_logout` | 3 / 0.3 · 5 / 1 · 20 / 20 · 30 / 30 | |
 
 
@@ -331,6 +331,7 @@ OPTIONS на неизвестный путь — `083` (404). OPTIONS учиты
 | GET | `/v1/config?v=…` | — | `data.config = {version, actual_version}` (коды `000`/`020`) | `063`, `040`, `173` |
 | GET | `/v1/config/frontend` | — | `data.config = {version}` — версия приложения | — |
 | GET | `/v1/config/frontend/supported_streams` | — | `data.streams[]` — доступные форматы стриминга | — |
+| GET | `/v1/config/time` | — | `data.time` — текущее время UTC, unix timestamp (целое, секунды). Открытый, без токена; rate limit `config_time` 20 / 120 | `173` |
 
 ### Логика версий фронтенда (`GET /v1/config?v=vM.m.p-Channel`)
 
@@ -352,6 +353,8 @@ OPTIONS на неизвестный путь — `083` (404). OPTIONS учиты
  "metadata": {"…": "…"},
  "data": {"config": {"version": "v3.2.0-Beta", "actual_version": "v3.5.1-Release"}}}
 ```
+
+`GET /config/time` пример: `{"code": "000", ..., "data": {"time": 1761912000}}`.
 
 `GET /config/frontend/supported_streams` пример: `{"streams": [{"format": "fmp4", "enabled": true, "readonly": true, "name": "Fragmented MP4", "description": "...", "latency": "2-5s", "endpoint": "/v1/cams/{id}/stream", "mime_type": "video/mp4", "features": ["low_latency","seek","pause"]}]}`. К `fmp4` добавляются `hls` (если включён HLS; `endpoint: /v1/cams/{id}/hls/playlist.m3u8`, `mime_type: application/vnd.apple.mpegurl`) и `webrtc` (если включён WebRTC и задан STUN; `endpoint: /v1/cams/{id}/webrtc`, `protocol: websocket`).
 

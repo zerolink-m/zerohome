@@ -1,4 +1,6 @@
-"""Config (virtual object): frontend-version check and supported streams."""
+"""Config (virtual object): frontend-version check, supported streams and server time."""
+import time
+
 from fastapi import APIRouter, Depends, Query
 
 from app.core.codes import (
@@ -12,7 +14,7 @@ from app.core.errors import AppError
 from app.core.rate_limit import rate_limit
 from app.core.response import success
 from app.core.validation import field_error
-from app.schemas.config import ConfigOut
+from app.schemas.config import ConfigOut, ServerTimeOut
 from app.services import frontend_version
 
 router = APIRouter(prefix="/v1/config", tags=["config"])
@@ -24,6 +26,12 @@ _VERSION_CODES = {0: SUCCESS, 5: FRONTEND_UPDATE_AVAILABLE, 67: FRONTEND_UPDATE_
 @router.get("/frontend")
 async def get_frontend_config():
     return success({"config": ConfigOut(version=settings.VERSION).model_dump(exclude_none=True)})
+
+
+@router.get("/time", dependencies=[Depends(rate_limit("config_time", capacity=20, per_minute=120))])
+async def get_time():
+    """Current server time, unix timestamp UTC (no auth required)."""
+    return success(ServerTimeOut(time=int(time.time())).model_dump())
 
 
 @router.get("", dependencies=[Depends(rate_limit("config", capacity=20, per_minute=120))])
