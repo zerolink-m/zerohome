@@ -71,19 +71,24 @@ def get_ice_servers() -> list[RTCIceServer]:
     """Build ICE servers configuration from settings"""
     ice_servers = []
 
-    # STUN server
-    if settings.WEBRTC_STUN_SERVER:
-        ice_servers.append(RTCIceServer(urls=[settings.WEBRTC_STUN_SERVER]))
+    # STUN/TURN on the SERVER-side RTCPeerConnection are temporarily disabled: aioice waits
+    # for a STUN reply on all IPv4 interfaces up to timeout=5 s, so ICE gathering
+    # (setLocalDescription) takes ~5 s. The public address is added to the offer by
+    # sanitize_local_sdp using WEBRTC_PUBLIC_IP. The browser still gets STUN/TURN via
+    # GET /v1/webrtc/ice (build_client_ice_servers).
+    # # STUN server
+    # if settings.WEBRTC_STUN_SERVER:
+    #     ice_servers.append(RTCIceServer(urls=[settings.WEBRTC_STUN_SERVER]))
 
-    # TURN server with temporary credentials
-    if settings.WEBRTC_TURN_SERVER and settings.WEBRTC_TURN_SECRET:
-        username, credential = generate_turn_credentials(settings.WEBRTC_TURN_SECRET)
-        ice_servers.append(
-            RTCIceServer(
-                urls=[settings.WEBRTC_TURN_SERVER],
-                username=username,
-                credential=credential,
-            )
-        )
+    # # TURN server with temporary credentials
+    # if settings.WEBRTC_TURN_SERVER and settings.WEBRTC_TURN_SECRET:
+    #     username, credential = generate_turn_credentials(settings.WEBRTC_TURN_SECRET)
+    #     ice_servers.append(
+    #         RTCIceServer(
+    #             urls=[settings.WEBRTC_TURN_SERVER],
+    #             username=username,
+    #             credential=credential,
+    #         )
+    #     )
 
     return ice_servers
