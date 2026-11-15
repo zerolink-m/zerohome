@@ -31,6 +31,10 @@ _STOP_ALL_TIMEOUT_SECONDS = 8.0
 
 async def start_motion_detection(cam_id: int) -> bool:
     """Start motion detection for a camera."""
+    # Central gate: startup, explicit API starts and future camera/settings hooks
+    # all pass here. Do not touch the DB, model or ffmpeg while disabled.
+    if not settings.MOTION_DETECTION_ENABLED:
+        return False
     logger.debug(f"[Cam {cam_id}] start_motion_detection() called")
 
     if cam_id in _active_sessions:

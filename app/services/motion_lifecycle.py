@@ -6,6 +6,7 @@ import logging
 
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.cams import Cam
 from app.models.push_settings import PushSettings
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 async def start_all_enabled() -> None:
     """Start motion detection on all cameras where users have it enabled."""
+    if not settings.MOTION_DETECTION_ENABLED:
+        return
     try:
         async with AsyncSessionLocal() as db:
             # Get all cameras with motion detection enabled in push_settings

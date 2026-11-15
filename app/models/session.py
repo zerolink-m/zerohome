@@ -16,5 +16,7 @@ class Session(Base):
     ua: Mapped[str] = mapped_column(String(255), nullable=False)
     ip: Mapped[str] = mapped_column(String(255), nullable=False)
     last_login: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    last_seen: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    token_hash: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     added_at: Mapped[int] = mapped_column(BigInteger, nullable=False)

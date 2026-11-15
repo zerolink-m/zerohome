@@ -1,9 +1,10 @@
+from tests.conftest import mint_test_token
 import pytest
 
 import time
 
 from app.core.codes import (FORBIDDEN_RESOURCE, LOCKED, OBJECT_NOT_FOUND, PTZ_NOT_CONFIGURED, TOKEN_ERROR)
-from app.core.security import create_access_token, create_session_token, create_share_token
+from app.core.security import create_session_token, create_share_token
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
 from tests.conftest import bearer
@@ -28,8 +29,8 @@ async def invite(db, owner_cam, email, status="accepted"):
         await s.commit()
 
 
-def tok(uid, role="user"):
-    return create_access_token(uid, 1, role)
+async def tok(uid, role="user"):
+    return await mint_test_token(uid, role)
 
 
 async def two_users(mk_user):
@@ -37,7 +38,7 @@ async def two_users(mk_user):
 
 
 async def test_cams_require_auth(client):
-    for h, code in (({}, "046"), (bearer("junk"), "149")):
+    for h, code in (({}, "046"), (bearer("junk"), "042")):
         r = await client.get("/v1/cams", headers=h)
         assert r.json()["code"] == code
     r = await client.get("/v1/cams", headers=bearer(create_session_token(1, 1)))
@@ -46,17 +47,17 @@ async def test_cams_require_auth(client):
 
 async def test_create_cam_and_owner_sees_full(client, mk_user):
     owner = await mk_user("o@x.io")
-    r = await client.post("/v1/cams", json=req("cam", NEW), headers=bearer(tok(owner)))
+    r = await client.post("/v1/cams", json=req("cam", NEW), headers=bearer(await tok(owner)))
     assert r.status_code == 201 and r.json()["code"] == "001"
     cam = r.json()["data"]["cam"]
     assert cam["password"] == "secret" and cam["owner"] == owner and "id" in cam
-    r = await client.get(f"/v1/cams/{cam['id']}", headers=bearer(tok(owner)))
+    r = await client.get(f"/v1/cams/{cam['id']}", headers=bearer(await tok(owner)))
     d = r.json()["data"]["cam"]
     assert r.json()["code"] == "000" and d["password"] == "secret" and d["owner"] == owner
 
 
 async def test_create_cam_validation_and_envelope_errors(client, mk_user):
-    h = bearer(tok(await mk_user("o@x.io")))
+    h = bearer(await tok(await mk_user("o@x.io")))
     r = await client.post("/v1/cams", json=NEW, headers=h)  # not a Request object
     assert r.status_code == 422 and r.json()["code"] == "109"
     r = await client.post("/v1/cams", json=req("cam", {"protocol": "rtsp"}), headers=h)
@@ -74,9 +75,9 @@ async def test_create_cam_validation_and_envelope_errors(client, mk_user):
 async def test_other_user_cannot_see_cam(client, mk_user, mk_cam):
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner)
-    r = await client.get(f"/v1/cams/{cid}", headers=bearer(tok(other)))
+    r = await client.get(f"/v1/cams/{cid}", headers=bearer(await tok(other)))
     assert r.status_code == 404 and r.json()["code"] == NOT_FOUND == "082"
-    r = await client.get("/v1/cams", headers=bearer(tok(other)))
+    r = await client.get("/v1/cams", headers=bearer(await tok(other)))
     assert r.json()["data"]["settings"]["total"] == 0 and r.json()["code"] == "012"
     assert r.json()["data"]["cams"] == []
 
@@ -85,14 +86,14 @@ async def test_admin_sees_all(client, mk_user, mk_cam):
     owner, _ = await two_users(mk_user)
     admin = await mk_user("adm@x.io", role="admin")
     cid = await mk_cam(owner)
-    r = await client.get(f"/v1/cams/{cid}", headers=bearer(tok(admin, "admin")))
+    r = await client.get(f"/v1/cams/{cid}", headers=bearer(await tok(admin, "admin")))
     assert r.json()["code"] == "000" and r.json()["data"]["cam"]["id"] == cid
 
 
 async def test_invited_user_visibility_and_restricted_view(client, mk_user, mk_cam, db):
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner, enabled=1)
-    h_other = bearer(tok(other))
+    h_other = bearer(await tok(other))
     await invite(db, cid, "Other@x.io", status="pending")
     assert (await client.get(f"/v1/cams/{cid}", headers=h_other)).json()["code"] == NOT_FOUND
     async with db() as s:
@@ -109,14 +110,14 @@ async def test_invited_user_cannot_see_disabled_cam(client, mk_user, mk_cam, db)
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner, enabled=0)
     await invite(db, cid, "other@x.io")
-    assert (await client.get(f"/v1/cams/{cid}", headers=bearer(tok(other)))).json()["code"] == NOT_FOUND
+    assert (await client.get(f"/v1/cams/{cid}", headers=bearer(await tok(other)))).json()["code"] == NOT_FOUND
 
 
 async def test_invited_user_cannot_modify_or_delete(client, mk_user, mk_cam, db):
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner)
     await invite(db, cid, "other@x.io")
-    h_other = bearer(tok(other))
+    h_other = bearer(await tok(other))
     r = await client.patch(f"/v1/cams/{cid}", headers=h_other, json=req("cam", {"name": "hacked"}))
     assert r.status_code == 403 and r.json()["code"] == FORBIDDEN_RESOURCE
     r = await client.delete(f"/v1/cams/{cid}", headers=h_other)
@@ -126,14 +127,14 @@ async def test_invited_user_cannot_modify_or_delete(client, mk_user, mk_cam, db)
 async def test_stranger_cannot_patch_or_delete(client, mk_user, mk_cam):
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner)
-    assert (await client.patch(f"/v1/cams/{cid}", headers=bearer(tok(other)),
+    assert (await client.patch(f"/v1/cams/{cid}", headers=bearer(await tok(other)),
                                json=req("cam", {"name": "x"}))).json()["code"] == NOT_FOUND
-    assert (await client.delete(f"/v1/cams/{cid}", headers=bearer(tok(other)))).json()["code"] == NOT_FOUND
+    assert (await client.delete(f"/v1/cams/{cid}", headers=bearer(await tok(other)))).json()["code"] == NOT_FOUND
 
 
 async def test_owner_patch_and_delete(client, mk_user, mk_cam):
     owner = await mk_user("o@x.io")
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     cid = await mk_cam(owner)
     r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"name": "new"}))
     assert r.json()["code"] == "003" and r.json()["data"]["cam"]["name"] == "new"
@@ -148,7 +149,7 @@ async def test_owner_patch_and_delete(client, mk_user, mk_cam):
 
 async def test_list_settings_search_sort_limits(client, mk_user, mk_cam):
     owner = await mk_user("o@x.io")
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     for n in ("alpha", "beta", "gamma"):
         await client.post("/v1/cams", headers=h, json=req("cam", {**NEW, "name": n, "address": f"{n}.lan"}))
     r = await client.get("/v1/cams", headers=h, params={"limit": 2, "sort_by": "name", "order": "desc"})
@@ -186,7 +187,7 @@ async def test_options_supported_functions(client):
 
 # --- bulk ---------------------------------------------------------------------
 async def test_bulk_create_atomic_and_partial(client, mk_user):
-    h = bearer(tok(await mk_user("o@x.io")))
+    h = bearer(await tok(await mk_user("o@x.io")))
     good = {**NEW, "name": "a"}
     bad = {"protocol": "rtsp"}
     r = await client.post("/v1/cams/bulk", headers=h, json={"data": {"cams": [good, bad]}})
@@ -208,7 +209,7 @@ async def test_bulk_create_atomic_and_partial(client, mk_user):
 
 async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
     owner, other = await two_users(mk_user)
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     c1, c2 = await mk_cam(owner), await mk_cam(owner)
     foreign = await mk_cam(other)
     r = await client.get(f"/v1/cams/bulk/{c1},{c2}", headers=h)
@@ -224,7 +225,8 @@ async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
     r = await client.get(f"/v1/cams/bulk/{c1},{foreign}?partial_allowed=true", headers=h)
     assert r.json()["code"] != "000"
     # admin sees everything
-    ra = await client.get(f"/v1/cams/bulk/{c1},{foreign}", headers=bearer(tok(owner, "admin")))
+    admin = await mk_user("admin@x.io", role="admin")
+    ra = await client.get(f"/v1/cams/bulk/{c1},{foreign}", headers=bearer(await tok(admin, "admin")))
     assert ra.json()["code"] == "000" and len(ra.json()["data"]["cams"]) == 2
     assert (await client.get("/v1/cams/bulk/1,x", headers=h)).json()["code"] == "109"
 
@@ -257,7 +259,7 @@ async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
 # --- PTZ / onvif / recordings -------------------------------------------------
 async def test_ptz_request_object_and_lock(client, mk_user, mk_cam, monkeypatch):
     owner = await mk_user("o@x.io")
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     cid = await mk_cam(owner, control_proto="onvif")
     moved = []
 
@@ -282,20 +284,20 @@ async def test_ptz_request_object_and_lock(client, mk_user, mk_cam, monkeypatch)
 async def test_ptz_not_configured_code(client, mk_user, mk_cam):
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    r = await client.post(f"/v1/cams/{cid}/ptz", headers=bearer(tok(owner)), json=req("ptz", {"pan": 1}))
+    r = await client.post(f"/v1/cams/{cid}/ptz", headers=bearer(await tok(owner)), json=req("ptz", {"pan": 1}))
     assert r.status_code == 409 and r.json()["code"] == PTZ_NOT_CONFIGURED == "176"
 
 
 async def test_onvif_patch(client, mk_user, mk_cam):
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner)
-    r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(tok(owner)),
+    r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(await tok(owner)),
                            json=req("onvif", {"onvif_enabled": 1}))
     assert r.json()["code"] == "003" and r.json()["data"]["onvif"]["onvif_enabled"] == 1
-    r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(tok(other)),
+    r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(await tok(other)),
                            json=req("onvif", {"onvif_enabled": 0}))
     assert r.json()["code"] == FORBIDDEN_RESOURCE
-    r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(tok(owner)),
+    r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(await tok(owner)),
                            json=req("onvif", {"onvif_enabled": 5}))
     assert r.json()["code"] == "109"
 
@@ -304,7 +306,7 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
     from app.models.user import User
     from sqlalchemy import update
     owner = await mk_user("o@x.io")
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     cid = await mk_cam(owner)
     assert (await client.get(f"/v1/cams/{cid}/recording", headers=h)).json()["data"]["recording_config"]["record"] == 0
     cfg = req("recording_config", {"record": 1, "record_type": "local", "record_metadata": {"local": {"path": str(tmp_path)}}})
@@ -345,8 +347,7 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
 
 
 async def test_forged_admin_role_via_user_secret_is_not_admin(client, mk_user, mk_cam):
-    """role claim signed with the ordinary access secret must not grant admin visibility.
-    (create_access_token picks the secret by role, so craft by hand.)"""
+    """An old access JWT with a forged admin claim is rejected outright."""
     import time, jwt
     from app.core.config import settings
     owner, other = await two_users(mk_user)
@@ -355,7 +356,7 @@ async def test_forged_admin_role_via_user_secret_is_not_admin(client, mk_user, m
     forged = jwt.encode({"uid": other, "sid": 1, "role": "admin", "iat": now, "exp": now + 99},
                         settings.JWT_SECRET_ACCESS, algorithm="HS256")
     r = await client.get(f"/v1/cams/{cid}", headers=bearer(forged))
-    assert r.json()["code"] == NOT_FOUND
+    assert r.json()["code"] == TOKEN_ERROR
 
 
 # --- share-token gated endpoint: GET /v1/cams/{id}/ptz (control_proto None -> 176 once auth passes) ---
@@ -449,4 +450,4 @@ async def test_share_token_signed_with_foreign_secret_rejected(client, mk_user, 
                          "device_id": cid, "filename": None, "iat": now, "exp": now + 99},
                         "attacker-secret-attacker-secret-1234", algorithm="HS256")
     r = await client.get(f"/v1/cams/{cid}/ptz", headers=bearer(forged))
-    assert r.json()["code"] == "044"
+    assert r.json()["code"] == "042"

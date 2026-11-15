@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import secrets
 import time
 from dataclasses import dataclass
 
@@ -26,13 +28,7 @@ from app.core.errors import AppError
 
 _hasher = PasswordHasher()
 
-# Which JWT secret signs/verifies each token kind. access-admin uses its own
-# secret so an access token can never be replayed as an admin one.
-SECRET_BY_KIND: dict[str, str] = {
-    "session": settings.JWT_SECRET_SESSION,
-    "access": settings.JWT_SECRET_ACCESS,
-    "access-admin": settings.JWT_SECRET_ACCESS_ADMIN,
-}
+# Legacy refresh JWT signing key is retained only for one-time migrations.
 
 
 @dataclass
@@ -72,25 +68,34 @@ async def verify_password(password: str, hashed: str) -> bool:
     return await asyncio.to_thread(_verify_password_sync, password, hashed)
 
 
-def _encode(kind: str, uid: int, sid: int, role: str, ttl_seconds: int) -> str:
-    now = int(time.time())
-    payload = {
-        "uid": uid,
-        "sid": sid,
-        "role": role,
-        "iat": now,
-        "exp": now + ttl_seconds,
-    }
-    return jwt.encode(payload, SECRET_BY_KIND[kind], algorithm=settings.JWT_ALGORITHM)
-
-
 def create_session_token(uid: int, sid: int) -> str:
-    return _encode("session", uid, sid, "user", settings.SESSION_TOKEN_TTL_SECONDS)
+    """Legacy refresh signer retained for migration regression tests only."""
+    now = int(time.time())
+    return jwt.encode({"uid": uid, "sid": sid, "role": "user", "iat": now,
+                       "exp": now + settings.SESSION_TOKEN_TTL_SECONDS},
+                      settings.JWT_SECRET_SESSION, algorithm=settings.JWT_ALGORITHM)
 
 
-def create_access_token(uid: int, sid: int, role: str) -> str:
-    kind = "access-admin" if role == "admin" else "access"
-    return _encode(kind, uid, sid, role, settings.ACCESS_TOKEN_TTL_SECONDS)
+def new_bearer_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def bearer_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def is_opaque_token(token: str) -> bool:
+    # 32 CSPRNG bytes in canonical unpadded base64url encoding.
+    return len(token) == 43 and all(c.isalnum() or c in "-_" for c in token)
+
+
+def decode_legacy_refresh(token: str) -> TokenPayload:
+    try:
+        data = jwt.decode(token, settings.JWT_SECRET_SESSION, algorithms=[settings.JWT_ALGORITHM])
+        return TokenPayload(kind="session", uid=int(data["uid"]), sid=int(data["sid"]),
+                            role="user", iat=int(data["iat"]), exp=int(data["exp"]))
+    except (PyJWTError, KeyError, TypeError, ValueError) as exc:
+        raise _token_error(exc)
 
 
 def create_share_token(
@@ -148,31 +153,3 @@ def _token_error(exc: Exception) -> AppError:
     if isinstance(exc, DecodeError):
         return AppError(TOKEN_FORMAT_INVALID, "Неверный формат токена")
     return AppError(TOKEN_ERROR, "Токен невалиден")
-
-
-def decode_any(token: str) -> TokenPayload:
-    """Try every known secret; whichever verifies determines the token's kind."""
-    bad_signature = False
-    for kind, secret in SECRET_BY_KIND.items():
-        try:
-            data = jwt.decode(token, secret, algorithms=[settings.JWT_ALGORITHM])
-            return TokenPayload(
-                kind=kind,
-                uid=data["uid"],
-                sid=data["sid"],
-                # Role comes from the token kind (i.e. which secret signed it),
-                # never from a claim: only the access-admin secret makes an admin.
-                role="admin" if kind == "access-admin" else "user",
-                iat=data["iat"],
-                exp=data["exp"],
-            )
-        except InvalidSignatureError:
-            bad_signature = True
-            continue
-        except KeyError:
-            raise AppError(TOKEN_ERROR, "В токене отсутствуют обязательные поля")
-        except PyJWTError as exc:
-            raise _token_error(exc)
-    if bad_signature:
-        raise AppError(TOKEN_BAD_SIGNATURE, "Токен подписан неверным ключом")
-    raise AppError(TOKEN_ERROR, "Токен невалиден")

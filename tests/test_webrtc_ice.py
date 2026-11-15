@@ -1,4 +1,5 @@
 """GET /v1/webrtc/ice, private-address hiding in SDP, public candidate, UDP port range."""
+from tests.conftest import mint_test_token
 import base64
 import hashlib
 import hmac
@@ -11,7 +12,7 @@ import pytest
 from aiortc import RTCConfiguration, RTCPeerConnection, VideoStreamTrack
 
 from app.core.config import settings
-from app.core.security import create_access_token, create_session_token, create_share_token
+from app.core.security import create_session_token, create_share_token
 from app.models.sharing import Sharing
 from app.services.webrtc_manager import portrange, sdp as sdp_mod
 from app.services.webrtc_manager.sdp import is_private_address, sanitize_sdp, sanitize_local_sdp
@@ -49,7 +50,7 @@ async def test_ice_rejects_session_token(client, turn_cfg):
 async def test_ice_with_turn(client, mk_user, turn_cfg):
     uid = await mk_user("a@x.io")
     before = int(time.time())
-    r = await client.get("/v1/webrtc/ice", headers=hdr(create_access_token(uid, 1, "user")))
+    r = await client.get("/v1/webrtc/ice", headers=hdr(await mint_test_token(uid, "user")))
     assert r.status_code == 200
     body = r.json()
     assert body["code"] == "000"
@@ -69,7 +70,7 @@ async def test_ice_admin_ttl_and_turns(client, mk_user, turn_cfg, monkeypatch):
     monkeypatch.setattr(settings, "WEBRTC_TURN_CREDENTIAL_TTL_SECONDS", 120)
     monkeypatch.setattr(settings, "WEBRTC_TURNS_SERVER", "turns:turn.example.org:5349")
     uid = await mk_user("adm@x.io", role="admin")
-    r = await client.get("/v1/webrtc/ice", headers=hdr(create_access_token(uid, 1, "admin")))
+    r = await client.get("/v1/webrtc/ice", headers=hdr(await mint_test_token(uid, "admin")))
     ice = r.json()["data"]["ice"]
     turn = ice["ice_servers"][1]
     assert ice["ttl"] == 120
@@ -80,7 +81,7 @@ async def test_ice_admin_ttl_and_turns(client, mk_user, turn_cfg, monkeypatch):
 
 async def test_ice_stun_only_and_empty(client, mk_user, turn_cfg, monkeypatch):
     uid = await mk_user("a@x.io")
-    h = hdr(create_access_token(uid, 1, "user"))
+    h = hdr(await mint_test_token(uid, "user"))
     monkeypatch.setattr(settings, "WEBRTC_TURN_SECRET", "")
     ice = (await client.get("/v1/webrtc/ice", headers=h)).json()["data"]["ice"]
     assert ice["ice_servers"] == [{"urls": ["stun:turn.example.org:3478"]}]
@@ -111,7 +112,7 @@ async def test_ice_share_token(client, db, mk_user, mk_cam, turn_cfg):
 
 async def test_ice_rate_limited(client, mk_user, turn_cfg):
     uid = await mk_user("a@x.io")
-    h = hdr(create_access_token(uid, 1, "user"))
+    h = hdr(await mint_test_token(uid, "user"))
     codes = [(await client.get("/v1/webrtc/ice", headers=h)).status_code for _ in range(61)]
     assert codes[:60] == [200] * 60 and codes[60] == 429
 
@@ -119,7 +120,7 @@ async def test_ice_rate_limited(client, mk_user, turn_cfg):
 def test_client_servers_dont_touch_server_side_config(turn_cfg):
     from app.services.webrtc_manager.ice import get_ice_servers
     servers = get_ice_servers()
-    assert [s.urls for s in servers] == [["stun:turn.example.org:3478"], ["turn:turn.example.org:3478"]]
+    assert servers == []  # server-side peer connection never uses ICE relay servers
 
 
 # --- address classification ------------------------------------------------------------

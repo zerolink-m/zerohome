@@ -1,4 +1,5 @@
 """WebRTC websocket: camera access must follow the same rules as stream/ptz."""
+from tests.conftest import mint_test_token
 import asyncio
 import time
 from unittest.mock import AsyncMock
@@ -6,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.core.config import settings
-from app.core.security import create_access_token, create_share_token
+from app.core.security import create_share_token
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
 from app.routers.cams import webrtc as webrtc_mod
@@ -18,7 +19,7 @@ async def ws_connect(app, cam_id, token):
     scope = {
         "type": "websocket", "asgi": {"version": "3.0"}, "http_version": "1.1",
         "scheme": "ws", "path": f"/v1/cams/{cam_id}/webrtc", "raw_path": b"",
-        "query_string": qs, "root_path": "", "headers": [(b"host", b"test")],
+        "query_string": qs, "root_path": "", "headers": [(b"host", b"test"), (b"user-agent", b"pytest-UA/1.0")],
         "client": ("203.0.113.9", 1), "server": ("test", 80), "subprotocols": [],
     }
     inbox: asyncio.Queue = asyncio.Queue()
@@ -59,14 +60,14 @@ def fake_rtc(monkeypatch):
     return mgr
 
 
-def tok(uid, role="user"):
-    return create_access_token(uid, 1, role)
+async def tok(uid, role="user"):
+    return await mint_test_token(uid, role)
 
 
 async def test_webrtc_stranger_rejected(app, mk_user, mk_cam, fake_rtc):
     owner, other = await mk_user("o@x.io"), await mk_user("s@x.io")
     cid = await mk_cam(owner)
-    ok, code, _ = await ws_connect(app, cid, tok(other))
+    ok, code, _ = await ws_connect(app, cid, await tok(other))
     assert not ok and code == 1008
     fake_rtc.create_session.assert_not_called()
 
@@ -75,7 +76,7 @@ async def test_webrtc_junk_token_and_missing_cam(app, mk_user, mk_cam, fake_rtc)
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
     assert (await ws_connect(app, cid, "junk"))[:2] == (False, 1008)
-    assert (await ws_connect(app, 9999, tok(owner, "admin")))[:2] == (False, 1008)
+    assert (await ws_connect(app, 9999, await tok(owner)))[:2] == (False, 1008)
 
 
 @pytest.mark.parametrize("who", ["owner", "admin"])
@@ -83,7 +84,7 @@ async def test_webrtc_owner_and_admin_allowed(app, mk_user, mk_cam, fake_rtc, wh
     owner = await mk_user("o@x.io")
     admin = await mk_user("a@x.io", role="admin")
     cid = await mk_cam(owner)
-    t = tok(owner) if who == "owner" else tok(admin, "admin")
+    t = await tok(owner) if who == "owner" else await tok(admin, "admin")
     ok, code, sent = await ws_connect(app, cid, t)
     assert ok and sent and "offer" in sent[0]
     fake_rtc.create_session.assert_awaited_once()
@@ -96,11 +97,11 @@ async def test_webrtc_invited_allowed_only_when_accepted_and_enabled(app, db, mk
         s.add(Invitation(device_type="cams", device_id=cid, email="g@x.io", invited_by=owner,
                          status="pending", added_at=int(time.time())))
         await s.commit()
-    assert (await ws_connect(app, cid, tok(guest)))[:2] == (False, 1008)
+    assert (await ws_connect(app, cid, await tok(guest)))[:2] == (False, 1008)
     async with db() as s:
         await s.execute(Invitation.__table__.update().values(status="accepted"))
         await s.commit()
-    ok, _, _ = await ws_connect(app, cid, tok(guest))
+    ok, _, _ = await ws_connect(app, cid, await tok(guest))
     assert ok
 
 
@@ -126,6 +127,6 @@ async def test_webrtc_share_token(app, db, mk_user, mk_cam, fake_rtc):
 async def test_webrtc_connection_rate_limited(app, mk_user, mk_cam, fake_rtc):
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    res = [await ws_connect(app, cid, tok(owner)) for _ in range(webrtc_mod.WEBRTC_BUDGET.capacity + 1)]
+    res = [await ws_connect(app, cid, await tok(owner)) for _ in range(webrtc_mod.WEBRTC_BUDGET.capacity + 1)]
     assert all(r[0] for r in res[:-1])
     assert res[-1][:2] == (False, 1008)

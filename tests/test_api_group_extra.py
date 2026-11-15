@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from app.core.security import create_access_token, decode_share_token
+from app.core.security import decode_share_token
 from app.models.motion_event import MotionEvent
 from app.models.switch import Switch
 from tests.conftest import bearer
@@ -23,7 +23,7 @@ async def setup(mk_user, mk_cam):
 # ---------------- shares / invitations lists ----------------
 async def test_shares_list_settings_and_empty(client, setup):
     owner, other, admin, cam = setup
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.get("/v1/shares", headers=h)
     assert r.json()["code"] == "012" and r.json()["data"]["shares"] == []
     assert r.json()["data"]["settings"]["total"] == 0
@@ -38,15 +38,15 @@ async def test_shares_list_settings_and_empty(client, setup):
     assert len(d["shares"]) == 2 and d["shares"][0]["id"] > d["shares"][1]["id"]
     assert r.json()["metadata"]["page"]["pages"] == 2
     # other user sees none, admin sees all
-    assert (await client.get("/v1/shares", headers=bearer(tok(other)))).json()["code"] == "012"
-    assert (await client.get("/v1/shares", headers=bearer(tok(admin, "admin")))).json()["data"]["settings"]["total"] == 3
+    assert (await client.get("/v1/shares", headers=bearer(await tok(other)))).json()["code"] == "012"
+    assert (await client.get("/v1/shares", headers=bearer(await tok(admin, "admin")))).json()["data"]["settings"]["total"] == 3
     # bad limit
     assert (await client.get("/v1/shares?limit=0", headers=h)).status_code == 400
 
 
 async def test_invitations_list_settings_and_accept_by_admin(client, setup):
     owner, other, admin, cam = setup
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.get("/v1/invitations", headers=h)
     assert r.json()["code"] == "012" and r.json()["data"]["invitations"] == []
     body = {"data": {"invitation": {"device_type": "cams", "device_id": cam, "email": "Other@X.io"}}}
@@ -55,8 +55,8 @@ async def test_invitations_list_settings_and_accept_by_admin(client, setup):
     iid = c.json()["data"]["invitation"]["id"]
     r = await client.get("/v1/invitations?search=pending&search_column=status&search_method=equals", headers=h)
     assert r.json()["code"] == "000" and r.json()["data"]["settings"]["total"] == 1
-    assert (await client.get("/v1/invitations", headers=bearer(tok(other)))).json()["data"]["settings"]["total"] == 1
-    r = await client.post(f"/v1/invitations/{iid}/accept", headers=bearer(tok(admin, "admin")))
+    assert (await client.get("/v1/invitations", headers=bearer(await tok(other)))).json()["data"]["settings"]["total"] == 1
+    r = await client.post(f"/v1/invitations/{iid}/accept", headers=bearer(await tok(admin, "admin")))
     assert r.json()["code"] == "003"
     assert (await client.post("/v1/invitations/9999/accept", headers=h)).json()["code"] == "082"
     assert (await client.post("/v1/invitations/9999/decline", headers=h)).json()["code"] == "082"
@@ -68,7 +68,7 @@ async def test_invitations_list_settings_and_accept_by_admin(client, setup):
 
 async def test_post_bodies_must_be_wrapped(client, setup):
     owner, _, _, cam = setup
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.post("/v1/shares", headers=h, json={"device_type": "cams", "device_id": cam, "type": "stream"})
     assert r.json()["code"] == "109"
     r = await client.post("/v1/invitations", headers=h, json={"device_type": "cams"})
@@ -94,15 +94,15 @@ async def test_switch_push_settings(client, setup, sessionmaker_):
         await s.commit()
         sid = sw.id
     url = f"/v1/switches/{sid}/push-settings"
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.get(url, headers=h)
     assert r.json()["code"] == "000" and r.json()["data"]["push_settings"]["device_type"] == "switches"
     r = await client.patch(url, headers=h, json={"data": {"push_settings": {"notify_online": 0}}})
     assert r.json()["code"] == "003"
     r = await client.patch(url, headers=h, json={"data": {"push_settings": {"notify_online": 0}}})
     assert r.json()["code"] == "005"
-    assert (await client.get(url, headers=bearer(tok(other)))).json()["code"] == "051"
-    assert (await client.get(url, headers=bearer(tok(admin, "admin")))).json()["code"] == "000"
+    assert (await client.get(url, headers=bearer(await tok(other)))).json()["code"] == "051"
+    assert (await client.get(url, headers=bearer(await tok(admin, "admin")))).json()["code"] == "000"
     assert (await client.get("/v1/switches/9999/push-settings", headers=h)).json()["code"] == "082"
 
 
@@ -115,14 +115,14 @@ async def test_motion_photo_missing_and_admin_delete(client, setup, sessionmaker
         s.add(ev)
         await s.commit()
         eid = ev.id
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.get(f"/v1/motion/events/{eid}/photo", headers=h)
     assert r.json()["code"] == "082"
-    assert (await client.get(f"/v1/motion/events/{eid}/photo", headers=bearer(tok(other)))).json()["code"] == "051"
+    assert (await client.get(f"/v1/motion/events/{eid}/photo", headers=bearer(await tok(other)))).json()["code"] == "051"
     assert (await client.get("/v1/motion/events/9999", headers=h)).json()["code"] == "082"
     assert (await client.delete("/v1/motion/events/9999", headers=h)).json()["code"] == "082"
     assert (await client.get("/v1/cams/9999/motion/status", headers=h)).json()["code"] == "082"
-    r = await client.delete(f"/v1/motion/events/{eid}", headers=bearer(tok(admin, "admin")))
+    r = await client.delete(f"/v1/motion/events/{eid}", headers=bearer(await tok(admin, "admin")))
     assert r.json()["code"] == "007"
 
 
@@ -131,7 +131,7 @@ async def test_motion_photo_missing_and_admin_delete(client, setup, sessionmaker
                                   "/users", "/errors", "/performance"])
 async def test_stats_forbidden_for_user_and_requires_auth(client, setup, path):
     owner, *_ = setup
-    r = await client.get(f"/v1/stats{path}", headers=bearer(tok(owner)))
+    r = await client.get(f"/v1/stats{path}", headers=bearer(await tok(owner)))
     assert r.status_code == 403 and r.json()["code"] == "050"
     assert (await client.get(f"/v1/stats{path}")).status_code == 401
 
@@ -139,7 +139,7 @@ async def test_stats_forbidden_for_user_and_requires_auth(client, setup, path):
 async def test_stats_db_backed_admin(client, setup, monkeypatch, sessionmaker_):
     from app.services import stats_collector
     _, _, admin, cam = setup
-    h = bearer(tok(admin, "admin"))
+    h = bearer(await tok(admin, "admin"))
     monkeypatch.setattr(stats_collector, "get_system_stats", lambda: {
         "cpu_percent": 1.5, "memory": {"percent": 10.0}, "disk": {"percent": 5.0},
         "network": {"bytes_sent": 1}, "uptime_seconds": 7})

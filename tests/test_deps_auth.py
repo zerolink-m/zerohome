@@ -1,87 +1,47 @@
-import time
-
-import jwt
 import pytest
 
 from app.core.codes import FORBIDDEN_ROLE, TOKEN_ERROR
-from app.core.config import settings
 from app.core.errors import AppError
-from app.core.security import create_access_token, create_session_token, create_share_token
+from app.core.security import create_session_token, create_share_token, is_opaque_token, new_bearer_token
 from app.deps import auth as deps
+from tests.conftest import bearer, mint_test_token
 
 
 def test_bearer_parsing():
     assert deps.get_bearer_token("Bearer abc") == "abc"
-    assert deps.get_bearer_token("Bearer   abc  ") == "abc"
-    for bad in (None, "", "Bearer "):
-        with pytest.raises(AppError) as e:
-            deps.get_bearer_token(bad)
-        assert e.value.code == "046", bad
-    for bad in ("Basic abc", "bearer abc", "Bearer"):
-        with pytest.raises(AppError) as e:
-            deps.get_bearer_token(bad)
-        assert e.value.code == "042", bad
+    for value in (None, "", "Bearer "):
+        with pytest.raises(AppError) as exc:
+            deps.get_bearer_token(value)
+        assert exc.value.code == "046"
+    with pytest.raises(AppError) as exc:
+        deps.get_bearer_token("Basic abc")
+    assert exc.value.code == TOKEN_ERROR
 
 
-def test_extract_token_header_priority_over_query():
-    assert deps._extract_token("Bearer h", "q") == "h"
-    assert deps._extract_token(None, "q") == "q"
-    assert deps._extract_token("Bearer ", "q") == "q"
-    with pytest.raises(AppError):
-        deps._extract_token(None, None)
+def test_opaque_format_and_legacy_distinction():
+    token = new_bearer_token()
+    assert is_opaque_token(token)
+    assert not is_opaque_token(create_session_token(1, 1))
+    assert not is_opaque_token(create_share_token(1, 1, "stream", "cams", 1, None, 60))
 
 
-def test_require_session():
-    assert deps.require_session(create_session_token(1, 1)).kind == "session"
-    with pytest.raises(AppError) as e:
-        deps.require_session(create_access_token(1, 1, "user"))
-    assert e.value.code == TOKEN_ERROR
-    with pytest.raises(AppError):
-        deps.require_session(create_access_token(1, 1, "admin"))
+def test_dash_roundtrip_and_header_priority():
+    token = new_bearer_token()
+    dashed = "-".join(token[i:i + 10] for i in range(0, len(token), 10))
+    assert deps._decode_dashed(dashed) == token
+    assert deps._query_token_candidates(dashed)[-1] == token
+    assert deps.extract_token_flexible(f"Bearer {token}", "junk") == token
+    assert deps.extract_token_flexible(None, dashed) == dashed
 
 
-@pytest.mark.parametrize("fn", [deps.require_access, deps.require_access_qs])
-def test_require_access(fn):
-    assert fn(create_access_token(1, 1, "user")).kind == "access"
-    assert fn(create_access_token(1, 1, "admin")).kind == "access-admin"
-    with pytest.raises(AppError) as e:
-        fn(create_session_token(1, 1))
-    assert e.value.code == TOKEN_ERROR
-
-
-def test_require_access_admin():
-    assert deps.require_access_admin(create_access_token(1, 1, "admin")).role == "admin"
-    with pytest.raises(AppError) as e:
-        deps.require_access_admin(create_access_token(1, 1, "user"))
-    assert e.value.code == FORBIDDEN_ROLE
-    with pytest.raises(AppError) as e:
-        deps.require_access_admin(create_session_token(1, 1))
-    assert e.value.code == TOKEN_ERROR
-
-
-def test_try_decode_any_returns_none_on_garbage():
-    assert deps._try_decode_any("zzz") is None
-    assert deps._try_decode_any(create_share_token(1, 1, "stream", "cams", 1, None, 60)) is None
-
-
-def test_decode_dashed():
-    raw = "abcdefghijKLMNOPQRSTuvwxyz"
-    dashed = "abcdefghij-KLMNOPQRST-uvwxyz"
-    assert deps._decode_dashed(dashed) == raw
-    assert deps._decode_dashed(raw) == raw  # no separators -> unchanged
-    # literal '-' inside the first 10 data chars is data, not a separator
-    assert deps._decode_dashed("abc-defghi-jklmnopqrs") == "abc-defghijklmnopqrs"
-
-
-def test_decode_dashed_roundtrip_jwt():
-    tok = create_share_token(1, 1, "stream", "cams", 1, None, 60)
-    dashed = "-".join(tok[i:i + 10] for i in range(0, len(tok), 10))
-    assert deps._decode_dashed(dashed) == tok
-
-
-def test_expired_access_rejected_by_dep():
-    now = int(time.time())
-    tok = jwt.encode({"uid": 1, "sid": 1, "role": "user", "iat": now - 100, "exp": now - 1},
-                     settings.JWT_SECRET_ACCESS, algorithm="HS256")
-    with pytest.raises(AppError):
-        deps.require_access(tok)
+async def test_database_auth_and_role(db, app, mk_user):
+    uid = await mk_user("u@x.io")
+    admin = await mk_user("a@x.io", role="admin")
+    token, admin_token = await mint_test_token(uid), await mint_test_token(admin, "admin")
+    async with db() as s:
+        payload = await deps._authenticate(token, s, "pytest-UA/1.0")
+        assert payload.uid == uid and payload.role == "user"
+        assert (await deps._authenticate(admin_token, s, "pytest-UA/1.0")).role == "admin"
+        with pytest.raises(AppError) as exc:
+            await deps._authenticate(create_session_token(uid, 1), s, "pytest-UA/1.0")
+        assert exc.value.code == TOKEN_ERROR

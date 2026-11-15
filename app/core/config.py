@@ -11,8 +11,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 class Settings(BaseSettings):
     """Application configuration, loaded from environment / .env.
 
-    Secrets (JWT_SECRET_*) are required and have no defaults — the app refuses
-    to start without them. Everything else has a sensible default.
+    Only the legacy-refresh and share JWT secrets remain required. Existing
+    access JWT settings are accepted for older deployments but never used to
+    authenticate requests. Everything else has a sensible default.
     """
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -24,23 +25,30 @@ class Settings(BaseSettings):
     DB_PASSWORD: str
     DB_NAME: str = "zerocams"
 
-    # --- JWT: four independent signing secrets ---
+    # --- JWT: share links and previously issued refresh tokens only ---
     JWT_SECRET_SESSION: str
-    JWT_SECRET_ACCESS: str
-    JWT_SECRET_ACCESS_ADMIN: str
     JWT_SECRET_SHARE: str
     JWT_ALGORITHM: str = "HS256"
+    # Deprecated configuration, retained to accept existing deployment env files.
+    JWT_SECRET_ACCESS: str = ""
+    JWT_SECRET_ACCESS_ADMIN: str = ""
 
-    # --- token TTLs (seconds) ---
-    ACCESS_TOKEN_TTL_SECONDS: int
-    SESSION_TOKEN_TTL_SECONDS: int
+    # --- legacy refresh signing (expiry itself is in the signed JWT) ---
+    SESSION_TOKEN_TTL_SECONDS: int = 86400
     SHARE_TOKEN_MIN_TTL_SECONDS: int
     SHARE_TOKEN_MAX_TTL_SECONDS: int
 
     # --- push (Telegram) ---
     TELEGRAM_API_BASE: str = "https://api.telegram.org"
 
-    # --- background workers ---
+    # --- background workers (read at process startup; restart after changing) ---
+    SESSION_CLEANUP_ENABLED: bool = True
+    HEALTHCHECK_ENABLED: bool = True
+    SWITCH_SYNC_ENABLED: bool = True
+    CONNECTION_SYNC_ENABLED: bool = True
+    TUYA_EVENTS_ENABLED: bool = True
+    MOTION_DETECTION_ENABLED: bool = True
+    MOTION_CLEANUP_ENABLED: bool = True
     HEALTHCHECK_INTERVAL_SECONDS: int = 60
     HEALTHCHECK_TCP_TIMEOUT_SECONDS: float = 5.0
     STREAM_IDLE_TIMEOUT_SECONDS: int = 30

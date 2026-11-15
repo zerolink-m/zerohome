@@ -301,6 +301,11 @@ async def delete_users_bulk(
     return bulk("users", succeeded, failed, op="delete", partial=partial_allowed)
 
 
+@router.get("/me", dependencies=[Depends(rate_limit("users_read", capacity=60, per_minute=60))])
+async def get_current_user(payload: TokenPayload = Depends(require_access), db: AsyncSession = Depends(get_db)):
+    return single("user", _to_out(await _get_user(db, payload.uid)))
+
+
 @router.get("/{id}", dependencies=[Depends(rate_limit("users_read", capacity=60, per_minute=60))])
 async def get_user(id: int, payload: TokenPayload = Depends(require_access), db: AsyncSession = Depends(get_db)):
     _check_user_access(payload, id)

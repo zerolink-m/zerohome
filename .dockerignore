@@ -1,0 +1,20 @@
+# Deny by default: never send local credentials, data, models, logs or git.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!main.py
+!alembic.ini
+!frontend_versions.json
+!deploy/
+!deploy/container-entrypoint.sh
+!app/
+!app/**
+!alembic/
+!alembic/**
+**/__pycache__/
+**/*.pyc
+**/.env*
+**/*.pem
+**/*.key
+**/*.log

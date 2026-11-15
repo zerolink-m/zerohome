@@ -1,11 +1,11 @@
 """MOTION_FILES_DIR setting drives where motion photos are read/deleted/cleaned."""
+from tests.conftest import mint_test_token
 import os
 import time
 from pathlib import Path
 
 from app.core import config
 from app.core.config import settings
-from app.core.security import create_access_token
 from app.models.motion_event import MotionEvent
 from app.services import motion_cleanup
 from tests.conftest import bearer
@@ -47,7 +47,7 @@ async def test_photo_get_and_delete_use_configured_dir(client, mk_user, mk_cam, 
     photo = tmp_path / str(cam) / "p.jpg"
     photo.write_bytes(b"\xff\xd8jpegdata")
     eid = await _event(sessionmaker_, cam, "p.jpg")
-    h = bearer(create_access_token(owner, 1, "user"))
+    h = bearer(await mint_test_token(owner, "user"))
 
     r = await client.get(f"/v1/motion/events/{eid}/photo", headers=h)
     assert r.status_code == 200 and r.content == b"\xff\xd8jpegdata"

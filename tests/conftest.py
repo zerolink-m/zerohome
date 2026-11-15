@@ -37,7 +37,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # no
 from sqlalchemy.pool import StaticPool  # noqa: E402
 
 from app.core import rate_limit as rl  # noqa: E402
-from app.core.security import hash_password  # noqa: E402
+from app.core.security import bearer_hash, hash_password, new_bearer_token  # noqa: E402
 from app.db.base import Base  # noqa: E402
 import app.models  # noqa: E402,F401  (register all tables)
 from app.db import session as db_session  # noqa: E402
@@ -45,6 +45,7 @@ from app.db.session import get_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.models.cams import Cam  # noqa: E402
 from app.models.user import User  # noqa: E402
+from app.models.session import Session  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -72,8 +73,13 @@ def sessionmaker_(engine):
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
+_active_test_sessionmaker = None
+
+
 @pytest.fixture
 def app(sessionmaker_, monkeypatch):
+    global _active_test_sessionmaker
+    _active_test_sessionmaker = sessionmaker_
     application = create_app()
 
     async def _get_db():
@@ -81,9 +87,7 @@ def app(sessionmaker_, monkeypatch):
             yield s
 
     application.dependency_overrides[get_db] = _get_db
-    # background tasks inside routers open their own sessions
     monkeypatch.setattr(db_session, "AsyncSessionLocal", sessionmaker_)
-    monkeypatch.setattr("app.routers.auth.AsyncSessionLocal", sessionmaker_)
     return application
 
 
@@ -145,10 +149,22 @@ def bearer(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+async def mint_test_token(uid, role="user"):
+    """Create a real database-backed session for integration tests (not an app API)."""
+    assert _active_test_sessionmaker is not None
+    token = new_bearer_token()
+    now = int(time.time())
+    async with _active_test_sessionmaker() as db:
+        user = await db.get(User, uid)
+        assert user is not None and user.role == role
+        db.add(Session(uid=uid, ua="pytest-UA/1.0", ip="127.0.0.1", last_login=now,
+                       last_seen=now, added_at=now, updated_at=now, token_hash=bearer_hash(token)))
+        await db.commit()
+    return token
+
+
 async def login_access(client, email, password="Passw0rd!"):
-    """Full login -> session -> access flow; returns access token."""
+    """Log in and return the database-backed bearer token."""
     r = await client.post("/v1/auth/login", json={"data": {"credentials": {"email": email, "password": password}}})
     assert r.json()["code"] == "010", r.text
-    r = await client.post("/v1/auth/access", headers=bearer(r.json()["data"]["token"]))
-    assert r.json()["code"] == "019", r.text
     return r.json()["data"]["token"]

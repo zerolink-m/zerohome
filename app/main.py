@@ -37,15 +37,22 @@ from app.services import (
 async def lifespan(app: FastAPI):
     # --- startup (same order as before) ---
     start_cleanup_task()
-    healthcheck.start()
-    switch_sync.start()
-    connection_sync.start()
-    # Real-time Pulsar consumers, running alongside switch_sync polling.
-    tuya_events.start()
+    if settings.SESSION_CLEANUP_ENABLED:
+        auth.start_session_cleanup()
+    if settings.HEALTHCHECK_ENABLED:
+        healthcheck.start()
+    if settings.SWITCH_SYNC_ENABLED:
+        switch_sync.start()
+    if settings.CONNECTION_SYNC_ENABLED:
+        connection_sync.start()
+    # Independent of polling: disabling one does not disable the other.
+    if settings.TUYA_EVENTS_ENABLED:
+        tuya_events.start()
     if settings.HLS_ENABLED:
         hls_manager.start_cleanup_task()
     # Motion detection cleanup task (removes events older than 7 days)
-    motion_cleanup.start()
+    if settings.MOTION_CLEANUP_ENABLED:
+        motion_cleanup.start()
     # Persistent ingest ffmpeg per enabled camera (no-op unless INGEST_ENABLED).
     # Before motion detection: its sessions read the hub.
     await ingest.start_all_enabled()
@@ -79,6 +86,7 @@ async def lifespan(app: FastAPI):
     if settings.WEBRTC_ENABLED:
         await webrtc_manager.stop_all_sessions()
     await motion_cleanup.stop()
+    await auth.stop_session_cleanup()
 
 
 def create_app() -> FastAPI:

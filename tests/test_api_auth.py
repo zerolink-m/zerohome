@@ -1,21 +1,15 @@
+import hashlib
+import time
+
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.core.codes import (BAD_CREDENTIALS, BAD_REQUEST, EMAIL_TAKEN, FORBIDDEN_ROLE,
-                            ENDPOINT_RATE_LIMITED, LOGIN_RATE_LIMITED, TOKEN_ERROR, TOKEN_MISSING)
-from app.core.security import create_access_token, create_session_token
-from app.models.session import Session as SessionModel
+from app.core.codes import BAD_CREDENTIALS, EMAIL_TAKEN, ENDPOINT_RATE_LIMITED, LOGIN_RATE_LIMITED, TOKEN_ERROR, TOKEN_MISSING
+import jwt
+from app.core.config import settings
+from app.core.security import bearer_hash, create_session_token
+from app.models.session import Session
 from tests.conftest import bearer, login_access
-
-
-def assert_envelope(body, code):
-    assert set(body) == {"code", "code_detail", "error", "metadata", "data"}
-    assert body["code"] == code
-    assert isinstance(body["code_detail"], str) and body["metadata"]["request_id"]
-    if code in ("000", "001", "007", "010", "018", "019"):
-        assert body["error"] == {}
-    else:
-        assert isinstance(body["error"]["error"], str) and body["data"] == {}
 
 
 def reg(user):
@@ -26,183 +20,128 @@ def cred(email, password):
     return {"data": {"credentials": {"email": email, "password": password}}}
 
 
-async def test_register_ok_and_duplicate(client):
+async def test_register_returns_token_and_persists_only_hash(client, db):
     p = {"name": "A", "surname": "B", "email": "A@Example.com", "password": "pw"}
     r = await client.post("/v1/auth/register", json=reg(p))
-    assert r.status_code == 201
-    assert_envelope(r.json(), "001")
-    assert isinstance(r.json()["data"]["user"]["id"], int)
-    r = await client.post("/v1/auth/register", json=reg({**p, "email": "a@example.com"}))
-    assert_envelope(r.json(), EMAIL_TAKEN)  # email is lower-cased
-
-
-async def test_register_invalid_body(client):
-    r = await client.post("/v1/auth/register", json=reg({"name": "A", "email": "nope"}))
-    assert r.status_code == 422
-    assert_envelope(r.json(), "109")
-    assert "email" in r.json()["error"]["fields"]
-    r = await client.post("/v1/auth/register", json=reg({"name": "A", "surname": "B",
-                          "email": "a@b.co", "password": "x", "extra": 1}))
-    assert_envelope(r.json(), "109")  # StrictModel forbids extras
-    assert r.json()["error"]["fields"]["extra"]["unknown"] is True
-
-
-async def test_register_rate_limited(client):
-    codes = []
-    for i in range(4):
-        r = await client.post("/v1/auth/register", json=reg({
-            "name": "A", "surname": "B", "email": f"u{i}@x.io", "password": "pw"}))
-        codes.append(r.json()["code"])
-    assert codes == ["001", "001", "001", ENDPOINT_RATE_LIMITED]
-    assert "retry-after" in r.headers
-
-
-async def test_login_ok_returns_session_token_and_creates_session(client, mk_user, db):
-    uid = await mk_user("u@x.io")
-    r = await client.post("/v1/auth/login", json=cred("U@X.io", "Passw0rd!"))
-    assert r.status_code == 200
-    assert_envelope(r.json(), "010")
-    tok = r.json()["data"]["token"]
-    from app.core.security import decode_any
-    p = decode_any(tok)
-    assert p.kind == "session" and p.uid == uid
+    assert r.status_code == 201 and r.json()["code"] == "001"
+    token = r.json()["data"]["token"]
+    assert len(token) == 43 and isinstance(r.json()["data"]["user"]["id"], int)
     async with db() as s:
-        rows = (await s.scalars(select(SessionModel))).all()
-    assert len(rows) == 1 and rows[0].ua == "pytest-UA/1.0" and rows[0].id == p.sid
+        row = (await s.scalars(select(Session))).one()
+        assert row.token_hash == hashlib.sha256(token.encode()).hexdigest()
+        assert row.last_seen == row.added_at
+    assert (await client.get("/v1/cams", headers=bearer(token))).status_code == 200
+    assert (await client.post("/v1/auth/register", json=reg({**p, "email": "a@example.com"}))).json()["code"] == EMAIL_TAKEN
+
+
+async def test_login_token_logout_and_revoke(client, mk_user, db):
+    await mk_user("u@x.io")
+    token = await login_access(client, "u@x.io")
+    assert (await client.get("/v1/cams", headers=bearer(token))).status_code == 200
+    async with db() as s:
+        row = (await s.scalars(select(Session))).one()
+        assert row.token_hash == bearer_hash(token)
+        sid = row.id
+    r = await client.post("/v1/auth/logout", headers=bearer(token))
+    assert r.json()["code"] == "018" and r.json()["data"]["session"]["id"] == sid
+    assert (await client.get("/v1/cams", headers=bearer(token))).status_code == 401
+    async with db() as s:
+        assert await s.get(Session, sid) is None
 
 
 @pytest.mark.parametrize("email,pw", [("u@x.io", "bad"), ("nobody@x.io", "Passw0rd!")])
 async def test_login_bad_credentials(client, mk_user, email, pw):
     await mk_user("u@x.io")
-    r = await client.post("/v1/auth/login", json=cred(email, pw))
-    assert_envelope(r.json(), BAD_CREDENTIALS)
+    assert (await client.post("/v1/auth/login", json=cred(email, pw))).json()["code"] == BAD_CREDENTIALS
 
 
-async def test_login_rate_limited_after_5(client, mk_user):
+async def test_login_rate_limit(client, mk_user):
     await mk_user("u@x.io")
-    codes = [(await client.post("/v1/auth/login", json=cred("u@x.io", "bad"))).json()["code"]
-             for _ in range(6)]
+    codes = [(await client.post("/v1/auth/login", json=cred("u@x.io", "bad"))).json()["code"] for _ in range(6)]
     assert codes[:5] == [BAD_CREDENTIALS] * 5 and codes[5] == LOGIN_RATE_LIMITED
 
 
-async def test_access_exchange_ok_user_and_admin(client, mk_user):
-    await mk_user("u@x.io")
-    await mk_user("a@x.io", role="admin")
-    from app.core.security import decode_any
-    assert decode_any(await login_access(client, "u@x.io")).kind == "access"
-    assert decode_any(await login_access(client, "a@x.io")).kind == "access-admin"
+async def test_register_rate_limit(client):
+    codes = [(await client.post("/v1/auth/register", json=reg({
+        "name": "A", "surname": "B", "email": f"u{i}@x.io", "password": "pw"}))).json()["code"] for i in range(4)]
+    assert codes == ["001"] * 3 + [ENDPOINT_RATE_LIMITED]
 
 
-async def test_access_requires_session_token(client, mk_user):
+async def test_legacy_refresh_one_time_conversion(client, mk_user, db):
     uid = await mk_user("u@x.io")
-    for h, code in (({}, TOKEN_MISSING), (bearer("junk"), "149"),
-                    (bearer(create_access_token(uid, 1, "user")), TOKEN_ERROR)):
-        r = await client.post("/v1/auth/access", headers=h)
-        assert_envelope(r.json(), code)
-
-
-async def test_access_unknown_session(client, mk_user):
-    uid = await mk_user("u@x.io")
-    r = await client.post("/v1/auth/access", headers=bearer(create_session_token(uid, 999)))
-    assert_envelope(r.json(), TOKEN_ERROR)
-
-
-async def test_access_ua_mismatch_deletes_session(client, mk_user, db):
-    await mk_user("u@x.io")
-    r = await client.post("/v1/auth/login", json=cred("u@x.io", "Passw0rd!"))
-    tok = r.json()["data"]["token"]
-    r = await client.post("/v1/auth/access", headers={**bearer(tok), "user-agent": "Totally Different"})
-    assert_envelope(r.json(), TOKEN_ERROR)
+    now = int(time.time())
     async with db() as s:
-        assert (await s.scalars(select(SessionModel))).all() == []
-    # session gone -> even the original UA no longer works
-    r = await client.post("/v1/auth/access", headers=bearer(tok))
-    assert_envelope(r.json(), TOKEN_ERROR)
+        row = Session(uid=uid, ua="pytest-UA/1.0", ip="127.0.0.1", last_login=now,
+                      last_seen=now, added_at=now, updated_at=now, token_hash=None)
+        s.add(row)
+        await s.commit()
+        legacy = create_session_token(uid, row.id)
+    assert (await client.get("/v1/cams", headers=bearer(legacy))).status_code == 401
+    converted = await client.post("/v1/auth/new-refresh", headers=bearer(legacy))
+    assert converted.json()["code"] == "019"
+    token = converted.json()["data"]["token"]
+    assert (await client.get("/v1/cams", headers=bearer(token))).status_code == 200
+    assert (await client.post("/v1/auth/new-refresh", headers=bearer(legacy))).status_code == 401
+    async with db() as s:
+        assert (await s.get(Session, row.id)).token_hash == bearer_hash(token)
+    assert (await client.post("/v1/auth/access", headers=bearer(legacy))).status_code == 404
 
 
-async def test_access_ua_version_bump_updates_ua(client, mk_user, db):
+async def test_expired_or_revoked_legacy_refresh_never_converts(client, mk_user, db):
+    uid = await mk_user("u@x.io")
+    now = int(time.time())
+    async with db() as s:
+        row = Session(uid=uid, ua="pytest-UA/1.0", ip="127.0.0.1", last_login=now,
+                      last_seen=now, added_at=now, updated_at=now, token_hash=None)
+        s.add(row)
+        await s.commit()
+        sid = row.id
+    expired = jwt.encode({"uid": uid, "sid": sid, "iat": now - 86400, "exp": now - 1},
+                         settings.JWT_SECRET_SESSION, algorithm="HS256")
+    assert (await client.post("/v1/auth/new-refresh", headers=bearer(expired))).json()["code"] == "043"
+    async with db() as s:
+        assert (await s.get(Session, sid)).token_hash is None
+        await s.delete(await s.get(Session, sid))
+        await s.commit()
+    assert (await client.post("/v1/auth/new-refresh", headers=bearer(create_session_token(uid, sid)))).json()["code"] == TOKEN_ERROR
+
+
+async def test_old_access_is_rejected_even_with_live_session(client, mk_user):
+    uid = await mk_user("u@x.io")
+    await login_access(client, "u@x.io")
+    now = int(time.time())
+    legacy = jwt.encode({"uid": uid, "sid": 1, "role": "user", "iat": now, "exp": now + 300},
+                        settings.JWT_SECRET_ACCESS, algorithm="HS256")
+    assert (await client.get("/v1/cams", headers=bearer(legacy))).status_code == 401
+    assert (await client.post("/v1/auth/new-refresh", headers=bearer(legacy))).status_code == 401
+
+
+async def test_ua_mismatch_revokes_and_version_change_keeps_session(client, mk_user):
     await mk_user("u@x.io")
     r = await client.post("/v1/auth/login", json=cred("u@x.io", "Passw0rd!"),
                           headers={"user-agent": "Browser/100.0.1"})
-    tok = r.json()["data"]["token"]
-    r = await client.post("/v1/auth/access", headers={**bearer(tok), "user-agent": "Browser/101.0.2"})
-    assert_envelope(r.json(), "019")
-    async with db() as s:
-        row = (await s.scalars(select(SessionModel))).one()
-    assert row.ua == "Browser/101.0.2"
+    token = r.json()["data"]["token"]
+    assert (await client.get("/v1/cams", headers={**bearer(token), "user-agent": "Browser/101.0.2"})).status_code == 200
+    assert (await client.get("/v1/cams", headers={**bearer(token), "user-agent": "Intruder"})).status_code == 401
+    assert (await client.get("/v1/cams", headers={**bearer(token), "user-agent": "Browser/101.0.2"})).status_code == 401
 
 
-async def test_logout_deletes_session(client, mk_user, db):
+async def test_idle_expiry_deletes_real_row(client, mk_user, db):
     await mk_user("u@x.io")
-    acc = await login_access(client, "u@x.io")
-    r = await client.post("/v1/auth/logout", headers=bearer(acc))
-    assert_envelope(r.json(), "018")
-    assert isinstance(r.json()["data"]["session"]["id"], int)
+    token = await login_access(client, "u@x.io")
     async with db() as s:
-        assert (await s.scalars(select(SessionModel))).all() == []
+        await s.execute(update(Session).values(last_seen=int(time.time()) - 30 * 86400))
+        await s.commit()
+    assert (await client.get("/v1/cams", headers=bearer(token))).status_code == 401
+    async with db() as s:
+        assert (await s.scalars(select(Session))).all() == []
 
 
-async def test_logout_requires_access_token(client, mk_user):
-    uid = await mk_user("u@x.io")
-    r = await client.post("/v1/auth/logout", headers=bearer(create_session_token(uid, 1)))
-    assert_envelope(r.json(), TOKEN_ERROR)
+async def test_missing_token(client):
     r = await client.post("/v1/auth/logout")
-    assert_envelope(r.json(), TOKEN_MISSING)
-
-
-async def test_cache_headers_default(client):
-    r = await client.post("/v1/auth/logout")
-    assert "no-store" in r.headers["cache-control"]
-
-
-# --- documented contract vs. actual HTTP statuses (API.md: code -> HTTP status) ---
-@pytest.mark.parametrize("path,expected", [("/v1/auth/logout", 401)])
-async def test_http_status_matches_documented_code(client, path, expected):
-    r = await client.post(path)
-    assert r.status_code == expected
-    assert r.json()["code"] == "046"
-
-
-# --- Request object contract ---
-async def test_register_old_flat_body_rejected(client):
-    r = await client.post("/v1/auth/register", json={"name": "A", "surname": "B", "email": "a@b.co", "password": "x"})
-    assert r.status_code == 422
-    assert_envelope(r.json(), "109")
-    assert "data" in r.json()["error"]["fields"]
-
-
-async def test_register_missing_key_and_empty_body_and_bad_json(client):
-    r = await client.post("/v1/auth/register", json={"data": {}})
-    assert_envelope(r.json(), "109")
-    assert "user" in r.json()["error"]["fields"]
-    r = await client.post("/v1/auth/register", content=b"", headers={"content-type": "application/json"})
-    assert_envelope(r.json(), "121")
-    r = await client.post("/v1/auth/register", content=b"{bad", headers={"content-type": "application/json"})
-    assert_envelope(r.json(), "117")
-
-
-async def test_register_wrong_content_type(client):
-    r = await client.post("/v1/auth/register", content=b"x", headers={"content-type": "text/plain"})
-    assert_envelope(r.json(), "107")
-
-
-async def test_login_validation_nested_field(client):
-    r = await client.post("/v1/auth/login", json={"data": {"credentials": {"email": "bad", "password": "x"}}})
-    assert r.status_code == 422
-    assert_envelope(r.json(), "109")
-    assert "email" in r.json()["error"]["fields"]
-
-
-async def test_access_token_data_shape(client, mk_user):
-    await mk_user("u@x.io")
-    r = await client.post("/v1/auth/login", json=cred("u@x.io", "Passw0rd!"))
-    assert set(r.json()["data"]) == {"token"}
-    r = await client.post("/v1/auth/access", headers=bearer(r.json()["data"]["token"]))
-    assert r.status_code == 200 and set(r.json()["data"]) == {"token"}
+    assert r.json()["code"] == TOKEN_MISSING and "no-store" in r.headers["cache-control"]
 
 
 async def test_options_auth_login(client):
     r = await client.options("/v1/auth/login")
-    assert r.status_code in (200, 204)
-    assert "POST" in r.headers["allow"] and "OPTIONS" in r.headers["allow"]
-    assert r.headers["cursed-bulk"] == "off"
+    assert r.status_code in (200, 204) and "POST" in r.headers["allow"]

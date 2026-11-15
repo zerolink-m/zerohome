@@ -1,0 +1,76 @@
+name: zerohome
+
+x-app: &app
+  image: ${ZEROHOME_IMAGE:-ghcr.io/zerolink-m/zerohome:stable}
+  # Supply a host-managed file; it is never copied into the build context.
+  env_file:
+    - ${ZEROHOME_CONFIG:-/etc/zerohome/app.conf}
+  environment:
+    DB_HOST: db
+    DB_PORT: "3306"
+    DB_NAME: ${DB_NAME:-zerocams}
+    DB_USER: ${DB_USER:-zerocams}
+    DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the deployment configuration}
+    HOST: 0.0.0.0
+    PORT: "8000"
+    CACHE_DIR: /data/cache
+    MOTION_FILES_DIR: /data/motion_files
+  volumes:
+    - motion:/data/motion_files
+    - models:/data/models
+  tmpfs:
+    - /tmp:mode=1777
+    - /data/cache:uid=10001,gid=10001,mode=0700
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  labels:
+    com.centurylinklabs.watchtower.enable: "false"
+
+services:
+  db:
+    image: mysql:8.4.8
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${DB_NAME:-zerocams}
+      MYSQL_USER: ${DB_USER:-zerocams}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the deployment configuration}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in the deployment configuration}
+    volumes:
+      - mysql:/var/lib/mysql
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD="$${MYSQL_ROOT_PASSWORD}" mysql --protocol=socket -uroot -e "SELECT 1" >/dev/null 2>&1']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    # No host port: only the app's private Compose network can reach MySQL.
+
+  migrate:
+    <<: *app
+    profiles: [maintenance]
+    restart: "no"
+    command: [alembic, upgrade, head]
+    healthcheck:
+      disable: true
+    depends_on:
+      db:
+        condition: service_healthy
+
+  app:
+    <<: *app
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    ports:
+      - "${ZEROHOME_BIND:-127.0.0.1}:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  mysql:
+  motion:
+  models:

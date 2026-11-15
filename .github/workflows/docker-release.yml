@@ -1,0 +1,89 @@
+name: Docker release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  push:
+    branches: [release/docker-task-controls]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - requirements.txt
+      - app/**
+      - alembic/**
+      - main.py
+      - compose.yaml
+      - deploy/**
+      - .github/workflows/docker-release.yml
+
+# Serialize promotions; never cancel a release after pushing its candidate.
+concurrency:
+  group: zerohome-container-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/zerolink-m/zerohome
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Prepare image metadata
+        id: meta
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="${RELEASE_TAG:-sha-$GITHUB_SHA}"
+          tag="$(printf '%s' "$version" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g')"
+          [[ "$tag" =~ ^[a-z0-9_][a-z0-9_.-]{0,127}$ ]] || exit 1
+          printf 'version=%s\ntag=%s\n' "$version" "$tag" >> "$GITHUB_OUTPUT"
+      - name: Verify private package or documented private bootstrap
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 deploy/check-package-visibility.py --allow-new
+      - uses: docker/login-action@v3
+        if: github.event_name == 'release'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and optionally publish SHA candidate
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'release' }}
+          tags: ghcr.io/zerolink-m/zerohome:sha-${{ github.sha }}
+          build-args: VERSION=${{ steps.meta.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/zerolink-m/zerohome
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Require private visibility before any release tag
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          python3 deploy/check-package-visibility.py | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Promote verified private candidate
+        if: github.event_name == 'release'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_IMAGE_TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          tags=(--tag "$IMAGE:$RELEASE_IMAGE_TAG")
+          if [[ "$PRERELEASE" == false ]]; then tags+=(--tag "$IMAGE:stable"); fi
+          docker buildx imagetools create "${tags[@]}" "$IMAGE@$DIGEST"

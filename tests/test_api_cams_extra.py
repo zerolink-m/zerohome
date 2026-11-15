@@ -1,14 +1,15 @@
+from tests.conftest import mint_test_token
 import os
 import time
 
-from app.core.security import create_access_token, create_share_token
+from app.core.security import create_share_token
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
 from tests.conftest import bearer
 
 
-def tok(uid, role="user"):
-    return create_access_token(uid, 1, role)
+async def tok(uid, role="user"):
+    return await mint_test_token(uid, role)
 
 
 def req(key, obj):
@@ -27,7 +28,7 @@ async def test_admin_can_patch_and_delete_foreign_cam(client, mk_user, mk_cam):
     owner = await mk_user("o@x.io")
     admin = await mk_user("a@x.io", role="admin")
     cid = await mk_cam(owner)
-    h = bearer(tok(admin, "admin"))
+    h = bearer(await tok(admin, "admin"))
     r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"name": "adm"}))
     assert r.json()["code"] == "003" and r.json()["data"]["cam"]["name"] == "adm"
     r = await client.delete(f"/v1/cams/{cid}", headers=h)
@@ -39,7 +40,7 @@ async def test_invited_user_forbidden_on_manage_endpoints(client, mk_user, mk_ca
     guest = await mk_user("g@x.io")
     cid = await mk_cam(owner)
     await _invite(db, cid, "g@x.io")
-    h = bearer(tok(guest))
+    h = bearer(await tok(guest))
     r = await client.get(f"/v1/cams/{cid}/recording", headers=h)
     assert r.status_code == 403 and r.json()["code"] == "051"
     r = await client.patch(f"/v1/cams/{cid}/recording", headers=h, json=req("recording_config", {"record": 0}))
@@ -52,7 +53,7 @@ async def test_invited_user_forbidden_on_manage_endpoints(client, mk_user, mk_ca
 
 
 async def test_unknown_cam_codes(client, mk_user):
-    h = bearer(tok(await mk_user("o@x.io")))
+    h = bearer(await tok(await mk_user("o@x.io")))
     for method, path, body in (
         ("get", "/v1/cams/999/ptz", None),
         ("get", "/v1/cams/999/recording", None),
@@ -68,12 +69,12 @@ async def test_unknown_cam_codes(client, mk_user):
 async def test_recording_not_configured_177(client, mk_user, mk_cam):
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    r = await client.get(f"/v1/cams/{cid}/recordings", headers=bearer(tok(owner)))
+    r = await client.get(f"/v1/cams/{cid}/recordings", headers=bearer(await tok(owner)))
     assert r.status_code == 409 and r.json()["code"] == "177"
 
 
 async def test_empty_list_has_settings_and_012(client, mk_user):
-    r = await client.get("/v1/cams", headers=bearer(tok(await mk_user("o@x.io"))))
+    r = await client.get("/v1/cams", headers=bearer(await tok(await mk_user("o@x.io"))))
     j = r.json()
     assert r.status_code == 200 and j["code"] == "012"
     assert j["data"]["cams"] == [] and j["data"]["settings"]["total"] == 0
@@ -83,7 +84,7 @@ async def test_snapshot_and_stream_errors_are_json(client, mk_user, mk_cam, monk
     from app.services import snapshot, stream_manager
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
 
     async def bad_snap(cam):
         raise snapshot.SnapshotError("boom")
@@ -117,7 +118,7 @@ async def test_hls_disabled_and_segment_errors(client, mk_user, mk_cam, monkeypa
     from app.services import hls_manager
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.get(f"/v1/cams/{cid}/hls/playlist.m3u8", headers=h)
     assert r.status_code == 400 and r.json()["code"] == "040"
     r = await client.get(f"/v1/cams/{cid}/hls/seg1.ts", headers=h)
@@ -150,7 +151,7 @@ async def test_record_share_token_gets_only_its_file(client, mk_user, mk_cam, db
     from sqlalchemy import update
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     async with db() as s:
         await s.execute(update(User).where(User.id == owner).values(allowrecord=1))
         await s.commit()
@@ -182,7 +183,7 @@ async def test_recording_snapshot_error_is_json(client, mk_user, mk_cam, db, tmp
     from sqlalchemy import update
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     async with db() as s:
         await s.execute(update(User).where(User.id == owner).values(allowrecord=1))
         await s.commit()

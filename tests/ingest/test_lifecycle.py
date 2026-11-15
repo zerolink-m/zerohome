@@ -74,7 +74,7 @@ async def test_start_all_enabled_only_enabled_cams(ingest_on, mk_user, sessionma
 
 async def test_crud_hooks_follow_enabled_and_connection_fields(ingest_on, client, mk_user, mk_cam, fake_log, sessionmaker_):
     owner = await mk_user("o@x.io")
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     try:
         # create enabled -> started
         r = await client.post("/v1/cams", headers=h, json=req("cam", {
@@ -124,7 +124,7 @@ async def test_crud_hooks_follow_enabled_and_connection_fields(ingest_on, client
 
 async def test_bulk_hooks(ingest_on, client, mk_user, fake_log):
     owner = await mk_user("o@x.io")
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     try:
         item = {"enabled": 1, "protocol": "rtsp", "address": "127.0.0.1", "port": 554,
                 "path": "ok", "username": "u", "password": "pw"}
@@ -147,7 +147,7 @@ async def test_ingest_failure_does_not_break_api(ingest_on, client, mk_user, mon
     monkeypatch.setattr(ingest_on, "apply", boom)
     monkeypatch.setattr(ingest_on, "stop", boom)
     owner = await mk_user("o@x.io")
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.post("/v1/cams", headers=h, json=req("cam", {
         "enabled": 1, "protocol": "rtsp", "address": "127.0.0.1", "port": 554,
         "username": "u", "password": "pw"}))

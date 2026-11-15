@@ -1,8 +1,8 @@
 """PATCH with explicit null: rejected (109) for NOT NULL columns, accepted for nullable ones."""
+from tests.conftest import mint_test_token
 import pytest
 from pydantic import ValidationError
 
-from app.core.security import create_access_token
 from app.schemas.cams import CamOnvifPatch, CamPatch, CamRecordingPatch
 from app.schemas.connection import ConnectionPatch
 from app.schemas.motion import ONVIFSettingsUpdate
@@ -54,7 +54,7 @@ def req(key, obj):
 async def test_http_patch_null_gives_109_not_500(client, mk_user, mk_cam):
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
-    h = bearer(create_access_token(owner, 1, "user"))
+    h = bearer(await mint_test_token(owner, "user"))
     for field in ("name", "port", "username", "password", "address", "protocol", "path", "enabled"):
         r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {field: None}))
         assert r.status_code == 422 and r.json()["code"] == "109", (field, r.text)
@@ -71,7 +71,7 @@ async def test_http_patch_null_gives_109_not_500(client, mk_user, mk_cam):
 
 async def test_http_user_and_switch_null(client, mk_user):
     uid = await mk_user("u@x.io")
-    h = bearer(create_access_token(uid, 1, "user"))
+    h = bearer(await mint_test_token(uid, "user"))
     for field in ("name", "surname", "email"):
         r = await client.patch(f"/v1/users/{uid}", headers=h, json=req("user", {field: None}))
         assert r.json()["code"] == "109", (field, r.text)

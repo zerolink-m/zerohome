@@ -55,7 +55,8 @@ async def webrtc_stream(
 
     try:
         raw = extract_token_flexible(None, token)
-        ctx = await authorize_device_token(raw, "cams", "stream", id, db)
+        ctx = await authorize_device_token(raw, "cams", "stream", id, db,
+                                           websocket.headers.get("user-agent", ""))
         cam = await _get_cam_for_access(id, ctx, db)
     except AppError as e:
         print(f"[WebRTC] Access denied: {e}")

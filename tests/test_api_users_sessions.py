@@ -185,9 +185,9 @@ async def test_sessions(client, admin, user, mk_user, db):
     r = await client.delete(f"/v1/users/{uid}/sessions/bulk/{sid},999?partial_allowed=true", headers=h)
     b = ok_env(r, "008")
     assert b["data"]["sessions"]["succeeded"] == [{"id": sid}]
-    # access token is still valid (stateless) -> delete single of unknown
+    # Revoking the current session immediately invalidates the bearer on every route.
     r = await client.delete(f"/v1/users/{uid}/sessions/{sid}", headers=h)
-    ok_env(r, "082")
+    ok_env(r, "042")
 
 
 async def test_session_delete_single(client, user):

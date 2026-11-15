@@ -1,10 +1,10 @@
+from tests.conftest import mint_test_token
 import time
 
 import pytest
 from sqlalchemy import BigInteger
 from sqlalchemy.ext.compiler import compiles
 
-from app.core.security import create_access_token
 from app.models.motion_event import MotionEvent
 from tests.conftest import bearer
 
@@ -15,8 +15,8 @@ def _bigint_as_integer(type_, compiler, **kw):
     return "INTEGER"
 
 
-def tok(uid, role="user"):
-    return create_access_token(uid, 1, role)
+async def tok(uid, role="user"):
+    return await mint_test_token(uid, role)
 
 
 @pytest.fixture
@@ -32,33 +32,33 @@ async def setup(mk_user, mk_cam):
 async def test_push_settings_get_and_patch(client, setup):
     owner, other, _, cam = setup
     url = f"/v1/cams/{cam}/push-settings"
-    r = await client.get(url, headers=bearer(tok(owner)))
+    r = await client.get(url, headers=bearer(await tok(owner)))
     assert r.status_code == 200 and r.json()["code"] == "000"
     ps = r.json()["data"]["push_settings"]
     assert ps["device_id"] == cam and ps["enabled"] == 1
 
     body = {"data": {"push_settings": {"notify_offline": 0}}}
-    r = await client.patch(url, headers=bearer(tok(owner)), json=body)
+    r = await client.patch(url, headers=bearer(await tok(owner)), json=body)
     assert r.json()["code"] == "003"
     assert r.json()["data"]["push_settings"]["notify_offline"] == 0
     # same values again: not changed
-    r = await client.patch(url, headers=bearer(tok(owner)), json=body)
+    r = await client.patch(url, headers=bearer(await tok(owner)), json=body)
     assert r.json()["code"] == "005"
 
 
 async def test_push_settings_validation_and_access(client, setup):
     owner, other, _, cam = setup
     url = f"/v1/cams/{cam}/push-settings"
-    r = await client.patch(url, headers=bearer(tok(owner)), json={"enabled": 0})
+    r = await client.patch(url, headers=bearer(await tok(owner)), json={"enabled": 0})
     assert r.json()["code"] == "109"
-    r = await client.patch(url, headers=bearer(tok(owner)),
+    r = await client.patch(url, headers=bearer(await tok(owner)),
                            json={"data": {"push_settings": {"enabled": 5}}})
     assert r.json()["code"] == "109" and "enabled" in r.json()["error"]["fields"]
-    r = await client.patch(url, headers=bearer(tok(owner)),
+    r = await client.patch(url, headers=bearer(await tok(owner)),
                            json={"data": {"push_settings": {"bogus": 1}}})
     assert r.json()["code"] == "109"
-    assert (await client.get(url, headers=bearer(tok(other)))).json()["code"] == "051"
-    assert (await client.get("/v1/cams/9999/push-settings", headers=bearer(tok(owner)))).json()["code"] == "082"
+    assert (await client.get(url, headers=bearer(await tok(other)))).json()["code"] == "051"
+    assert (await client.get("/v1/cams/9999/push-settings", headers=bearer(await tok(owner)))).json()["code"] == "082"
 
 
 # ---------------- motion ----------------
@@ -76,7 +76,7 @@ async def events(sessionmaker_, setup):
 
 async def test_motion_events_list_get_delete(client, setup, events):
     owner, other, _, cam = setup
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
     r = await client.get(f"/v1/cams/{cam}/motion/events", headers=h)
     d = r.json()["data"]
     assert r.json()["code"] == "000" and d["settings"]["total"] == 3
@@ -89,9 +89,9 @@ async def test_motion_events_list_get_delete(client, setup, events):
     eid = d["motion_events"][0]["id"]
     r = await client.get(f"/v1/motion/events/{eid}", headers=h)
     assert r.json()["data"]["motion_event"]["id"] == eid
-    assert (await client.get(f"/v1/motion/events/{eid}", headers=bearer(tok(other)))).json()["code"] == "051"
+    assert (await client.get(f"/v1/motion/events/{eid}", headers=bearer(await tok(other)))).json()["code"] == "051"
 
-    assert (await client.delete(f"/v1/motion/events/{eid}", headers=bearer(tok(other)))).json()["code"] == "051"
+    assert (await client.delete(f"/v1/motion/events/{eid}", headers=bearer(await tok(other)))).json()["code"] == "051"
     r = await client.delete(f"/v1/motion/events/{eid}", headers=h)
     assert r.json()["code"] == "007" and r.json()["data"]["motion_event"] == {"id": eid}
     assert (await client.get(f"/v1/motion/events/{eid}", headers=h)).json()["code"] == "082"
@@ -99,9 +99,9 @@ async def test_motion_events_list_get_delete(client, setup, events):
 
 async def test_motion_events_empty_and_bad_limit(client, setup):
     owner, _, _, cam = setup
-    r = await client.get(f"/v1/cams/{cam}/motion/events", headers=bearer(tok(owner)))
+    r = await client.get(f"/v1/cams/{cam}/motion/events", headers=bearer(await tok(owner)))
     assert r.json()["code"] == "012" and r.json()["data"]["motion_events"] == []
-    r = await client.get(f"/v1/cams/{cam}/motion/events?limit=500", headers=bearer(tok(owner)))
+    r = await client.get(f"/v1/cams/{cam}/motion/events?limit=500", headers=bearer(await tok(owner)))
     assert r.json()["code"] == "183"
 
 
@@ -122,7 +122,7 @@ async def test_motion_control(client, setup, monkeypatch, sessionmaker_):
     monkeypatch.setattr(motion_detection, "start_motion_detection", start)
     monkeypatch.setattr(motion_detection, "stop_motion_detection", stop)
     monkeypatch.setattr(motion_detection, "is_motion_detection_active", lambda cid: state["on"])
-    h = bearer(tok(owner))
+    h = bearer(await tok(owner))
 
     # owner not allowed motion detection yet
     assert (await client.post(f"/v1/cams/{cam}/motion/start", headers=h)).json()["code"] == "051"
@@ -135,7 +135,7 @@ async def test_motion_control(client, setup, monkeypatch, sessionmaker_):
     assert r.json()["data"]["motion"]["is_active"] is True
     r = await client.post(f"/v1/cams/{cam}/motion/stop", headers=h)
     assert r.json()["data"]["motion"]["is_active"] is False
-    assert (await client.post(f"/v1/cams/{cam}/motion/stop", headers=bearer(tok(other)))).json()["code"] == "051"
+    assert (await client.post(f"/v1/cams/{cam}/motion/stop", headers=bearer(await tok(other)))).json()["code"] == "051"
 
 
 # ---------------- stats ----------------
@@ -145,18 +145,18 @@ async def test_stats_admin_only_and_shape(client, setup, monkeypatch):
     monkeypatch.setattr(stats_collector, "get_stream_stats", lambda: {"active_streams": {"fmp4": 1}, "total_clients": 2})
     monkeypatch.setattr(stats_collector, "get_error_stats", lambda: {
         "errors_by_type": {}, "http_4xx": 1, "http_5xx": 0, "rtsp_failures": 0, "onvif_failures": 0})
-    assert (await client.get("/v1/stats/streams", headers=bearer(tok(owner)))).json()["code"] == "050"
-    r = await client.get("/v1/stats/streams", headers=bearer(tok(admin, "admin")))
+    assert (await client.get("/v1/stats/streams", headers=bearer(await tok(owner)))).json()["code"] == "050"
+    r = await client.get("/v1/stats/streams", headers=bearer(await tok(admin, "admin")))
     assert r.json()["code"] == "000"
     assert r.json()["data"] == {"streams": {"active_streams": {"fmp4": 1}, "total_clients": 2}}
-    r = await client.get("/v1/stats/errors", headers=bearer(tok(admin, "admin")))
+    r = await client.get("/v1/stats/errors", headers=bearer(await tok(admin, "admin")))
     assert r.json()["data"]["errors"]["http_4xx"] == 1
 
 
 async def test_stats_all_and_bad_period(client, setup, monkeypatch):
     from app.services import stats_collector
     _, _, admin, _ = setup
-    h = bearer(tok(admin, "admin"))
+    h = bearer(await tok(admin, "admin"))
     full = {
         "system": {"cpu_percent": 1.0, "memory": {}, "disk": {}, "network": {}, "uptime_seconds": 1},
         "streams": {"active_streams": {}, "total_clients": 0},
@@ -210,7 +210,7 @@ async def test_stats_cameras_ingest_block(client, setup, monkeypatch):
     }
     monkeypatch.setattr(settings, "INGEST_ENABLED", True)
     monkeypatch.setattr(lifecycle, "_supervisor", _StubSupervisor(status))
-    r = await client.get("/v1/stats/cameras", headers=bearer(tok(admin, "admin")))
+    r = await client.get("/v1/stats/cameras", headers=bearer(await tok(admin, "admin")))
     assert r.json()["code"] == "000"
     cams = r.json()["data"]["cameras"]
     assert _OLD_CAM_KEYS <= set(cams) and cams["total"] == 1
@@ -236,7 +236,7 @@ async def test_stats_cameras_ingest_disabled(client, setup, monkeypatch):
     _, _, admin, _ = setup
     monkeypatch.setattr(settings, "INGEST_ENABLED", False)
     monkeypatch.setattr(lifecycle, "_supervisor", _StubSupervisor({1: {"state": "online"}}))
-    r = await client.get("/v1/stats/cameras", headers=bearer(tok(admin, "admin")))
+    r = await client.get("/v1/stats/cameras", headers=bearer(await tok(admin, "admin")))
     cams = r.json()["data"]["cameras"]
     assert cams["ingest"] is None
     assert cams == {"total": 1, "enabled": cams["enabled"], "disabled": cams["disabled"],
@@ -245,7 +245,7 @@ async def test_stats_cameras_ingest_disabled(client, setup, monkeypatch):
     # enabled but supervisor never started
     monkeypatch.setattr(settings, "INGEST_ENABLED", True)
     monkeypatch.setattr(lifecycle, "_supervisor", None)
-    r = await client.get("/v1/stats/cameras", headers=bearer(tok(admin, "admin")))
+    r = await client.get("/v1/stats/cameras", headers=bearer(await tok(admin, "admin")))
     assert r.json()["data"]["cameras"]["ingest"] is None
 
 

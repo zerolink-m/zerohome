@@ -9,5 +9,6 @@ class SessionOut(StrictModel):
     ua: str
     ip: str
     last_login: int
+    last_seen: int
     updated_at: int
     added_at: int

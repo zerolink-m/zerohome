@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.codes import FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND
@@ -12,7 +14,7 @@ from app.core.validation import field_error
 from app.core.rate_limit import rate_limit
 from app.core.security import TokenPayload
 from app.db.session import get_db
-from app.deps.auth import require_access
+from app.deps.auth import IDLE_SECONDS, require_access
 from app.deps.list_query import ListQuery, list_query
 from app.models.session import Session as SessionModel
 from app.models.user import User
@@ -22,7 +24,7 @@ from app.schemas.session import SessionOut
 
 router = APIRouter(prefix="/v1/users", tags=["sessions"])
 
-SESSIONS_COLUMNS = ["id", "uid", "ua", "ip", "last_login", "added_at", "updated_at"]
+SESSIONS_COLUMNS = ["id", "uid", "ua", "ip", "last_login", "last_seen", "added_at", "updated_at"]
 sessions_query = list_query(model=SessionModel, sortable=SESSIONS_COLUMNS, searchable=SESSIONS_COLUMNS)
 
 
@@ -33,6 +35,7 @@ def _to_out(session: SessionModel) -> dict:
         ua=session.ua,
         ip=session.ip,
         last_login=session.last_login,
+        last_seen=session.last_seen,
         added_at=session.added_at,
         updated_at=session.updated_at,
     ).model_dump()
@@ -43,6 +46,10 @@ async def _check_access_and_user(
 ) -> None:
     if payload.uid != user_id and payload.role != "admin":
         raise AppError(FORBIDDEN_RESOURCE, "Доступ к чужим сессиям запрещён")
+    result = await db.execute(delete(SessionModel).where(
+        SessionModel.uid == user_id, SessionModel.last_seen <= int(time.time()) - IDLE_SECONDS))
+    if result.rowcount:
+        await db.commit()
     user = await db.get(User, user_id)
     if user is None:
         raise AppError(OBJECT_NOT_FOUND, "Пользователь не найден", path={
