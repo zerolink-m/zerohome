@@ -33,4 +33,4 @@ from app.services.connection_sync.helpers import (  # noqa: F401
     _tuya_master_controlmeta,
 )
 from app.services.connection_sync.tuya_sync import _sync_tuya_connection  # noqa: F401
-from app.services.connection_sync.runner import _loop, _sync_one, _sync_once, start, sync_connection_now  # noqa: F401
+from app.services.connection_sync.runner import _loop, _sync_one, _sync_once, start, stop, sync_connection_now  # noqa: F401

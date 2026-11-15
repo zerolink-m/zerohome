@@ -17,10 +17,11 @@ from app.db.session import get_db
 from app.models.session import Session
 from app.models.sharing import Sharing
 from app.models.user import User
+from app.services import session_activity
 
 _AUTH_HDR = {"Authorization": {"error": "token is required", "required": True, "type": "string"}}
-IDLE_SECONDS = 30 * 24 * 3600
-ACTIVITY_INTERVAL = 60
+IDLE_SECONDS = session_activity.IDLE_SECONDS
+ACTIVITY_INTERVAL = session_activity.ACTIVITY_INTERVAL
 
 
 def get_bearer_token(authorization: str | None = Header(None)) -> str:
@@ -99,12 +100,8 @@ async def _authenticate(raw: str, db: AsyncSession, ua: str, query: bool = False
             if not result.rowcount:
                 raise AppError(TOKEN_ERROR, "Сессия отозвана")
         elif row.last_seen <= now - ACTIVITY_INTERVAL:
-            result = await db.execute(update(Session).where(
-                Session.id == row.id, Session.token_hash == digest, Session.last_seen > cutoff
-            ).values(last_seen=now))
-            await db.commit()
-            if not result.rowcount:
-                raise AppError(TOKEN_ERROR, "Сессия отозвана")
+            # Deferred, non-blocking: the background writer persists last_seen.
+            session_activity.touch(row.id, digest, now)
         user = await db.get(User, row.uid)
         if user is None:
             raise AppError(TOKEN_ERROR, "Пользователь не найден")

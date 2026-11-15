@@ -105,6 +105,75 @@ Fresh MySQL installs create Alembic's version table with a 128-character revisio
 
 Moving an existing production DB into the Compose volume is **not** performed by this setup. Plan and rehearse a stopped-writer export/import, preserve credentials and signing keys as appropriate, verify the Alembic revision, migrate, and cut over explicitly. Never point the fresh MySQL service at arbitrary existing host database files.
 
+## Existing `/opt/zerocams` host: systemd to Docker, host MySQL retained
+
+`compose.host.yaml` is a **standalone, host-specific alternative**, not an override to merge with `compose.yaml`. It has only `app`: no database container, migration service, automatic schema changes or image pulls. **The shipped `deploy/update.sh` and `zerohome-update.timer` are NOT compatible with this deployment**: they assume Compose-managed MySQL and run migrations. Do not install/enable them; ensure no previously installed updater is active before cutover. Watchtower is explicitly excluded.
+
+Inspected host settings: systemd runs `/opt/zerocams/main.py` as root, with working directory `/opt/zerocams` and `KillMode=control-group`; HTTP binds `0.0.0.0:3805`, MySQL is `127.0.0.1:3306`, WebRTC uses UDP `49152–65535`. Host networking retains these routes and the existing firewall/NAT rules; Docker port publishing is deliberately absent. It also exposes the container to host-network services: this is not bridge-network isolation.
+
+The unchanged `/opt/zerocams/.env` is supplied via `env_file`; credentials, signing keys, worker flags and WebRTC settings remain there. Only container storage paths and the inspected HTTP bind are overridden. The image entrypoint restores the release `VERSION` from `/usr/local/share/zerohome-version`, ignoring a stale value in `.env`. If the host bind/port is deliberately changed later, update both Compose environment and healthcheck.
+
+### Storage and privilege choices
+
+- `/opt/zerocams/motion_files` is bind-mounted read/write at `/data/motion_files`. Existing photos and ownership remain unchanged; normal application retention cleanup still applies after startup.
+- `/opt/zerocams/caching` is **not mounted or copied**. Snapshots are regenerable; all ingest/transcode/HLS/WebRTC/snapshot/motion PID registries go into private `/data/cache` tmpfs. HLS segments use private `/tmp/zerocams/hls` tmpfs. Never share the host PID namespace or copy its process registries. These caches disappear on container stop.
+- Existing `/root/.EasyOCR` is narrowly mounted **read-only** at `/data/models/.EasyOCR`; no other `/root` files are exposed. The inspected cache contains `model/craft_mlt_25k.pth`, `model/cyrillic_g2.pth` and `user_network/`, matching the app's English/Russian EasyOCR reader. A missing/corrupt/incompatible model cannot be downloaded over this read-only mount: test OCR after cutover. If replacement models are needed, prepare a separate container-owned copy and change only this bind source, rather than modifying production cache ownership.
+- The fresh `zerohome-host_models` volume holds Ultralytics settings and other model-home caches. `nocopy` avoids inheriting UID 10001 ownership from the image. Existing `/root/.config/Ultralytics` is not required/copied; it is library configuration, not the app's detection model. YOLO loads `/app/yolov8n.pt`, the image's pinned/checksummed weights, not the host's untracked `yolov8n.pt`.
+- `frontend_versions.json` is read-only application input shipped in the image. Logging is stdout with bounded Docker log rotation; the host's existing `app.log` is not mounted. Camera recordings remain on the cameras; no additional local recording archive path was found.
+- The host-only config runs as `0:0`, matching systemd and allowing writes to root-owned motion data **without chmod/chown**. It drops all capabilities and uses `no-new-privileges` and a private PID namespace, but root plus host networking is weaker isolation than the default non-root deployment. Do not add Docker-socket or host-root mounts. Run only one app instance.
+
+### Operator-only preparation and cutover (not automatic)
+
+First verify a current recoverable host-MySQL backup plus photos/config backup, and that the chosen release is compatible with the existing schema **without migration**. If not, stop here and plan a separate schema change. Build the reviewed final release commit into `zerohome-host:v4.5.0-release`, with `--build-arg VERSION=v4.5.0-Release`, from an isolated checkout of that immutable commit. Do not merely retag `zerohome-release-check:v4.5.0-release`: it may predate the final fixes. Record the source commit and resulting image ID; do not overwrite the tag during cutover.
+
+Use the explicit file and an empty Compose interpolation env file every time. The service's `env_file` still loads `/opt/zerocams/.env`. Do not print `docker compose config`, container environment, raw logs, SQL rows or camera URLs; use quiet validation or narrow output instead. Do not source `.env` in a shell. Before stopping systemd, compare resolved environment values to the existing Python dotenv parser in-memory without printing values (especially if secrets contain `$` or quoting).
+
+Read-only preflight, safe output:
+
+```sh
+compose=(docker compose --env-file /dev/null -f /opt/zerocams/compose.host.yaml)
+"${compose[@]}" config --quiet
+"${compose[@]}" config --services  # must list only app
+# Inspect only identity/version, never the full image/container environment.
+docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.version"}}' zerohome-host:v4.5.0-release
+systemctl is-active zerocams
+systemctl is-enabled zerocams
+systemctl is-active zerohome-update.timer zerohome-update.service
+```
+
+Record the original systemd enablement for rollback. An absent/inactive updater is expected; these status commands may return nonzero. Check for any other automation outside these units. After approval, the operator runs the following **state-changing cutover**; no migration or DB service operation is included:
+
+```sh
+# Run in the same Bash shell as the compose array above.
+systemctl stop zerocams
+# Must report inactive before continuing; never run both app instances.
+systemctl is-active zerocams
+# Guard against a remaining HTTP listener before starting Docker.
+python3 -I - <<'PY'
+import socket
+with socket.socket() as s:
+    s.bind(('0.0.0.0', 3805))
+print('HTTP port available')
+PY
+# Only after both checks succeed:
+"${compose[@]}" up -d --no-deps --pull never --wait --wait-timeout 180 app
+```
+
+The `is-active` result `inactive` has a nonzero exit status; inspect it deliberately, not in a blindly pasted `set -e` chain. A healthcheck alone could hit the old process with host networking, hence the explicit stop/port checks. Startup resumes existing workers and their ordinary database writes/retention; “migration-free” does not mean the application is read-only.
+
+Safe-output smoke checks:
+
+```sh
+"${compose[@]}" ps
+curl --fail --silent --show-error --output /dev/null --write-out 'health HTTP %{http_code}\n' http://127.0.0.1:3805/v1/health
+curl --fail --silent --show-error --output /dev/null --write-out 'time HTTP %{http_code}\n' http://127.0.0.1:3805/v1/config/time
+"${compose[@]}" exec -T app python -c 'import os; from pathlib import Path; print("release", Path("/usr/local/share/zerohome-version").read_text().strip()); assert os.access("/data/motion_files", os.W_OK); assert Path("/data/models/.EasyOCR/model/craft_mlt_25k.pth").is_file(); assert Path("/data/models/.EasyOCR/model/cyrillic_g2.pth").is_file(); print("storage paths OK")'
+```
+
+HTTP health is liveness, **not** DB/camera readiness. Through the existing authenticated UI verify login/data reads (DB), access to an old motion photo, new motion capture, OCR, and WebRTC video **and audio** from the normal external client network. Verify HLS only if enabled. Review logs locally with credentials/addresses redacted before sharing. After successful smoke checks, `systemctl disable zerocams` prevents the old service competing after reboot; Docker's `unless-stopped` policy supplies restart behavior (also confirm Docker is enabled at boot).
+
+If startup or smoke checks fail, first `"${compose[@]}" stop -t 60 app` and verify `"${compose[@]}" ps --status running` shows no app before `systemctl start zerocams`. Restore the recorded original systemd enablement if it was changed. Leave MySQL, `.env`, photos and the model volume untouched; never use `down -v`. This rollback assumes the explicitly verified unchanged-schema compatibility; normal writes made during the Docker trial remain in the same DB.
+
 ## Per-task controls
 
 Settings are read at process startup. Edit the host's application configuration and restart/redeploy to change them; there is no unauthenticated runtime administration endpoint. New flags default to `true`, preserving existing behavior:
@@ -118,6 +187,36 @@ Settings are read at process startup. Edit the host's application configuration 
 | `TUYA_EVENTS_ENABLED` | Real-time Tuya/Pulsar consumers | Polling workers |
 | `MOTION_DETECTION_ENABLED` | Global motion detection gate: startup and every runtime start | Event/photo cleanup and stored user preferences |
 | `MOTION_CLEANUP_ENABLED` | Expired motion event/photo removal | Detection itself |
+| `STARTUP_WARMUP_ENABLED` / `STARTUP_WARMUP_TIMEOUT_SECONDS` (default `10.0`) | Bounded in-process DB/HTTP warm-up at startup (no tokens, no writes; failure or timeout never blocks startup) | All workers |
+| `CLUSTER_ENABLED` (default `false`) | Multi-node mode switch: per-camera ingest and motion detection and the global workers (health check, switch sync, connection sync, Tuya events) are owned through leases (see below); session and motion cleanup are unchanged | Other workers |
+| `NODE_ID` (default empty) | Node identifier; required (non-blank) when `CLUSTER_ENABLED=true`, startup fails otherwise. With `CLUSTER_ENABLED=false` empty means hostname plus a random suffix generated once per process | Leases |
+| `NODE_ADDRESS` (default empty) | Address other nodes use to reach this one | Leases |
+| `LEASE_TTL_SECONDS` (default `30`) / `LEASE_RENEW_INTERVAL_SECONDS` (default `10`) | Lease lifetime and renewal period; startup fails unless renew interval x 2 <= TTL | Workers |
+| `NODE_HEARTBEAT_INTERVAL_SECONDS` (default `10`) | Node heartbeat period | Leases |
+
+### Multi-node mode (experimental)
+
+With `CLUSTER_ENABLED=true` a node no longer starts ingest and motion detection for every camera at startup. Instead it registers itself in the shared database (`nodes` table, refreshed every `NODE_HEARTBEAT_INTERVAL_SECONDS`) and, every `LEASE_RENEW_INTERVAL_SECONDS`, renews or acquires per-camera leases (`assignments` table) for `ingest` and `motion`. Local work for a camera runs only while the node holds its lease. Cameras are split evenly between live nodes that have the function enabled (`INGEST_ENABLED`, `MOTION_DETECTION_ENABLED`); if a node dies, its leases expire after `LEASE_TTL_SECONDS` and another node takes its cameras over. A node that cannot reach the database for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS` stops its per-camera work on its own and resumes after the database is back. Already owned cameras are not rebalanced when a node joins later. With `CLUSTER_ENABLED=false` (default) behavior is unchanged.
+
+Requirements for every node:
+
+- One shared database (all nodes point at the same `DATABASE_URL`/MySQL); migrations must be applied before nodes start.
+- A unique `NODE_ID` per node, and its own `CACHE_DIR` and `INGEST_REGISTRY_DIR` (never share these between nodes).
+- `NODE_ID` is required on every node when `CLUSTER_ENABLED=true`: the settings validation fails at startup if it is empty or blank. A random id would change on every start, so the process registry of the previous run (kept under a directory named after the node id) is not found and ffmpeg processes orphaned by a crash are not reaped.
+- With `CLUSTER_ENABLED=true` and no explicit `INGEST_REGISTRY_DIR` / `HLS_TEMP_DIR`, the process registries and the HLS temp directory are placed in `<CACHE_DIR>/ingest/nodes/<NODE_ID>/` and `<HLS_TEMP_DIR>/nodes/<NODE_ID>/` (NODE_ID reduced to `[A-Za-z0-9._-]`), so two nodes on one host never reap each other's ffmpeg or clean each other's HLS files. Explicit values are used as given. Still give each node its own volume or `CACHE_DIR`; on different hosts or containers never share one.
+- Motion photos are still stored locally (shared storage is planned for stage 2), so in a multi-node cluster the photos of a camera are on whichever node currently detects motion for it.
+- Not yet covered: `session_cleanup` and `motion_cleanup` (see below), notifications, and viewing (HLS/WebRTC) is not routed to the node that owns the camera.
+
+Global functions under a single right (`resource_id` 0): `healthcheck`, `switch_sync`, `connection_sync` and `tuya_events`. With `CLUSTER_ENABLED=true` the application does not start these four at boot. Each reconcile cycle, a node whose flag is on (`HEALTHCHECK_ENABLED`, `SWITCH_SYNC_ENABLED`, `CONNECTION_SYNC_ENABLED`, `TUYA_EVENTS_ENABLED`) tries to acquire or renew the right; whoever gets it first runs the loop, a node with the flag off never takes it. If the right is lost, not renewed, or the database was unreachable for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS`, the node stops that loop; on a graceful shutdown the rights are released so another node takes over within one renew interval. There is no fair share for these (one right per function), so they can all end up on the same node.
+
+Not under a right (still run on every node whose flag is on): `session_cleanup` is idempotent, so concurrent runs are harmless. `motion_cleanup` works on files of the local photo directory, so it must stay per node until photos move to shared storage (stage 2).
+
+Limitations:
+
+- `healthcheck` keeps the last known online/offline state of each camera in memory only. After the right moves to another node, the new owner has no previous state: its first check only records the state, so one online/offline change that happened during the handover can go unreported (and no notification is repeated for the old state).
+- Camera create/update/delete on any node makes that node run an early reconcile. A camera owned by another node is picked up by its owner on the owner's next cycle (at most `LEASE_RENEW_INTERVAL_SECONDS`): ingest applies a changed URL by restarting ffmpeg, a motion session is restarted when the camera fields change, and a deleted or disabled camera is stopped and its right released. Stopping HLS/WebRTC/transcoder sessions and ONVIF cache invalidation stay local to the node that handled the request.
+
+`GET /v1/cluster` (admin only) shows the state: local `node_id`, `cluster_enabled`, nodes (address, heartbeat age, alive flag, capabilities, version), current rights (function, resource, owner, generation, seconds until expiry, expired flag) and `unassigned` - wanted per-camera and global functions with no live owner (`reason` is `no_capable_node` when no live node has the function enabled). It never returns camera URLs or credentials. With `CLUSTER_ENABLED=false` it returns `cluster_enabled=false` and empty lists.
 
 `MOTION_DETECTION_ENABLED=false` returns `started=false` from otherwise-authorized motion-start requests without querying the detector's database, loading YOLO or launching a detector. Camera/push-settings changes cannot override it. User motion preferences remain editable and are retained for a later restart with detection enabled. Existing permissions and per-camera checks still apply when enabled. Orphan-process reaping and shutdown remain available even with detection off.
 

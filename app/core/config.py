@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -49,6 +50,8 @@ class Settings(BaseSettings):
     TUYA_EVENTS_ENABLED: bool = True
     MOTION_DETECTION_ENABLED: bool = True
     MOTION_CLEANUP_ENABLED: bool = True
+    STARTUP_WARMUP_ENABLED: bool = True  # in-process DB/HTTP warm-up before serving; never fails startup
+    STARTUP_WARMUP_TIMEOUT_SECONDS: float = 10.0  # hard wall-clock bound for the whole warm-up
     HEALTHCHECK_INTERVAL_SECONDS: int = 60
     HEALTHCHECK_TCP_TIMEOUT_SECONDS: float = 5.0
     STREAM_IDLE_TIMEOUT_SECONDS: int = 30
@@ -91,6 +94,14 @@ class Settings(BaseSettings):
     WEBRTC_AUDIO_ENABLED: bool = True  # send the camera's audio (Opus, mono 48 kHz) when the stream has any
     WEBRTC_MAX_LATENCY_MS: int = 500  # frames queued beyond this are dropped (live edge wins)
 
+    # --- multi-node: node identity and leases (stage 1; nothing consumes these yet) ---
+    CLUSTER_ENABLED: bool = False
+    NODE_ID: str = ""  # required when CLUSTER_ENABLED; otherwise empty -> hostname + random suffix, see app.services.cluster.identity.get_node_id()
+    NODE_ADDRESS: str = ""
+    LEASE_TTL_SECONDS: int = 30
+    LEASE_RENEW_INTERVAL_SECONDS: int = 10
+    NODE_HEARTBEAT_INTERVAL_SECONDS: int = 10
+
     # --- ingest: one persistent ffmpeg (RTSP -> fMP4, -c copy) per enabled camera ---
     # /stream, HLS, WebRTC, live snapshots and motion detection read this hub when it is on.
     INGEST_ENABLED: bool = False
@@ -129,6 +140,19 @@ class Settings(BaseSettings):
     # filtering and why it was dropped / whether an event was created. Off by default.
     MOTION_DEBUG_LOG: bool = False
 
+    @model_validator(mode="after")
+    def _check_lease_timing(self) -> "Settings":
+        if self.LEASE_RENEW_INTERVAL_SECONDS < 1 or self.NODE_HEARTBEAT_INTERVAL_SECONDS < 1:
+            raise ValueError("LEASE_RENEW_INTERVAL_SECONDS and NODE_HEARTBEAT_INTERVAL_SECONDS must be >= 1")
+        if self.LEASE_RENEW_INTERVAL_SECONDS * 2 > self.LEASE_TTL_SECONDS:
+            raise ValueError("LEASE_RENEW_INTERVAL_SECONDS * 2 must be <= LEASE_TTL_SECONDS")
+        if self.CLUSTER_ENABLED and not (self.NODE_ID or "").strip():
+            raise ValueError(
+                "NODE_ID must be set explicitly when CLUSTER_ENABLED=true: a random id changes on every "
+                "start, so orphaned processes of the previous run are not cleaned up"
+            )
+        return self
+
     @property
     def database_url(self) -> str:
         """Single source of the async MySQL URL (asyncmy driver)."""
@@ -137,13 +161,37 @@ class Settings(BaseSettings):
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}?charset=utf8mb4"
         )
 
+    def _node_scoped(self, base: Path) -> Path:
+        """<base>/nodes/<safe node_id> in cluster mode, base unchanged otherwise."""
+        if not self.CLUSTER_ENABLED:
+            return base
+        from app.services.cluster.identity import get_node_id, safe_node_dir_name
+
+        return base / "nodes" / safe_node_dir_name(get_node_id(self))
+
     @property
     def ingest_registry_path(self) -> str:
-        """Absolute path of the ingest process registry file."""
-        base = Path(self.INGEST_REGISTRY_DIR or (Path(self.CACHE_DIR) / "ingest")).expanduser()
+        """Absolute path of the ingest process registry file.
+
+        Every pool (ingest, transcode, webrtc, hls, snapshot, motion) derives its registry
+        file from this directory. With CLUSTER_ENABLED and no explicit INGEST_REGISTRY_DIR the
+        directory is per node, so reap_orphans of one process never touches another's ffmpeg.
+        """
+        if self.INGEST_REGISTRY_DIR:
+            base = Path(self.INGEST_REGISTRY_DIR).expanduser()
+        else:
+            base = self._node_scoped(Path(self.CACHE_DIR) / "ingest")
         if not base.is_absolute():
             base = PROJECT_ROOT / base
         return str(base / "registry.json")
+
+    @property
+    def hls_temp_path(self) -> str:
+        """HLS temp directory; per node in cluster mode unless HLS_TEMP_DIR is set explicitly."""
+        base = Path(self.HLS_TEMP_DIR)
+        if "HLS_TEMP_DIR" not in self.model_fields_set:
+            base = self._node_scoped(base)
+        return str(base)
 
     @property
     def motion_files_path(self) -> str:

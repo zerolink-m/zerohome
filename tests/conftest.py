@@ -55,6 +55,14 @@ def _reset_rate_limits():
     rl._buckets.clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_session_activity():
+    from app.services import session_activity
+    session_activity.reset()
+    yield
+    session_activity.reset()
+
+
 @pytest_asyncio.fixture
 async def engine():
     eng = create_async_engine(

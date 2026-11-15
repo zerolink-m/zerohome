@@ -15,8 +15,9 @@ from app.core.errors import (
 from app.core.logging import setup_logging
 from app.core.middleware import CursedMiddleware
 from app.core.rate_limit import start_cleanup_task
-from app.routers import auth, cams, config, connections, invitations, motion, push_settings, service, sessions, shares, stats, switches, users, webrtc
-from app.services import ingest
+from app.routers import auth, cams, cluster, config, connections, invitations, motion, push_settings, service, sessions, shares, stats, switches, users, webrtc
+from app.services import ingest, warmup
+from app.services.cluster import runner as cluster_runner
 from app.services import (
     connection_sync,
     healthcheck,
@@ -24,6 +25,7 @@ from app.services import (
     motion_cleanup,
     motion_detection,
     motion_lifecycle,
+    session_activity,
     snapshot,
     stream_manager,
     switch_sync,
@@ -37,17 +39,20 @@ from app.services import (
 async def lifespan(app: FastAPI):
     # --- startup (same order as before) ---
     start_cleanup_task()
+    session_activity.start()  # required: defers sessions.last_seen writes
     if settings.SESSION_CLEANUP_ENABLED:
         auth.start_session_cleanup()
-    if settings.HEALTHCHECK_ENABLED:
-        healthcheck.start()
-    if settings.SWITCH_SYNC_ENABLED:
-        switch_sync.start()
-    if settings.CONNECTION_SYNC_ENABLED:
-        connection_sync.start()
-    # Independent of polling: disabling one does not disable the other.
-    if settings.TUYA_EVENTS_ENABLED:
-        tuya_events.start()
+    # CLUSTER_ENABLED: these four are global functions owned through a lease (cluster_runner).
+    if not settings.CLUSTER_ENABLED:
+        if settings.HEALTHCHECK_ENABLED:
+            healthcheck.start()
+        if settings.SWITCH_SYNC_ENABLED:
+            switch_sync.start()
+        if settings.CONNECTION_SYNC_ENABLED:
+            connection_sync.start()
+        # Independent of polling: disabling one does not disable the other.
+        if settings.TUYA_EVENTS_ENABLED:
+            tuya_events.start()
     if settings.HLS_ENABLED:
         hls_manager.start_cleanup_task()
     # Motion detection cleanup task (removes events older than 7 days)
@@ -55,7 +60,9 @@ async def lifespan(app: FastAPI):
         motion_cleanup.start()
     # Persistent ingest ffmpeg per enabled camera (no-op unless INGEST_ENABLED).
     # Before motion detection: its sessions read the hub.
-    await ingest.start_all_enabled()
+    # CLUSTER_ENABLED: per-camera leases decide instead (cluster_runner, started below).
+    if not settings.CLUSTER_ENABLED:
+        await ingest.start_all_enabled()
     # Reap transcoders orphaned by a previous run (no-op unless INGEST_ENABLED)
     await stream_manager.startup()
     # Reap HLS ffmpegs orphaned by a previous run
@@ -66,7 +73,13 @@ async def lifespan(app: FastAPI):
     await snapshot.startup()
     await motion_detection.startup()
     # Auto-start motion detection on cameras where users have it enabled
-    await motion_lifecycle.start_all_enabled()
+    if settings.CLUSTER_ENABLED:
+        await cluster_runner.start()  # ingest/motion per-camera + global function rights
+    else:
+        await motion_lifecycle.start_all_enabled()
+    # Last: bounded, never raises (see services/warmup.py)
+    if settings.STARTUP_WARMUP_ENABLED:
+        await warmup.run(app)
 
     yield
 
@@ -75,6 +88,7 @@ async def lifespan(app: FastAPI):
     # Consumers of the hub (and their ffmpeg children) first, then ingest itself.
     await stream_manager.stop_all()
     await hls_manager.stop_all()
+    await cluster_runner.stop()  # releases rights; no-op unless CLUSTER_ENABLED
     await motion_lifecycle.stop_all()
     await snapshot.stop_all()
     await ingest.stop_all()
@@ -87,6 +101,7 @@ async def lifespan(app: FastAPI):
         await webrtc_manager.stop_all_sessions()
     await motion_cleanup.stop()
     await auth.stop_session_cleanup()
+    await session_activity.stop()  # flush pending last_seen before the process exits
 
 
 def create_app() -> FastAPI:
@@ -130,6 +145,7 @@ def create_app() -> FastAPI:
     app.include_router(push_settings.router)
     app.include_router(motion.router)
     app.include_router(stats.router)
+    app.include_router(cluster.router)
     app.include_router(webrtc.router)
 
     return app

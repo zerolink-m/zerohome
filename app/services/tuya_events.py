@@ -245,9 +245,14 @@ def start() -> None:
 
 
 async def stop_all() -> None:
-    """Cancel every running consumer. Called from FastAPI shutdown."""
+    """Cancel the supervisor and every running consumer. Called from FastAPI shutdown
+    and by the cluster runner when the right is lost. Idempotent."""
+    global _task
     tasks = list(_consumers.values())
     _consumers.clear()
+    if _task is not None and not _task.done():
+        tasks.append(_task)
+    _task = None
     for t in tasks:
         t.cancel()
     for t in tasks:

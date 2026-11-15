@@ -93,6 +93,20 @@ def start() -> None:
         _task = asyncio.create_task(_loop())
 
 
+async def stop() -> None:
+    """Stops the loop only (idempotent; safe when it was never started)."""
+    global _task
+    task, _task = _task, None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("%s loop raised during stop", __name__)
+
+
 async def sync_connection_now(connection_id: int) -> None:
     """Manually trigger a sync for one connection (called from the router on
     connection create/update, so the client sees devices without waiting for

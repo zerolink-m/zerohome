@@ -48,6 +48,25 @@ def _target_for(cam: Cam) -> IngestTarget | None:
     return IngestTarget(cam_id=cam.id, url=build_rtsp_url(cam), name=cam.name or "")
 
 
+async def prepare() -> None:
+    """Reaps ingest leftovers of the previous run. Never raises."""
+    if not settings.INGEST_ENABLED:
+        return
+    try:
+        report = await get_supervisor().startup()
+        logger.info("ingest: orphan sweep: %s", report)
+    except Exception:
+        logger.exception("ingest: orphan sweep failed")
+
+
+async def select_targets() -> dict[int, IngestTarget]:
+    """Cameras ingest should run on right now (enabled=1 with an address), by cam id."""
+    async with db_session.AsyncSessionLocal() as db:
+        cams = (await db.execute(select(Cam).where(Cam.enabled == 1))).scalars().all()
+        targets = [t for t in (_target_for(c) for c in cams) if t is not None]
+    return {t.cam_id: t for t in targets}
+
+
 async def start_all_enabled() -> None:
     """Reaps leftovers of the previous run, then starts ingest for every enabled camera."""
     if not settings.INGEST_ENABLED:
@@ -56,9 +75,7 @@ async def start_all_enabled() -> None:
         supervisor = get_supervisor()
         report = await supervisor.startup()
         logger.info("ingest: orphan sweep: %s", report)
-        async with db_session.AsyncSessionLocal() as db:
-            cams = (await db.execute(select(Cam).where(Cam.enabled == 1))).scalars().all()
-            targets = [t for t in (_target_for(c) for c in cams) if t is not None]
+        targets = list((await select_targets()).values())
         for target in targets:
             await supervisor.start(target)
         logger.info("ingest: started on %d cameras", len(targets))
@@ -86,9 +103,20 @@ async def _guarded(coro, what: str) -> None:
         logger.exception("ingest hook failed: %s", what)
 
 
+def _request_cluster_reconcile() -> None:
+    from app.services.cluster import runner
+    runner.request_reconcile()
+
+
 async def on_cam_saved(cam: Cam, fields: set[str] | None = None) -> None:
     """Camera created or PATCHed. `fields` = names the request touched (None = all).
-    enabled=0 stops; enabled=1 starts/updates (unchanged URL is a no-op)."""
+    enabled=0 stops; enabled=1 starts/updates (unchanged URL is a no-op).
+    CLUSTER_ENABLED: this node does not start anything itself (the camera may belong to
+    another node); it only asks the runner for an early reconcile."""
+    if settings.CLUSTER_ENABLED:
+        if fields is None or (set(fields) & RELEVANT_FIELDS):
+            _request_cluster_reconcile()
+        return
     if not settings.INGEST_ENABLED:
         return
     if fields is not None and not (set(fields) & RELEVANT_FIELDS):
@@ -101,6 +129,9 @@ async def on_cam_saved(cam: Cam, fields: set[str] | None = None) -> None:
 
 
 async def on_cam_deleted(cam_id: int) -> None:
+    if settings.CLUSTER_ENABLED:
+        _request_cluster_reconcile()  # the owner notices the camera is gone and stops
+        return
     if not settings.INGEST_ENABLED:
         return
     await _guarded(get_supervisor().stop(cam_id), f"cam {cam_id} deleted")
