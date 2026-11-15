@@ -12,14 +12,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
-      - name: Install dependencies
+      - name: Cache CPU Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          # Separate namespace: never restore the previous CUDA-heavy pip cache.
+          key: ${{ runner.os }}-${{ runner.arch }}-python3.14-pip-cpu-v1-${{ hashFiles('requirements.txt', 'requirements-dev.txt', '.github/workflows/ci.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-python3.14-pip-cpu-v1-
+      - name: Install CPU dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-dev.txt
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          excluded = ('cuda-', 'nvidia-', 'torch==', 'torchvision==', 'triton==')
+          requirements = Path('requirements.txt').read_text().splitlines()
+          Path(os.environ['RUNNER_TEMP'], 'requirements-cpu.txt').write_text(
+              '\n'.join(line for line in requirements if not line.lower().startswith(excluded)) + '\n'
+          )
+          PY
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.1+cpu torchvision==0.29.1+cpu
+          python -m pip install -r "$RUNNER_TEMP/requirements-cpu.txt" -r requirements-dev.txt
+          python -m pip check
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Run tests
