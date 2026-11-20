@@ -10,8 +10,9 @@ Per-camera functions ('ingest', 'motion'): one lease per camera, acquired up to 
 Global functions ('healthcheck', 'switch_sync', 'connection_sync', 'tuya_events'): one lease
 with resource_id 0; whoever takes it first runs the module's loop (start() every cycle is
 idempotent), a node without the capability never takes it. No fair share for them.
-Not under leases yet: 'session_cleanup' (idempotent, runs everywhere) and 'motion_cleanup'
-(bound to local files, stage 2).
+Not under leases: 'session_cleanup' (idempotent, runs everywhere), 'motion_cleanup'
+(deletes through the storage layer, idempotent, still runs on every node) and 'notify'
+(its own loop takes that lease; see notify_worker).
 
 Self-fencing: a lease that was not successfully renewed for TTL - RENEW seconds is dropped
 locally (work stopped) before it can expire in the DB and be taken by another node.

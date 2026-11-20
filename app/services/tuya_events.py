@@ -31,7 +31,7 @@ from sqlalchemy import select
 from app.db.session import AsyncSessionLocal
 from app.models.connection import Connection
 from app.models.switch import Switch
-from app.services import push
+from app.services import notify_queue
 from app.schemas.connection import TUYA_ENDPOINTS
 
 logger = logging.getLogger(__name__)
@@ -131,9 +131,7 @@ async def _apply_dp_report(conn_id: int, dev_id: str, status: list[dict]) -> Non
                 if master.notify == 1:
                     to_notify.append(master)
 
-        await db.commit()
-
-        # Notify with timestamp
+        # Notify with timestamp, in the same transaction as the state change.
         from datetime import datetime
         now_str = datetime.fromtimestamp(now).strftime("%d.%m.%Y %H:%M:%S")
 
@@ -143,10 +141,12 @@ async def _apply_dp_report(conn_id: int, dev_id: str, status: list[dict]) -> Non
                 f"{'включено' if sw.state == 1 else 'выключено'}\n\n"
                 f"Время: {now_str}"
             )
-            await push._notify_recipients_filtered(
-                db, "switches", sw.id, sw.ownuser, message,
-                filter_func=lambda ps: ps.notify_state_change == 1
+            await notify_queue.enqueue(
+                db, kind="tuya", device_type="switches", device_id=sw.id,
+                message=message, payload={"filter": "notify_state_change"},
             )
+        await db.commit()
+        for sw in to_notify:
             logger.info(
                 "switch_id=%s state -> %s via pulsar", sw.id, sw.state
             )

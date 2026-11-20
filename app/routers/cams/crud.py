@@ -20,7 +20,7 @@ from app.models.cams import Cam
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
 from app.schemas.cams import CamCreate, CamPatch
-from app.services import hls_manager, onvif_client, push, stream_manager
+from app.services import hls_manager, notify_queue, onvif_client, stream_manager
 from app.services.ingest import lifecycle as ingest
 
 from app.routers.cams._common import (
@@ -87,11 +87,13 @@ def _apply_patch(cam: Cam, body: CamPatch) -> tuple[bool, bool, bool]:
     return changed, control_touched, notify_enabled
 
 
-def _after_patch(cam: Cam, control_touched: bool, notify_enabled: bool) -> None:
+def _push_enabled_message(cam: Cam) -> str:
+    return f"Push включён для камеры {cam.name or cam.id}"
+
+
+def _after_patch(cam: Cam, control_touched: bool) -> None:
     if control_touched:
         onvif_client.invalidate(cam.id)
-    if notify_enabled:
-        push.notify_cam_background(cam.id, f"Push включён для камеры {cam.name or cam.id}")
 
 
 async def _delete_cam(cam: Cam, db: AsyncSession) -> None:
@@ -216,11 +218,16 @@ async def patch_cams_bulk(
     results = []
     for cam, patch in work:
         _, control_touched, notify_enabled = _apply_patch(cam, patch)
-        effects.append((cam, control_touched, notify_enabled, set(patch.model_fields_set)))
+        if notify_enabled:
+            await notify_queue.enqueue(
+                db, kind="manual", device_type="cams", device_id=cam.id,
+                message=_push_enabled_message(cam),
+            )
+        effects.append((cam, control_touched, set(patch.model_fields_set)))
         results.append(cam)
     await db.commit()
-    for cam, control_touched, notify_enabled, touched in effects:
-        _after_patch(cam, control_touched, notify_enabled)
+    for cam, control_touched, touched in effects:
+        _after_patch(cam, control_touched)
         await ingest.on_cam_saved(cam, touched)
     return bulk("cams", [_serialize(c, payload) for c in results], _failed(failures), op="edit",
                 partial=body.partial_allowed, all_failed_code=failures[0][1] if failures else "109")
@@ -292,8 +299,13 @@ async def patch_cam(
         raise AppError(FORBIDDEN_RESOURCE, "Изменение камеры доступно только владельцу или admin")
 
     changed, control_touched, notify_enabled = _apply_patch(cam, body.obj)
+    if notify_enabled:
+        await notify_queue.enqueue(
+            db, kind="manual", device_type="cams", device_id=cam.id,
+            message=_push_enabled_message(cam),
+        )
     await db.commit()
-    _after_patch(cam, control_touched, notify_enabled)
+    _after_patch(cam, control_touched)
     await ingest.on_cam_saved(cam, set(body.obj.model_fields_set))
     return edited("cam", _serialize(cam, payload), changed=changed)
 

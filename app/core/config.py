@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     CACHE_DIR: str = "caching"
     # Motion event photos; a relative path is resolved against the project root.
     MOTION_FILES_DIR: str = "motion_files"
+    # local (default) writes under MOTION_FILES_DIR. s3 never falls back to local.
+    STORAGE_BACKEND: str = "local"
+    S3_ENDPOINT: str = ""
+    S3_BUCKET: str = ""
+    S3_ACCESS_KEY: str = Field(default="", repr=False)
+    S3_SECRET_KEY: str = Field(default="", repr=False)
+    S3_REGION: str = ""  # blank is signed as us-east-1
+    NOTIFY_ENABLED: bool = True  # capability "notify"; off = this node does not send pushes
+    NOTIFY_JOB_RETENTION_DAYS: int = 7
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     VERSION: str = "v0.0.0-Alpha"
@@ -151,6 +160,27 @@ class Settings(BaseSettings):
                 "NODE_ID must be set explicitly when CLUSTER_ENABLED=true: a random id changes on every "
                 "start, so orphaned processes of the previous run are not cleaned up"
             )
+        backend = (self.STORAGE_BACKEND or "").strip().lower()
+        if backend not in ("local", "s3"):
+            raise ValueError("STORAGE_BACKEND must be 'local' or 's3'")
+        self.STORAGE_BACKEND = backend
+        if self.NOTIFY_JOB_RETENTION_DAYS < 0:
+            raise ValueError("NOTIFY_JOB_RETENTION_DAYS must be >= 0")
+        if backend == "s3":
+            missing = [
+                name for name in ("S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY", "S3_SECRET_KEY")
+                if not str(getattr(self, name) or "").strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "STORAGE_BACKEND=s3 requires non-empty settings: " + ", ".join(missing)
+                    + ". Refusing to start; not falling back to local storage."
+                )
+            parts = urlsplit(self.S3_ENDPOINT.strip())
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                raise ValueError(
+                    "S3_ENDPOINT must be an absolute http(s) URL, for example http://minio:9000"
+                )
         return self
 
     @property

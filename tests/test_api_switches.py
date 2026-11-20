@@ -44,7 +44,6 @@ def _mock_ext(monkeypatch):
         calls.append((switch.id, state))
 
     monkeypatch.setattr("app.routers.switches.switch_client.set_state", set_state)
-    monkeypatch.setattr("app.routers.switches.push.notify_switch_background", lambda *a, **k: None)
     return calls
 
 

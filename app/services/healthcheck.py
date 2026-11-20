@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.cams import Cam
-from app.services import push
+from app.services import notify_queue
 
 
 logger = logging.getLogger(__name__)
@@ -47,33 +47,35 @@ async def _check_once() -> None:
                 select(Cam).where(Cam.enabled == 1)
             )
         ).scalars().all()
+        observed: dict[int, bool] = {}
+        queued = False
         for cam in cams:
             reachable = await _is_reachable(cam)
             previous = _last_online.get(cam.id)
-            _last_online[cam.id] = reachable
+            observed[cam.id] = reachable
 
             if previous is None or previous == reachable:
                 continue
 
             if reachable:
                 message = f"✅ Камера {_cam_label(cam)} снова на связи\n\nВремя: {_format_time()}"
-                # Notify users with notify_online=1
-                await push._notify_recipients_filtered(
-                    db, "cams", cam.id, cam.ownuser, message,
-                    filter_func=lambda ps: ps.notify_online == 1
-                )
+                filt = "notify_online"
             else:
                 message = f"⚠️ Камера {_cam_label(cam)} не отвечает\n\nВремя: {_format_time()}"
-                # Notify users with notify_offline=1
-                await push._notify_recipients_filtered(
-                    db, "cams", cam.id, cam.ownuser, message,
-                    filter_func=lambda ps: ps.notify_offline == 1
-                )
+                filt = "notify_offline"
+            # Same transaction as this check's session; the worker delivers it.
+            await notify_queue.enqueue(
+                db, kind="health", device_type="cams", device_id=cam.id,
+                message=message, payload={"filter": filt},
+            )
+            queued = True
 
-        still_tracked = {cam.id for cam in cams}
-        for stale_id in list(_last_online.keys()):
-            if stale_id not in still_tracked:
-                _last_online.pop(stale_id, None)
+        if queued:
+            await db.commit()
+
+    # Memory updates only after the jobs are durable, so a failed commit retries next cycle.
+    _last_online.clear()
+    _last_online.update(observed)
 
 
 def _format_time() -> str:

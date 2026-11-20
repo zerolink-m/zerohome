@@ -44,5 +44,5 @@ def local_capabilities(settings: Any) -> dict[str, bool]:
         "ingest": bool(settings.INGEST_ENABLED),
         "hls": bool(settings.HLS_ENABLED),
         "webrtc": bool(settings.WEBRTC_ENABLED),
-        "notify": True,
+        "notify": bool(settings.NOTIFY_ENABLED),
     }

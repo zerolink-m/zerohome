@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
-import os
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -14,12 +12,10 @@ import cv2
 import numpy as np
 
 from app.core.config import settings
-from app.db.session import AsyncSessionLocal
 from app.models.cams import Cam
-from app.models.motion_event import MotionEvent
 from app.models.push_settings import PushSettings
-from app.models.user import User
-from app.services import license_plate_ocr, push
+from app.services import license_plate_ocr
+from app.services.motion_photos import save_motion_event_and_photo
 from app.services.object_tracker import ObjectTracker
 
 logger = logging.getLogger("app.services.motion_detection")
@@ -634,6 +630,20 @@ class MotionDetectionSession:
 
         return True
 
+    def _motion_message(self, object_type: str, detected_at: int, confidence: float,
+                        license_plate: Optional[str]) -> str:
+        emoji_map = {'person': '🚶', 'dog': '🐕', 'cat': '🐈', 'car': '🚗'}
+        emoji = emoji_map.get(object_type, '📷')
+        obj_names = {'person': 'человек', 'dog': 'собака', 'cat': 'кошка', 'car': 'машина'}
+        obj_name = obj_names.get(object_type, object_type)
+        time_str = datetime.fromtimestamp(detected_at).strftime("%d.%m.%Y %H:%M:%S")
+        message = f"{emoji} Обнаружен {obj_name} на камере \"{self.cam.name or self.cam.id}\"\n\n"
+        message += f"Время: {time_str}\n"
+        message += f"Уверенность: {int(confidence * 100)}%"
+        if license_plate:
+            message += f"\nНомер машины: {license_plate}"
+        return message
+
     async def _save_and_notify(
         self,
         frame: np.ndarray,
@@ -644,96 +654,52 @@ class MotionDetectionSession:
         license_plate: Optional[str],
         frame_ts: float | None = None,
     ):
-        """Save event to database and notify users."""
+        """Save event to database and queue a notification in the same transaction."""
         try:
-            # Save frame as JPEG
             if frame_ts is None:
                 frame_ts = time.time()
             timestamp = int(frame_ts)
             filename = f"{timestamp}_{object_type}_{int(confidence * 100)}.jpg"
+            logger.debug(
+                f"[Cam {self.cam.id}] Saving event: {object_type} conf={confidence:.2f} size={object_size:.4f}"
+            )
 
-            # Create directory
-            photo_dir = os.path.join(settings.motion_files_path, str(self.cam.id))
-            os.makedirs(photo_dir, exist_ok=True)
-
-            photo_path = os.path.join(photo_dir, filename)
-
-            logger.debug(f"[Cam {self.cam.id}] Saving event: {object_type} conf={confidence:.2f} size={object_size:.4f}")
-            logger.debug(f"[Cam {self.cam.id}] Photo path: {photo_path}")
-
-            # Draw bounding box on frame
             x, y, w, h = bbox
             frame_copy = frame.copy()
-            cv2.rectangle(frame_copy, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-            # Save JPEG
-            await asyncio.to_thread(cv2.imwrite, photo_path, frame_copy)
-            logger.debug(f"[Cam {self.cam.id}] Photo saved successfully")
+            def _encode(img):
+                cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                ok, encoded = cv2.imencode(".jpg", img)
+                if not ok:
+                    return None
+                return encoded.tobytes()
 
-            # Save to database
-            async with AsyncSessionLocal() as db:
-                # Create motion event
-                event = MotionEvent(
-                    cam_id=self.cam.id,
-                    detected_at=timestamp,
-                    object_type=object_type,
-                    confidence=confidence,
-                    object_size=object_size,
-                    license_plate=license_plate,
-                    photo_filename=filename,
-                    bbox_x=x,
-                    bbox_y=y,
-                    bbox_width=w,
-                    bbox_height=h,
-                    notified_user_ids=json.dumps([ps.user_id for ps in self.user_settings]),
-                )
-                db.add(event)
-                await db.commit()
-                logger.debug(f"[Cam {self.cam.id}] Event saved to database (id={event.id})")
+            jpeg = await asyncio.to_thread(_encode, frame_copy)
+            if not jpeg:
+                logger.error(f"[Cam {self.cam.id}] Failed to encode motion photo")
+                return
 
-                # Send notifications
-                logger.debug(f"[Cam {self.cam.id}] Sending notifications to {len(self.user_settings)} user(s)...")
-                await self._notify_users(db, event, photo_path)
+            message = self._motion_message(object_type, timestamp, confidence, license_plate)
+            event_id = await save_motion_event_and_photo(
+                cam_id=self.cam.id,
+                detected_at=timestamp,
+                object_type=object_type,
+                confidence=confidence,
+                object_size=object_size,
+                license_plate=license_plate,
+                photo_filename=filename,
+                bbox=bbox,
+                notified_user_ids=[ps.user_id for ps in self.user_settings],
+                message=message,
+                jpeg=jpeg,
+            )
+            logger.debug(f"[Cam {self.cam.id}] Event saved (id={event_id})")
 
-                # Update cooldown
-                current_time = frame_ts
-                for ps in self.user_settings:
-                    key = (ps.user_id, object_type)
-                    self.last_notification_time[key] = current_time
-                    logger.debug(f"[Cam {self.cam.id}] Updated cooldown for user_id={ps.user_id}, {object_type}")
+            # Cooldown decides whether the next frame creates an event; unchanged.
+            for ps in self.user_settings:
+                key = (ps.user_id, object_type)
+                self.last_notification_time[key] = frame_ts
+                logger.debug(f"[Cam {self.cam.id}] Updated cooldown for user_id={ps.user_id}, {object_type}")
 
         except Exception as exc:
             logger.error(f"[Cam {self.cam.id}] Error saving/notifying event: {exc}", exc_info=True)
-
-    async def _notify_users(self, db, event: MotionEvent, photo_path: str):
-        """Send Telegram notifications to users."""
-        try:
-            # Get emoji
-            emoji_map = {'person': '🚶', 'dog': '🐕', 'cat': '🐈', 'car': '🚗'}
-            emoji = emoji_map.get(event.object_type, '📷')
-
-            # Format Russian object name
-            obj_names = {'person': 'человек', 'dog': 'собака', 'cat': 'кошка', 'car': 'машина'}
-            obj_name = obj_names.get(event.object_type, event.object_type)
-
-            # Format time
-            dt = datetime.fromtimestamp(event.detected_at)
-            time_str = dt.strftime("%d.%m.%Y %H:%M:%S")
-
-            # Build message
-            message = f"{emoji} Обнаружен {obj_name} на камере \"{self.cam.name or self.cam.id}\"\n\n"
-            message += f"Время: {time_str}\n"
-            message += f"Уверенность: {int(event.confidence * 100)}%"
-
-            if event.license_plate:
-                message += f"\nНомер машины: {event.license_plate}"
-
-            # Send to each user
-            user_ids = json.loads(event.notified_user_ids) if event.notified_user_ids else []
-            for user_id in user_ids:
-                user = await db.get(User, user_id)
-                if user:
-                    await push.notify_user(user, message, photo_path=photo_path)
-
-        except Exception as exc:
-            logger.error(f"Error notifying users: {exc}")

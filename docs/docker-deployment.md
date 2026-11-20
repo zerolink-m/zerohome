@@ -193,6 +193,11 @@ Settings are read at process startup. Edit the host's application configuration 
 | `NODE_ADDRESS` (default empty) | Address other nodes use to reach this one | Leases |
 | `LEASE_TTL_SECONDS` (default `30`) / `LEASE_RENEW_INTERVAL_SECONDS` (default `10`) | Lease lifetime and renewal period; startup fails unless renew interval x 2 <= TTL | Workers |
 | `NODE_HEARTBEAT_INTERVAL_SECONDS` (default `10`) | Node heartbeat period | Leases |
+| `NOTIFY_ENABLED` (default `true`) | Push delivery. Off: this node never sends. On, with `CLUSTER_ENABLED=false`: the single process sends. On, with `CLUSTER_ENABLED=true`: only the node holding the `notify` lease sends | Other workers |
+| `NOTIFY_JOB_RETENTION_DAYS` (default `7`) | How long `sent` and `failed` notification jobs are kept | Delivery itself |
+| `STORAGE_BACKEND` (default `local`) | Where new motion photos are stored: `local` directory or an `s3` bucket. `s3` does not fall back to local | Reading old photos that have no object key |
+| `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | Required together when `STORAGE_BACKEND=s3`. Startup fails if any of them is empty. Path-style requests to the endpoint. Access keys are never logged | `STORAGE_BACKEND=local` |
+| `S3_REGION` (default empty) | Region used to sign S3 requests. Empty signs as `us-east-1` | The bucket name |
 
 ### Multi-node mode (experimental)
 
@@ -204,12 +209,13 @@ Requirements for every node:
 - A unique `NODE_ID` per node, and its own `CACHE_DIR` and `INGEST_REGISTRY_DIR` (never share these between nodes).
 - `NODE_ID` is required on every node when `CLUSTER_ENABLED=true`: the settings validation fails at startup if it is empty or blank. A random id would change on every start, so the process registry of the previous run (kept under a directory named after the node id) is not found and ffmpeg processes orphaned by a crash are not reaped.
 - With `CLUSTER_ENABLED=true` and no explicit `INGEST_REGISTRY_DIR` / `HLS_TEMP_DIR`, the process registries and the HLS temp directory are placed in `<CACHE_DIR>/ingest/nodes/<NODE_ID>/` and `<HLS_TEMP_DIR>/nodes/<NODE_ID>/` (NODE_ID reduced to `[A-Za-z0-9._-]`), so two nodes on one host never reap each other's ffmpeg or clean each other's HLS files. Explicit values are used as given. Still give each node its own volume or `CACHE_DIR`; on different hosts or containers never share one.
-- Motion photos are still stored locally (shared storage is planned for stage 2), so in a multi-node cluster the photos of a camera are on whichever node currently detects motion for it.
-- Not yet covered: `session_cleanup` and `motion_cleanup` (see below), notifications, and viewing (HLS/WebRTC) is not routed to the node that owns the camera.
+- Motion photos for new events are an object key `motion/<cam_id>/<filename>` plus a state (`uploading`, `ready`, `failed`). `STORAGE_BACKEND=local` (default) writes that key under `MOTION_FILES_DIR` by a temp file and `rename` in the same directory. Events saved before this change have no key and are still read and deleted from `<MOTION_FILES_DIR>/<cam_id>/<photo_filename>`. `STORAGE_BACKEND=s3` stores the same keys in a private S3-compatible bucket; `motion_cleanup` deletes them from the bucket. The API still returns `photo_filename` and does not return the object key.
+- Notifications are rows in `notification_jobs`, inserted in the same database transaction as the event that caused them. With `CLUSTER_ENABLED=false` the one process sends them. With `CLUSTER_ENABLED=true` only the node that holds the `notify` lease (`resource_id` 0) sends. That loop takes the lease itself; it is not one of the ClusterRunner global functions, but it is the same kind of right, so two nodes do not send at once. A node with `NOTIFY_ENABLED=false` never takes it. Delivery to Telegram can be repeated if a claim is lost before the provider answers. `sent` and `failed` jobs older than `NOTIFY_JOB_RETENTION_DAYS` are deleted by that loop.
+- Not yet covered: viewing (HLS/WebRTC) is not routed to the node that owns the camera. `session_cleanup` and `motion_cleanup` still run on every node (see below).
 
 Global functions under a single right (`resource_id` 0): `healthcheck`, `switch_sync`, `connection_sync` and `tuya_events`. With `CLUSTER_ENABLED=true` the application does not start these four at boot. Each reconcile cycle, a node whose flag is on (`HEALTHCHECK_ENABLED`, `SWITCH_SYNC_ENABLED`, `CONNECTION_SYNC_ENABLED`, `TUYA_EVENTS_ENABLED`) tries to acquire or renew the right; whoever gets it first runs the loop, a node with the flag off never takes it. If the right is lost, not renewed, or the database was unreachable for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS`, the node stops that loop; on a graceful shutdown the rights are released so another node takes over within one renew interval. There is no fair share for these (one right per function), so they can all end up on the same node.
 
-Not under a right (still run on every node whose flag is on): `session_cleanup` is idempotent, so concurrent runs are harmless. `motion_cleanup` works on files of the local photo directory, so it must stay per node until photos move to shared storage (stage 2).
+Not under a right (still run on every node whose flag is on): `session_cleanup` is idempotent, so concurrent runs are harmless. `motion_cleanup` deletes through the storage layer (the local directory, or the bucket when `STORAGE_BACKEND=s3`) and is idempotent, so it also stays per node. `notify` is a right, but its loop is separate from the four above.
 
 Limitations:
 
