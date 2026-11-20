@@ -20,6 +20,10 @@ locally (work stopped) before it can expire in the DB and be taken by another no
 Fair share: ceil(wanted cameras / live nodes with the capability). Cameras that stay without
 an owner for a full renew interval may be taken beyond the share, so none stays unserved.
 There is no rebalancing of cameras that are already owned.
+
+Media (CLUSTER_ENABLED only): this process also listens for fMP4 from other nodes
+and, for a camera it does not own, pulls that fMP4 into the local hub while
+somebody here is watching. CLUSTER_ENABLED=false starts neither side.
 """
 from __future__ import annotations
 
@@ -141,6 +145,11 @@ class ClusterRunner:
         self._tasks: list[asyncio.Task] = []
         self._started = False
         self._wake = asyncio.Event()
+        self._media = None  # remote fMP4 pull; None unless cluster media is attached
+
+    def attach_media(self, media) -> None:
+        """RemoteHub (or a test double): on_acquired / on_lost / has_local_viewers."""
+        self._media = media
 
     # ----- helpers -----
     def _now(self) -> int:
@@ -260,17 +269,35 @@ class ClusterRunner:
             h.task.cancel()
 
     async def _drop(self, f: ClusterFunction, rid: int, *, release: bool) -> None:
-        """Stop local work for the camera and forget the right (optionally release it)."""
-        h = self._held.pop((f.name, rid), None)
+        """Stop local work for the camera and forget the right (optionally release it).
+
+        The lease stays in `_held` until local ingest has stopped, so a viewer cannot
+        start a remote pull while ffmpeg is still feeding the same hub.
+        """
+        key = (f.name, rid)
+        h = self._held.get(key)
         if h is None:
             return
         self._cancel_start(h)
         if h.task is not None:
             await asyncio.wait({h.task}, timeout=2.0)
+        had_viewers = False
+        if self._media is not None and f.name == "ingest":
+            try:
+                had_viewers = bool(self._media.has_local_viewers(rid))
+            except Exception:
+                logger.exception("cluster: viewer check failed for cam %s", rid)
         try:
             await f.stop(rid)
         except Exception:
             logger.exception("cluster: %s stop failed for cam %s", f.name, rid)
+        finally:
+            self._held.pop(key, None)
+        if had_viewers and self._media is not None and f.name == "ingest":
+            try:
+                await self._media.on_lost(rid)
+            except Exception:
+                logger.exception("cluster: remote ingest start failed for cam %s", rid)
         if release:
             try:
                 await self._db(lambda db: leases.release(db, h.lease))
@@ -438,6 +465,11 @@ class ClusterRunner:
             if not is_mine:
                 allowed -= 1
             logger.info("cluster: acquired %s cam %s (generation %s)", f.name, rid, lease.generation)
+            if self._media is not None and f.name == "ingest":
+                try:
+                    await self._media.on_acquired(rid)
+                except Exception:
+                    logger.exception("cluster: remote ingest stop failed for cam %s", rid)
 
 
 _runner: ClusterRunner | None = None
@@ -447,11 +479,22 @@ async def start() -> None:
     global _runner
     if not app_settings.CLUSTER_ENABLED or _runner is not None:
         return
+    from app.services.cluster.remote_hub import RemoteHub, set_bridge
+
     _runner = ClusterRunner()
+    bridge = RemoteHub(runner=_runner, settings=app_settings)
+    set_bridge(bridge)
+    _runner.attach_media(bridge)
     try:
+        await bridge.start()
         await _runner.start()
     except Exception:
         logger.exception("cluster: failed to start")
+        try:
+            await bridge.stop()
+        except Exception:
+            logger.exception("cluster: remote hub failed to stop after start error")
+        set_bridge(None)
 
 
 def request_reconcile() -> None:
@@ -470,6 +513,16 @@ def get_runner() -> ClusterRunner | None:
 
 async def stop() -> None:
     global _runner
+    from app.services.cluster.remote_hub import get_bridge, set_bridge
+
+    # Drop remote pulls before leases are released, or losing `held` would start them.
+    bridge = get_bridge()
+    set_bridge(None)
+    if bridge is not None:
+        try:
+            await bridge.stop()
+        except Exception:
+            logger.exception("cluster: remote hub failed to stop")
     runner, _runner = _runner, None
     if runner is None:
         return

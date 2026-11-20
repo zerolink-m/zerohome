@@ -272,6 +272,7 @@ def _stub_lifespan(monkeypatch):
         (main.motion_cleanup, ("stop",)),
         (main.auth, ("stop_session_cleanup",)),
         (main.cluster_runner, ("start", "stop")),
+        (main.media_server, ("start", "stop")),
     ]:
         for name in names:
             monkeypatch.setattr(module, name, AsyncMock())
@@ -285,20 +286,23 @@ async def test_lifespan_legacy_path_when_cluster_disabled(monkeypatch):
     main.ingest.start_all_enabled.assert_awaited_once()
     main.motion_lifecycle.start_all_enabled.assert_awaited_once()
     main.cluster_runner.start.assert_not_awaited()
+    main.media_server.start.assert_not_awaited()
 
 
 async def test_lifespan_uses_runner_when_cluster_enabled(monkeypatch):
     _stub_lifespan(monkeypatch)
     monkeypatch.setattr(settings, "CLUSTER_ENABLED", True)
     order = []
+    main.media_server.stop.side_effect = lambda: order.append("media.stop")
     main.cluster_runner.stop.side_effect = lambda: order.append("runner.stop")
     main.motion_lifecycle.stop_all.side_effect = lambda: order.append("motion.stop_all")
     main.ingest.stop_all.side_effect = lambda: order.append("ingest.stop_all")
     async with main.lifespan(main.app):
         main.cluster_runner.start.assert_awaited_once()
+        main.media_server.start.assert_awaited_once()
     main.ingest.start_all_enabled.assert_not_awaited()
     main.motion_lifecycle.start_all_enabled.assert_not_awaited()
-    assert order == ["runner.stop", "motion.stop_all", "ingest.stop_all"]
+    assert order == ["media.stop", "runner.stop", "motion.stop_all", "ingest.stop_all"]
 
 
 # ---------------- global functions ----------------

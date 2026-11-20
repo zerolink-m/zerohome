@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     LEASE_TTL_SECONDS: int = 30
     LEASE_RENEW_INTERVAL_SECONDS: int = 10
     NODE_HEARTBEAT_INTERVAL_SECONDS: int = 10
+    # Plain TCP fMP4 between nodes (stage 3). TLS is not enabled: an empty secret
+    # listens and dials on loopback only. See app/services/cluster/media_transport.py.
+    CLUSTER_MEDIA_HOST: str = "127.0.0.1"
+    CLUSTER_MEDIA_PORT: int = 4700
+    CLUSTER_SECRET: str = Field(default="", repr=False)  # handshake HMAC only; does not encrypt
+    CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS: float = 10.0
 
     # --- ingest: one persistent ffmpeg (RTSP -> fMP4, -c copy) per enabled camera ---
     # /stream, HLS, WebRTC, live snapshots and motion detection read this hub when it is on.
@@ -160,6 +166,22 @@ class Settings(BaseSettings):
                 "NODE_ID must be set explicitly when CLUSTER_ENABLED=true: a random id changes on every "
                 "start, so orphaned processes of the previous run are not cleaned up"
             )
+        if self.CLUSTER_ENABLED:
+            media_host = (self.CLUSTER_MEDIA_HOST or "").strip()
+            if not media_host:
+                raise ValueError("CLUSTER_MEDIA_HOST must be set when CLUSTER_ENABLED=true")
+            if self.CLUSTER_MEDIA_PORT < 1 or self.CLUSTER_MEDIA_PORT > 65535:
+                raise ValueError("CLUSTER_MEDIA_PORT must be between 1 and 65535")
+            if self.CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS < 0:
+                raise ValueError("CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS must be >= 0")
+            from app.services.cluster.media_protocol import is_loopback_host
+            if not is_loopback_host(media_host) and not (self.CLUSTER_SECRET or "").strip():
+                raise ValueError(
+                    "CLUSTER_SECRET must be set when CLUSTER_ENABLED=true and CLUSTER_MEDIA_HOST "
+                    f"({media_host}) is not loopback. TLS is not enabled, so the media stream would be "
+                    "sent in the clear; refusing to listen. Bind 127.0.0.1 or ::1 without a secret, "
+                    "or set CLUSTER_SECRET before using any other address."
+                )
         backend = (self.STORAGE_BACKEND or "").strip().lower()
         if backend not in ("local", "s3"):
             raise ValueError("STORAGE_BACKEND must be 'local' or 's3'")

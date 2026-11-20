@@ -18,7 +18,7 @@ from app.core.rate_limit import start_cleanup_task
 from app.routers import auth, cams, cluster, config, connections, invitations, motion, push_settings, service, sessions, shares, stats, switches, users, webrtc
 from app.services import ingest, warmup
 from app.services.storage import get_storage
-from app.services.cluster import runner as cluster_runner
+from app.services.cluster import media_server, runner as cluster_runner
 from app.services import (
     connection_sync,
     healthcheck,
@@ -78,6 +78,9 @@ async def lifespan(app: FastAPI):
     await motion_detection.startup()
     # Auto-start motion detection on cameras where users have it enabled
     if settings.CLUSTER_ENABLED:
+        # Plain TCP. TLS is not on: empty CLUSTER_SECRET binds loopback only
+        # (the socket is opened in app/services/cluster/media_transport.py).
+        await media_server.start()
         await cluster_runner.start()  # ingest/motion per-camera + global function rights
     else:
         await motion_lifecycle.start_all_enabled()
@@ -95,6 +98,8 @@ async def lifespan(app: FastAPI):
     await notify_worker.stop()
     await stream_manager.stop_all()
     await hls_manager.stop_all()
+    # Remote viewers first, then leases, then the local ffmpeg processes.
+    await media_server.stop()  # no-op unless CLUSTER_ENABLED started it
     await cluster_runner.stop()  # releases rights; no-op unless CLUSTER_ENABLED
     await motion_lifecycle.stop_all()
     await snapshot.stop_all()
