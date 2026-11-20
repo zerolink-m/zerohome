@@ -13,7 +13,7 @@ on:
       - app/**
       - alembic/**
       - main.py
-      - compose.yaml
+      - templates/compose.yaml
       - deploy/**
       - .github/workflows/docker-release.yml
 

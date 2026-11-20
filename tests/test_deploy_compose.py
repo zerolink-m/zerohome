@@ -78,7 +78,7 @@ def _compose_config(tmp_path, compose_file, extra, profile=None):
 
 def test_builtin_compose_has_db_migrate_and_app(tmp_path):
     rendered = _compose_config(
-        tmp_path, ROOT / "compose.yaml",
+        tmp_path, ROOT / "templates" / "compose.yaml",
         {"MYSQL_ROOT_PASSWORD": "test-root-password"},
         profile="maintenance",
     )
@@ -93,7 +93,7 @@ def test_builtin_compose_has_db_migrate_and_app(tmp_path):
 
 def test_app_environment_receives_node_and_cluster_settings(tmp_path):
     rendered = _compose_config(
-        tmp_path, ROOT / "compose.yaml",
+        tmp_path, ROOT / "templates" / "compose.yaml",
         {
             "MYSQL_ROOT_PASSWORD": "test-root-password",
             "NODE_ID": "node-a",
@@ -114,7 +114,7 @@ def test_app_environment_receives_node_and_cluster_settings(tmp_path):
     assert env["CLUSTER_MEDIA_HOST"] == "127.0.0.1"
     assert env["CLUSTER_MEDIA_PORT"] == "4700"
     assert env["STORAGE_BACKEND"] == "local"
-    source = (ROOT / "compose.yaml").read_text()
+    source = (ROOT / "templates" / "compose.yaml").read_text()
     assert "NODE_ID: ${NODE_ID:-}" in source
     assert "NODE_ADDRESS: ${NODE_ADDRESS:-}" in source
     assert 'CLUSTER_ENABLED: "${CLUSTER_ENABLED:-false}"' in source
@@ -122,7 +122,7 @@ def test_app_environment_receives_node_and_cluster_settings(tmp_path):
 
 def test_external_compose_has_no_database_service(tmp_path):
     rendered = _compose_config(
-        tmp_path, ROOT / "compose.external-db.yaml",
+        tmp_path, ROOT / "templates" / "compose.external-db.yaml",
         {"DB_HOST": "10.9.9.9", "DB_PORT": "3307"},
         profile="maintenance",
     )
@@ -406,7 +406,7 @@ def test_update_external_db_does_not_dump_and_still_migrates(tmp_path):
     assert result.returncode == 0, result.stderr
     for call in calls:
         if call["args"][0] == "compose":
-            assert call["args"][4].endswith("compose.external-db.yaml")
+            assert call["args"][4].endswith("templates/compose.external-db.yaml")
     flat = [" ".join(command) for command in commands]
     assert not any(command[0] == "exec" for command in commands)
     assert not any("mysqldump" in text for text in flat)

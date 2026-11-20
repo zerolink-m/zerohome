@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run as the dedicated Docker operator/root. Requires Bash, flock, gzip, Python 3.
-# ZEROHOME_EXTERNAL_DB=1 selects compose.external-db.yaml: no db container and no
+# ZEROHOME_EXTERNAL_DB=1 selects templates/compose.external-db.yaml: no db container and no
 # automatic backup (the operator backs up that database). Migration still runs
 # under the MySQL lock when this node is the migration node.
 # ZEROHOME_MIGRATE=0 updates only this node's app container and waits for the
@@ -21,9 +21,9 @@ case "${ZEROHOME_EXTERNAL_DB:-}" in
     1|true|TRUE|yes|YES) external=1 ;;
 esac
 if [[ "$external" == 1 ]]; then
-    compose_file="$ROOT/compose.external-db.yaml"
+    compose_file="$ROOT/templates/compose.external-db.yaml"
 else
-    compose_file="$ROOT/compose.yaml"
+    compose_file="$ROOT/templates/compose.yaml"
 fi
 compose=(docker compose --env-file "$CONFIG" -f "$compose_file")
 

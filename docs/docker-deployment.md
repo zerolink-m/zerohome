@@ -26,7 +26,7 @@ This is a CPU image, not a GPU-enabled or ARM build. Native dependencies and ML 
 
 ## First deployment on the target host
 
-Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), Bash, `flock`, gzip and Python 3. Docker access is root-equivalent. Use a dedicated trusted operator. Put this checkout (including `compose.yaml` and `deploy/`) at `/opt/zerohome`; if you use another location, adjust the service unit accordingly.
+Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), Bash, `flock`, gzip and Python 3. Docker access is root-equivalent. Use a dedicated trusted operator. Put this checkout (including `templates/compose.yaml` and `deploy/`) at `/opt/zerohome`; if you use another location, adjust the service unit accordingly.
 
 1. Authenticate **as the same OS user that runs the updater**. Use an account with package access and a GitHub PAT (classic) with `read:packages`, SSO-authorized if applicable. Do not place the token in this repository or a command-line argument:
 
@@ -67,9 +67,9 @@ Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), B
 
    ```sh
    cd /opt/zerohome
-   docker compose --env-file /etc/zerohome/deployment.conf pull db
+   docker compose --env-file /etc/zerohome/deployment.conf -f templates/compose.yaml pull db
    sudo ./deploy/update.sh
-   docker compose --env-file /etc/zerohome/deployment.conf ps
+   docker compose --env-file /etc/zerohome/deployment.conf -f templates/compose.yaml ps
    curl --fail http://127.0.0.1:8000/v1/health
    ```
 
@@ -77,19 +77,19 @@ Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), B
 
 The built-in file runs one app container. More than one node is the external-database layout below; camera work is then leased instead of started for every camera on every node. The container runs as UID/GID 10001, drops capabilities and uses an init process for child reaping. Named volumes persist MySQL data, motion event photos and OCR/model state. Cache/process registries and temporary media are disposable tmpfs. Never run `docker compose down -v` on a live installation. A healthcheck is HTTP **liveness**, not proof of camera reachability or database correctness; DB health and migration success are checked separately by deployment.
 
-The HTTP port is loopback-only by default; terminate HTTPS in a reverse proxy with WebSocket support and appropriate streaming timeouts. MySQL has no published host port. Camera RTSP/ONVIF addresses must be reachable from the Docker bridge network. WebRTC needs explicit UDP routing: choose `WEBRTC_UDP_PORT_MIN/MAX`, set `WEBRTC_PUBLIC_IP` and publish/forward the same UDP range in a local Compose override; HTTP proxying alone is insufficient. Supply that override explicitly in the updater's Compose command if used (the shipped script reads `compose.yaml`, or `compose.external-db.yaml` when `ZEROHOME_EXTERNAL_DB=1`, and no further file). Review firewall/NAT and STUN/TURN client settings for the target host; do not assume the existing host configuration automatically transfers into bridge networking.
+The HTTP port is loopback-only by default; terminate HTTPS in a reverse proxy with WebSocket support and appropriate streaming timeouts. MySQL has no published host port. Camera RTSP/ONVIF addresses must be reachable from the Docker bridge network. WebRTC needs explicit UDP routing: choose `WEBRTC_UDP_PORT_MIN/MAX`, set `WEBRTC_PUBLIC_IP` and publish/forward the same UDP range in a local Compose override; HTTP proxying alone is insufficient. Supply that override explicitly in the updater's Compose command if used (the shipped script reads `templates/compose.yaml`, or `templates/compose.external-db.yaml` when `ZEROHOME_EXTERNAL_DB=1`, and no further file). Review firewall/NAT and STUN/TURN client settings for the target host; do not assume the existing host configuration automatically transfers into bridge networking.
 
 ## One node, an external database, or a second node
 
-Node identity and cluster settings are not hardcoded. `compose.yaml` and `compose.external-db.yaml` pass `NODE_ID`, `NODE_ADDRESS`, `CLUSTER_ENABLED`, `CLUSTER_SECRET`, `CLUSTER_MEDIA_HOST`, `CLUSTER_MEDIA_PORT`, `STORAGE_BACKEND` and `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` from the Compose environment (the deployment env file or `export`). Those entries override the application env file. Put them there, not only in `app.conf`. Unset booleans and integers use the app defaults (`CLUSTER_ENABLED=false`, media on `127.0.0.1:4700`, `STORAGE_BACKEND=local`) because an empty string fails startup. `MIGRATE_LOCK_TIMEOUT_SECONDS` (default 300) is how long a node waits for the migration lock.
+Node identity and cluster settings are not hardcoded. `templates/compose.yaml` and `templates/compose.external-db.yaml` pass `NODE_ID`, `NODE_ADDRESS`, `CLUSTER_ENABLED`, `CLUSTER_SECRET`, `CLUSTER_MEDIA_HOST`, `CLUSTER_MEDIA_PORT`, `STORAGE_BACKEND` and `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` from the Compose environment (the deployment env file or `export`). Those entries override the application env file. Put them there, not only in `app.conf`. Unset booleans and integers use the app defaults (`CLUSTER_ENABLED=false`, media on `127.0.0.1:4700`, `STORAGE_BACKEND=local`) because an empty string fails startup. `MIGRATE_LOCK_TIMEOUT_SECONDS` (default 300) is how long a node waits for the migration lock.
 
 ### One node, built-in database
 
-Leave the variables above unset and run `./deploy/update.sh` with `compose.yaml`, as in the first-deployment steps. The script starts the existing `db` container without recreating it, stops the app, takes the logical backup, migrates, and starts the app. `ZEROHOME_MIGRATE` stays unset: this node is the migration node. Do not point a second server at this Compose database; MySQL has no published port.
+Leave the variables above unset and run `./deploy/update.sh` with `templates/compose.yaml`, as in the first-deployment steps. The script starts the existing `db` container without recreating it, stops the app, takes the logical backup, migrates, and starts the app. `ZEROHOME_MIGRATE` stays unset: this node is the migration node. Do not point a second server at this Compose database; MySQL has no published port.
 
 ### External database
 
-`compose.external-db.yaml` is a separate file, not an overlay. Do not combine it with `compose.yaml`. An overlay would still interpolate the built-in file, still require `MYSQL_ROOT_PASSWORD`, and still describe a `db` service. The external file has `app` and `migrate` only: no `db` service and no `depends_on`. The project name stays `zerohome`, so the motion and model volumes keep their names. Do not `up` both files at once.
+`templates/compose.external-db.yaml` is a separate file, not an overlay. Do not combine it with `templates/compose.yaml`. An overlay would still interpolate the built-in file, still require `MYSQL_ROOT_PASSWORD`, and still describe a `db` service. The external file has `app` and `migrate` only: no `db` service and no `depends_on`. The project name stays `zerohome`, so the motion and model volumes keep their names. Do not `up` both files at once.
 
 The app reads `DB_HOST`, `DB_PORT` (default 3306), `DB_USER`, `DB_PASSWORD` and `DB_NAME`. `DB_READ_TIMEOUT_SECONDS` (default 30) is passed to asyncmy as `read_timeout` on every pooled connection, including pool pre-ping, so a silent MySQL fails the read instead of holding a pool slot until the pool is exhausted; `pool_pre_ping` stays on and `pool_recycle` stays 3600. `DB_WRITE_TIMEOUT_SECONDS` (default 30) is passed only when this asyncmy accepts `write_timeout` (the installed driver does not). There is no second set of names and no `MYSQL_ROOT_PASSWORD`. `DB_HOST` must be reachable from the Compose network. `127.0.0.1` inside the container is the container, not the host; for MySQL on the same machine use a reachable address, or a local override with `extra_hosts: ["host.docker.internal:host-gateway"]` and `DB_HOST=host.docker.internal`.
 
@@ -97,7 +97,7 @@ The app reads `DB_HOST`, `DB_PORT` (default 3306), `DB_USER`, `DB_PASSWORD` and 
 ZEROHOME_EXTERNAL_DB=1 sudo -E ./deploy/update.sh
 ```
 
-The script then uses `compose.external-db.yaml`. It does not start a database container and it does not run `mysqldump`. That refusal is deliberate: back up the external database yourself before the run. Schema migration still runs, once, under the MySQL lock. The unattended timer is for the built-in single-node stack; do not enable it here unless backups are handled outside the script.
+The script then uses `templates/compose.external-db.yaml`. It does not start a database container and it does not run `mysqldump`. That refusal is deliberate: back up the external database yourself before the run. Schema migration still runs, once, under the MySQL lock. The unattended timer is for the built-in single-node stack; do not enable it here unless backups are handled outside the script.
 
 ### Second node
 
@@ -141,7 +141,7 @@ Moving an existing production DB into the Compose volume is **not** performed by
 
 ## Existing `/opt/zerocams` host: systemd to Docker, host MySQL retained
 
-`compose.host.yaml` is a **standalone, host-specific alternative**, not an override to merge with `compose.yaml`. It has only `app`: no database container, migration service, automatic schema changes or image pulls. **The shipped `deploy/update.sh` and `zerohome-update.timer` are NOT compatible with this deployment**: they assume Compose-managed MySQL and run migrations. Do not install/enable them; ensure no previously installed updater is active before cutover. Watchtower is explicitly excluded.
+`compose.host.yaml` is a **standalone, host-specific alternative**, not an override to merge with `templates/compose.yaml`. It has only `app`: no database container, migration service, automatic schema changes or image pulls. **The shipped `deploy/update.sh` and `zerohome-update.timer` are NOT compatible with this deployment**: they assume Compose-managed MySQL and run migrations. Do not install/enable them; ensure no previously installed updater is active before cutover. Watchtower is explicitly excluded.
 
 Inspected host settings: systemd runs `/opt/zerocams/main.py` as root, with working directory `/opt/zerocams` and `KillMode=control-group`; HTTP binds `0.0.0.0:3805`, MySQL is `127.0.0.1:3306`, WebRTC uses UDP `49152–65535`. Host networking retains these routes and the existing firewall/NAT rules; Docker port publishing is deliberately absent. It also exposes the container to host-network services: this is not bridge-network isolation.
 
