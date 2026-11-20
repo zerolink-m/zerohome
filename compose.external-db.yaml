@@ -1,0 +1,73 @@
+# Standalone stack for an already-running database. Do not merge with
+# compose.yaml: Compose interpolates the base file first, so its required
+# MYSQL_ROOT_PASSWORD would still be demanded and the db service would still
+# be part of the model. This file has no db service and no depends_on.
+# Same project name as compose.yaml so motion/model volumes keep their names
+# when an operator switches files. Do not `up` both files at once.
+name: zerohome
+
+x-app: &app
+  image: ${ZEROHOME_IMAGE:-ghcr.io/zerolink-m/zerohome:stable}
+  # Supply a host-managed file; it is never copied into the build context.
+  env_file:
+    - ${ZEROHOME_CONFIG:-/etc/zerohome/app.conf}
+  environment:
+    DB_HOST: ${DB_HOST:?Set DB_HOST to the external database host}
+    DB_PORT: "${DB_PORT:-3306}"
+    DB_NAME: ${DB_NAME:-zerocams}
+    DB_USER: ${DB_USER:-zerocams}
+    DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in the deployment configuration}
+    HOST: 0.0.0.0
+    PORT: "8000"
+    CACHE_DIR: /data/cache
+    MOTION_FILES_DIR: /data/motion_files
+    # Same pass-through as compose.yaml. Set these in the Compose env file or
+    # export them; they override the application env file. Bool/int defaults
+    # match the app so an unset value still starts, and an empty string would
+    # not (settings reject it).
+    NODE_ID: ${NODE_ID:-}
+    NODE_ADDRESS: ${NODE_ADDRESS:-}
+    CLUSTER_ENABLED: "${CLUSTER_ENABLED:-false}"
+    CLUSTER_SECRET: ${CLUSTER_SECRET:-}
+    CLUSTER_MEDIA_HOST: ${CLUSTER_MEDIA_HOST:-127.0.0.1}
+    CLUSTER_MEDIA_PORT: "${CLUSTER_MEDIA_PORT:-4700}"
+    STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+    S3_ENDPOINT: ${S3_ENDPOINT:-}
+    S3_BUCKET: ${S3_BUCKET:-}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+    S3_REGION: ${S3_REGION:-}
+    MIGRATE_LOCK_TIMEOUT_SECONDS: "${MIGRATE_LOCK_TIMEOUT_SECONDS:-300}"
+  volumes:
+    - motion:/data/motion_files
+    - models:/data/models
+  tmpfs:
+    - /tmp:mode=1777
+    - /data/cache:uid=10001,gid=10001,mode=0700
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  labels:
+    com.centurylinklabs.watchtower.enable: "false"
+
+services:
+  migrate:
+    <<: *app
+    profiles: [maintenance]
+    restart: "no"
+    # Script is copied into the image. GET_LOCK is held for the whole upgrade.
+    command: ["python", "/app/deploy/migrate_locked.py"]
+    healthcheck:
+      disable: true
+
+  app:
+    <<: *app
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    ports:
+      - "${ZEROHOME_BIND:-127.0.0.1}:8000:8000"
+
+volumes:
+  motion:
+  models:

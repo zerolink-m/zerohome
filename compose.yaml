@@ -15,6 +15,23 @@ x-app: &app
     PORT: "8000"
     CACHE_DIR: /data/cache
     MOTION_FILES_DIR: /data/motion_files
+    # Compose environment overrides env_file. Defaults match the app so an
+    # unset value does not change a single-node install. Set node and cluster
+    # values in the Compose env file or export them. Bool and int defaults are
+    # explicit: an empty string is rejected by settings.
+    NODE_ID: ${NODE_ID:-}
+    NODE_ADDRESS: ${NODE_ADDRESS:-}
+    CLUSTER_ENABLED: "${CLUSTER_ENABLED:-false}"
+    CLUSTER_SECRET: ${CLUSTER_SECRET:-}
+    CLUSTER_MEDIA_HOST: ${CLUSTER_MEDIA_HOST:-127.0.0.1}
+    CLUSTER_MEDIA_PORT: "${CLUSTER_MEDIA_PORT:-4700}"
+    STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+    S3_ENDPOINT: ${S3_ENDPOINT:-}
+    S3_BUCKET: ${S3_BUCKET:-}
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+    S3_REGION: ${S3_REGION:-}
+    MIGRATE_LOCK_TIMEOUT_SECONDS: "${MIGRATE_LOCK_TIMEOUT_SECONDS:-300}"
   volumes:
     - motion:/data/motion_files
     - models:/data/models
@@ -52,7 +69,8 @@ services:
     <<: *app
     profiles: [maintenance]
     restart: "no"
-    command: [alembic, upgrade, head]
+    # Image copy of deploy/migrate_locked.py. Holds GET_LOCK for the upgrade.
+    command: ["python", "/app/deploy/migrate_locked.py"]
     healthcheck:
       disable: true
     depends_on:

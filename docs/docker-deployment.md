@@ -73,11 +73,45 @@ Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), B
    curl --fail http://127.0.0.1:8000/v1/health
    ```
 
-   Run all Docker commands under the authenticated operator (omit `sudo` if already root). The updater pulls the application, pins its digest, starts/waits for the existing or freshly initialized DB without upgrading it, stops the app, backs up the database, runs `alembic upgrade head` in a single disposable `migrate` container, and only then starts/waits for the app. Initial deployment also takes a backup of the newly initialized empty database. The app image itself never runs migrations at startup. **Use the script, not a bare `docker compose up -d app`, to deploy or update.** The maintenance-profile migrate service is not a continuously running replica.
+   Run all Docker commands under the authenticated operator (omit `sudo` if already root). The updater pulls the application, pins its digest, starts/waits for the existing or freshly initialized DB without upgrading it, stops the app, backs up the database, runs `alembic upgrade head` while holding MySQL `GET_LOCK('zerohome_migrate')` (`deploy/migrate_locked.py`) in a single disposable `migrate` container, and only then starts/waits for the app. Initial deployment also takes a backup of the newly initialized empty database. The app image itself never runs migrations at startup. **Use the script, not a bare `docker compose up -d app`, to deploy or update.** The maintenance-profile migrate service is not a continuously running replica.
 
-One app process/replica is supported: camera ownership and background jobs are in-process, not a distributed worker system. The container runs as UID/GID 10001, drops capabilities and uses an init process for child reaping. Named volumes persist MySQL data, motion event photos and OCR/model state. Cache/process registries and temporary media are disposable tmpfs. Never run `docker compose down -v` on a live installation. A healthcheck is HTTP **liveness**, not proof of camera reachability or database correctness; DB health and migration success are checked separately by deployment.
+The built-in file runs one app container. More than one node is the external-database layout below; camera work is then leased instead of started for every camera on every node. The container runs as UID/GID 10001, drops capabilities and uses an init process for child reaping. Named volumes persist MySQL data, motion event photos and OCR/model state. Cache/process registries and temporary media are disposable tmpfs. Never run `docker compose down -v` on a live installation. A healthcheck is HTTP **liveness**, not proof of camera reachability or database correctness; DB health and migration success are checked separately by deployment.
 
-The HTTP port is loopback-only by default; terminate HTTPS in a reverse proxy with WebSocket support and appropriate streaming timeouts. MySQL has no published host port. Camera RTSP/ONVIF addresses must be reachable from the Docker bridge network. WebRTC needs explicit UDP routing: choose `WEBRTC_UDP_PORT_MIN/MAX`, set `WEBRTC_PUBLIC_IP` and publish/forward the same UDP range in a local Compose override; HTTP proxying alone is insufficient. Supply that override explicitly in the updater's Compose command if used (the shipped script intentionally reads only `compose.yaml`). Review firewall/NAT and STUN/TURN client settings for the target host; do not assume the existing host configuration automatically transfers into bridge networking.
+The HTTP port is loopback-only by default; terminate HTTPS in a reverse proxy with WebSocket support and appropriate streaming timeouts. MySQL has no published host port. Camera RTSP/ONVIF addresses must be reachable from the Docker bridge network. WebRTC needs explicit UDP routing: choose `WEBRTC_UDP_PORT_MIN/MAX`, set `WEBRTC_PUBLIC_IP` and publish/forward the same UDP range in a local Compose override; HTTP proxying alone is insufficient. Supply that override explicitly in the updater's Compose command if used (the shipped script reads `compose.yaml`, or `compose.external-db.yaml` when `ZEROHOME_EXTERNAL_DB=1`, and no further file). Review firewall/NAT and STUN/TURN client settings for the target host; do not assume the existing host configuration automatically transfers into bridge networking.
+
+## One node, an external database, or a second node
+
+Node identity and cluster settings are not hardcoded. `compose.yaml` and `compose.external-db.yaml` pass `NODE_ID`, `NODE_ADDRESS`, `CLUSTER_ENABLED`, `CLUSTER_SECRET`, `CLUSTER_MEDIA_HOST`, `CLUSTER_MEDIA_PORT`, `STORAGE_BACKEND` and `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` from the Compose environment (the deployment env file or `export`). Those entries override the application env file. Put them there, not only in `app.conf`. Unset booleans and integers use the app defaults (`CLUSTER_ENABLED=false`, media on `127.0.0.1:4700`, `STORAGE_BACKEND=local`) because an empty string fails startup. `MIGRATE_LOCK_TIMEOUT_SECONDS` (default 300) is how long a node waits for the migration lock.
+
+### One node, built-in database
+
+Leave the variables above unset and run `./deploy/update.sh` with `compose.yaml`, as in the first-deployment steps. The script starts the existing `db` container without recreating it, stops the app, takes the logical backup, migrates, and starts the app. `ZEROHOME_MIGRATE` stays unset: this node is the migration node. Do not point a second server at this Compose database; MySQL has no published port.
+
+### External database
+
+`compose.external-db.yaml` is a separate file, not an overlay. Do not combine it with `compose.yaml`. An overlay would still interpolate the built-in file, still require `MYSQL_ROOT_PASSWORD`, and still describe a `db` service. The external file has `app` and `migrate` only: no `db` service and no `depends_on`. The project name stays `zerohome`, so the motion and model volumes keep their names. Do not `up` both files at once.
+
+The app reads `DB_HOST`, `DB_PORT` (default 3306), `DB_USER`, `DB_PASSWORD` and `DB_NAME`. There is no second set of names and no `MYSQL_ROOT_PASSWORD`. `DB_HOST` must be reachable from the Compose network. `127.0.0.1` inside the container is the container, not the host; for MySQL on the same machine use a reachable address, or a local override with `extra_hosts: ["host.docker.internal:host-gateway"]` and `DB_HOST=host.docker.internal`.
+
+```sh
+ZEROHOME_EXTERNAL_DB=1 sudo -E ./deploy/update.sh
+```
+
+The script then uses `compose.external-db.yaml`. It does not start a database container and it does not run `mysqldump`. That refusal is deliberate: back up the external database yourself before the run. Schema migration still runs, once, under the MySQL lock. The unattended timer is for the built-in single-node stack; do not enable it here unless backups are handled outside the script.
+
+### Second node
+
+Every node uses the external file and the same writable database. Replication is the operator's job. The application needs one writer for leases, notification jobs and sessions. It does not support multi-master writes. Read replicas are not used.
+
+On each node set a unique stable `NODE_ID`, that node's own `NODE_ADDRESS` (`host`, `host:port` or `[ipv6]:port`), `CLUSTER_ENABLED=true`, and `CLUSTER_SECRET` (required when the media listener is not loopback; it authenticates the handshake and does not encrypt). Publish the fMP4 port and the HTTP port yourself; neither Compose file opens 4700. Give each node its own cache volume. Do not share one.
+
+Exactly one node migrates. On that node leave `ZEROHOME_MIGRATE` unset or set it to `1`, with `ZEROHOME_EXTERNAL_DB=1`. On every other node:
+
+```sh
+ZEROHOME_EXTERNAL_DB=1 ZEROHOME_MIGRATE=0 sudo -E ./deploy/update.sh
+```
+
+Those nodes do not back up and do not run Alembic. They wait until `zerohome_migrate` is free, then replace only their app container. Start them after the migrating node has taken the lock, or after it has finished. A follower that starts earlier can pass the wait before the lock exists. Raise `MIGRATE_LOCK_TIMEOUT_SECONDS` if a migration can still be running when followers start waiting. The lock is one database session held for the whole `alembic upgrade head`, then released. Do not enable `zerohome-update.timer` on more than one host.
 
 ## Automatic stable updates (opt-in)
 
@@ -210,7 +244,7 @@ With `CLUSTER_ENABLED=true` a node no longer starts ingest and motion detection 
 
 Requirements for every node:
 
-- One shared database (all nodes point at the same `DATABASE_URL`/MySQL); migrations must be applied before nodes start.
+- One shared writable database (all nodes use the same `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME`). Replication is the operator's job; multi-master writes are not supported. One node applies migrations under the MySQL lock; the others wait. See "One node, an external database, or a second node" above.
 - A unique `NODE_ID` per node, and its own `CACHE_DIR` and `INGEST_REGISTRY_DIR` (never share these between nodes).
 - `NODE_ID` is required on every node when `CLUSTER_ENABLED=true`: the settings validation fails at startup if it is empty or blank. A random id would change on every start, so the process registry of the previous run (kept under a directory named after the node id) is not found and ffmpeg processes orphaned by a crash are not reaped.
 - With `CLUSTER_ENABLED=true` and no explicit `INGEST_REGISTRY_DIR` / `HLS_TEMP_DIR`, the process registries and the HLS temp directory are placed in `<CACHE_DIR>/ingest/nodes/<NODE_ID>/` and `<HLS_TEMP_DIR>/nodes/<NODE_ID>/` (NODE_ID reduced to `[A-Za-z0-9._-]`), so two nodes on one host never reap each other's ffmpeg or clean each other's HLS files. Explicit values are used as given. Still give each node its own volume or `CACHE_DIR`; on different hosts or containers never share one.
