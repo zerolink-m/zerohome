@@ -55,7 +55,12 @@ def _compose_config(tmp_path, compose_file, extra, profile=None):
         "DB_PASSWORD": "test-db-password",
         "DB_NAME": "zerocams",
         "DB_USER": "zerocams",
+        # env_file defaults to /etc/zerohome/app.conf, which exists on the
+        # deploy host but not in CI. Compose checks the file is present even
+        # with --no-env-resolution, so point it at an empty fixture.
+        "ZEROHOME_CONFIG": str(tmp_path / "app.conf"),
     }
+    (tmp_path / "app.conf").write_text("")
     env.update(extra)
     command = [
         "docker", "compose",
