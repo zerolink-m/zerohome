@@ -105,8 +105,13 @@ class Settings(BaseSettings):
     # listens and dials on loopback only. See app/services/cluster/media_transport.py.
     CLUSTER_MEDIA_HOST: str = "127.0.0.1"
     CLUSTER_MEDIA_PORT: int = 4700
-    CLUSTER_SECRET: str = Field(default="", repr=False)  # handshake HMAC only; does not encrypt
+    CLUSTER_SECRET: str = Field(default="", repr=False)  # media handshake HMAC, and the view-proxy header HMAC; does not encrypt
     CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS: float = 10.0
+    # View routing (stage 4). Host is the host part of nodes.address; the port in that
+    # address stays the fMP4 port. 0 means dial HTTP on PORT.
+    CLUSTER_VIEW_HTTP_PORT: int = 0
+    CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS: float = 3.0
+    CLUSTER_VIEW_READ_TIMEOUT_SECONDS: float = 15.0  # silence between proxied chunks; also bounds waiting for headers
 
     # --- ingest: one persistent ffmpeg (RTSP -> fMP4, -c copy) per enabled camera ---
     # /stream, HLS, WebRTC, live snapshots and motion detection read this hub when it is on.
@@ -174,6 +179,12 @@ class Settings(BaseSettings):
                 raise ValueError("CLUSTER_MEDIA_PORT must be between 1 and 65535")
             if self.CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS < 0:
                 raise ValueError("CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS must be >= 0")
+            if self.CLUSTER_VIEW_HTTP_PORT < 0 or self.CLUSTER_VIEW_HTTP_PORT > 65535:
+                raise ValueError("CLUSTER_VIEW_HTTP_PORT must be 0 (use PORT) or between 1 and 65535")
+            if self.CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS <= 0 or self.CLUSTER_VIEW_READ_TIMEOUT_SECONDS <= 0:
+                raise ValueError(
+                    "CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS and CLUSTER_VIEW_READ_TIMEOUT_SECONDS must be > 0"
+                )
             from app.services.cluster.media_protocol import is_loopback_host
             if not is_loopback_host(media_host) and not (self.CLUSTER_SECRET or "").strip():
                 raise ValueError(
