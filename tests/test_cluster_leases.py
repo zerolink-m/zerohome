@@ -127,7 +127,10 @@ def test_migration_chain():
     nxt = script.get_revision("47600_notify_photo")
     assert nxt.down_revision == "47500_cluster_leases"
     assert len(nxt.revision) <= 32
-    assert script.get_heads() == ["47600_notify_photo"]
+    holder = script.get_revision("47700_lease_holder")
+    assert holder.down_revision == "47600_notify_photo"
+    assert len(holder.revision) <= 32
+    assert script.get_heads() == ["47700_lease_holder"]
 
 
 def _settings(**kw):

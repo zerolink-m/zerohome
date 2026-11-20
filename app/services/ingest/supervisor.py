@@ -97,6 +97,14 @@ class IngestSupervisor:
                 worker.task = asyncio.create_task(self._run(worker), name=f"ingest-{cam_id}")
                 logger.info("ingest: started cam %s", cam_id)
                 return "started"
+            if worker.task is None or worker.task.done():
+                # The record is still here, but the task ended on its own (not via stop(),
+                # which removes the record first). Same URL must not report "unchanged".
+                self._retrieve_task_error(worker)
+                worker.target = target
+                worker.task = asyncio.create_task(self._run(worker), name=f"ingest-{cam_id}")
+                logger.warning("ingest: cam %s worker died, restarting", cam_id)
+                return "restarting"
             if worker.target.url != target.url:
                 worker.target = target
                 worker.restart_event.set()
@@ -104,6 +112,14 @@ class IngestSupervisor:
                 return "restarting"
             worker.target = target
             return "unchanged"
+
+    def _retrieve_task_error(self, worker: _Worker) -> None:
+        task = worker.task
+        if task is None or not task.done() or task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("ingest: cam %s worker exited: %s", worker.target.cam_id, exc)
 
     async def restart(self, cam_id: int) -> bool:
         worker = self._workers.get(cam_id)

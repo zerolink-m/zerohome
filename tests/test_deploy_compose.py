@@ -1,10 +1,14 @@
 """Compose profiles, node environment, migration lock and external-db updates."""
+import asyncio
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -176,6 +180,156 @@ def test_migration_lock_is_released_when_upgrade_raises():
     with pytest.raises(RuntimeError, match="migration failed"):
         migrate_locked.migrate_under_lock(connection, boom, 5)
     assert connection.calls[-1][0] == migrate_locked.RELEASE_LOCK_SQL
+
+
+class DyingLockConnection(FakeLockConnection):
+    """Fake GET_LOCK session whose death the migrator can observe."""
+
+    def __init__(self):
+        super().__init__(granted=True)
+        self.lock_lost = threading.Event()
+        self.lock_lost_reason = ""
+
+    def die(self):
+        self.lock_lost_reason = "server has gone away"
+        self.lock_lost.set()
+
+
+def test_live_lock_connection_still_runs_upgrade():
+    connection = DyingLockConnection()
+    ran = []
+    code = migrate_locked.migrate_under_lock(connection, lambda: ran.append("upgrade"), 5)
+    assert code == 0
+    assert ran == ["upgrade"]
+    assert connection.calls[0][0] == migrate_locked.GET_LOCK_SQL
+    assert connection.calls[-1][0] == migrate_locked.RELEASE_LOCK_SQL
+
+
+def test_live_lock_connection_still_propagates_upgrade_errors():
+    connection = DyingLockConnection()
+
+    def boom():
+        raise RuntimeError("migration failed")
+
+    with pytest.raises(RuntimeError, match="migration failed"):
+        migrate_locked.migrate_under_lock(connection, boom, 5)
+    assert connection.calls[-1][0] == migrate_locked.RELEASE_LOCK_SQL
+
+
+def test_already_lost_lock_does_not_start_upgrade(capsys):
+    connection = DyingLockConnection()
+    connection.die()
+    ran = []
+    code = migrate_locked.migrate_under_lock(connection, lambda: ran.append("upgrade"), 5)
+    assert code == 1
+    assert ran == []
+    assert connection.calls[-1][0] == migrate_locked.RELEASE_LOCK_SQL
+    assert "was lost during migration" in capsys.readouterr().err
+
+
+def test_lock_connection_death_aborts_upgrade(capsys):
+    connection = DyingLockConnection()
+    started = threading.Event()
+    finished = []
+
+    def upgrade():
+        started.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            time.sleep(0.01)
+        finished.append("completed")
+
+    def kill():
+        assert started.wait(2)
+        connection.die()
+
+    threading.Thread(target=kill, daemon=True).start()
+    code = migrate_locked.migrate_under_lock(connection, upgrade, 30)
+    assert code == 1
+    assert started.is_set()
+    assert finished == []
+    statements = [sql for sql, _params in connection.calls]
+    assert statements[0] == migrate_locked.GET_LOCK_SQL
+    assert statements[-1] == migrate_locked.RELEASE_LOCK_SQL
+    err = capsys.readouterr().err
+    assert "was lost during migration" in err
+    assert "server has gone away" in err
+
+
+def _bare_lock_holder():
+    holder = migrate_locked.MysqlLockConnection.__new__(migrate_locked.MysqlLockConnection)
+    holder.lock_lost = threading.Event()
+    holder.lock_lost_reason = ""
+    holder._conn = None
+    holder._gate = None
+    return holder
+
+
+def test_closed_lock_socket_marks_lock_lost(monkeypatch):
+    monkeypatch.setattr(migrate_locked, "LOCK_WATCH_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(migrate_locked, "HEARTBEAT_INTERVAL_SECONDS", 30)
+    holder = _bare_lock_holder()
+    holder._conn = SimpleNamespace(connected=True, _proto=SimpleNamespace(eof=True, exc=None))
+
+    asyncio.run(holder._heartbeat_loop())
+
+    assert holder.lock_lost.is_set()
+    assert "closed" in holder.lock_lost_reason
+
+
+def test_heartbeat_ping_failure_marks_lock_lost(monkeypatch):
+    monkeypatch.setattr(migrate_locked, "LOCK_WATCH_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(migrate_locked, "HEARTBEAT_INTERVAL_SECONDS", 0)
+    holder = _bare_lock_holder()
+
+    class Boom:
+        connected = True
+        _proto = SimpleNamespace(eof=False, exc=None)
+
+        def cursor(self):
+            raise ConnectionError("server has gone away")
+
+    async def drive():
+        holder._gate = asyncio.Lock()
+        holder._conn = Boom()
+        await holder._heartbeat_loop()
+
+    asyncio.run(drive())
+    assert holder.lock_lost.is_set()
+    assert "gone away" in holder.lock_lost_reason
+
+
+def test_heartbeat_cancel_is_not_lock_loss():
+    holder = _bare_lock_holder()
+    holder._conn = SimpleNamespace(connected=True, _proto=SimpleNamespace(eof=False, exc=None))
+
+    async def drive():
+        task = asyncio.create_task(holder._heartbeat_loop())
+        task.add_done_callback(holder._on_heartbeat_done)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+    assert holder.lock_lost.is_set() is False
+
+
+def test_heartbeat_task_failure_is_not_left_unread():
+    holder = _bare_lock_holder()
+
+    async def boom():
+        raise ConnectionError("server has gone away")
+
+    async def drive():
+        task = asyncio.create_task(boom())
+        task.add_done_callback(holder._on_heartbeat_done)
+        with pytest.raises(ConnectionError):
+            await task
+
+    asyncio.run(drive())
+    assert holder.lock_lost.is_set()
+    assert "gone away" in holder.lock_lost_reason
 
 
 def test_null_get_lock_is_not_a_grant():

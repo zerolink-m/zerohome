@@ -146,7 +146,14 @@ async def notify_user(
         return False
 
 
-async def _notify_recipients(db, device_type: str, device_id: int, owner_id: int, message: str):
+def _without(users, skip_ids):
+    if not skip_ids:
+        return list(users)
+    return [user for user in users if getattr(user, "id", None) not in skip_ids]
+
+
+async def _notify_recipients(db, device_type: str, device_id: int, owner_id: int, message: str,
+                             delivered: list | None = None, skip_ids: set | None = None):
     """Notifies users who have push_settings.enabled=1 for this device."""
     # Get all push_settings for this device where enabled=1
     stmt = select(PushSettings).where(
@@ -190,13 +197,18 @@ async def _notify_recipients(db, device_type: str, device_id: int, owner_id: int
             )
             recipients.extend(invitees)
 
-        return await _notify_users(recipients, message)
+        recipients = _without(recipients, skip_ids)
+        if not recipients:
+            return True
+        return await _notify_users(recipients, message, delivered)
     # New behavior: notify based on push_settings
     user_ids = [ps.user_id for ps in push_settings_list]
     stmt_users = select(User).where(User.id.in_(user_ids))
     result_users = await db.execute(stmt_users)
-    users = result_users.scalars().all()
-    return await _notify_users(users, message)
+    users = _without(result_users.scalars().all(), skip_ids)
+    if not users:
+        return True
+    return await _notify_users(users, message, delivered)
 
 
 async def _notify_recipients_filtered(
@@ -206,6 +218,8 @@ async def _notify_recipients_filtered(
     owner_id: int,
     message: str,
     filter_func=None,
+    delivered: list | None = None,
+    skip_ids: set | None = None,
 ):
     """Notifies users with additional filtering based on push_settings.
 
@@ -231,25 +245,36 @@ async def _notify_recipients_filtered(
     user_ids = [ps.user_id for ps in push_settings_list]
     stmt_users = select(User).where(User.id.in_(user_ids))
     result_users = await db.execute(stmt_users)
-    users = result_users.scalars().all()
-    return await _notify_users(users, message)
+    users = _without(result_users.scalars().all(), skip_ids)
+    if not users:
+        return True
+    return await _notify_users(users, message, delivered)
 
 
-async def _notify_users(users, message: str) -> bool:
+async def _notify_users(users, message: str, delivered: list | None = None) -> bool:
     ok = True
     for user in users:
         # Do not short-circuit: one failure must not skip the remaining recipients.
         if not await notify_user(user, message):
             ok = False
+            continue
+        if delivered is not None:
+            uid = getattr(user, "id", None)
+            if isinstance(uid, int) and not isinstance(uid, bool):
+                delivered.append(uid)
     return ok
 
 
-async def notify_cam_recipients(db, cam: Cam, message: str) -> bool:
-    return await _notify_recipients(db, "cams", cam.id, cam.ownuser, message)
+async def notify_cam_recipients(db, cam: Cam, message: str, *,
+                                delivered: list | None = None, skip_ids: set | None = None) -> bool:
+    return await _notify_recipients(db, "cams", cam.id, cam.ownuser, message,
+                                    delivered=delivered, skip_ids=skip_ids)
 
 
-async def notify_switch_recipients(db, switch: Switch, message: str) -> bool:
-    return await _notify_recipients(db, "switches", switch.id, switch.ownuser, message)
+async def notify_switch_recipients(db, switch: Switch, message: str, *,
+                                   delivered: list | None = None, skip_ids: set | None = None) -> bool:
+    return await _notify_recipients(db, "switches", switch.id, switch.ownuser, message,
+                                    delivered=delivered, skip_ids=skip_ids)
 
 
 async def _notify_cam_id(cam_id: int, message: str):

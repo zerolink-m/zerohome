@@ -22,6 +22,7 @@ from app.services.cluster.media_protocol import (
     TYPE_FRAGMENT,
     TYPE_HELLO,
     TYPE_INIT,
+    TYPE_PING,
     TYPE_PONG,
     TYPE_RESET,
     TYPE_STATE,
@@ -148,13 +149,19 @@ class _Peer:
             await self._handshake(reader, writer)
             self.connected = True
             self._ready.set()
-            for cam in list(self.cams.values()):
-                if cam.started:
-                    cam.need_init = True
-                    self.client.on_reset(cam.cam_id, "reconnect")
-                cam.started = True
-                await self._send(writer, TYPE_SUBSCRIBE, cam.channel, encode_subscribe(cam.cam_id))
-            await self._read(reader, writer)
+            ping = asyncio.create_task(self._ping(writer), name=f"cluster-media-ping-{self.node_id}")
+            try:
+                for cam in list(self.cams.values()):
+                    if cam.started:
+                        cam.need_init = True
+                        self.client.on_reset(cam.cam_id, "reconnect")
+                    cam.started = True
+                    await self._send(writer, TYPE_SUBSCRIBE, cam.channel, encode_subscribe(cam.cam_id))
+                await self._read(reader, writer)
+            finally:
+                ping.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await ping
         finally:
             self.connected = False
             self._ready.clear()
@@ -181,10 +188,30 @@ class _Peer:
             auth = b""
         await self._send(writer, TYPE_HELLO, 0, encode_hello(self.client.node_id, auth))
 
+    async def _ping(self, writer: asyncio.StreamWriter) -> None:
+        interval = max(self.client.idle_timeout / 2.0, 0.05)
+        while not self.stopped:
+            await asyncio.sleep(interval)
+            if self.stopped:
+                return
+            try:
+                await self._send(writer, TYPE_PING, 0, b"")
+            except (ConnectionError, OSError, RuntimeError):
+                return
+
     async def _read(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         while not self.stopped:
-            msg_type, channel, payload = await read_frame(reader)
+            try:
+                msg_type, channel, payload = await asyncio.wait_for(
+                    read_frame(reader), timeout=self.client.idle_timeout,
+                )
+            except asyncio.TimeoutError:
+                raise ConnectionError(f"no frame for {self.client.idle_timeout:g}s")
             cam = next((c for c in self.cams.values() if c.channel == channel), None)
+            if msg_type == TYPE_PING:
+                with contextlib.suppress(ConnectionError, OSError, RuntimeError):
+                    await self._send(writer, TYPE_PONG, channel, payload[:64])
+                continue
             if msg_type == TYPE_PONG or msg_type == TYPE_HELLO:
                 continue
             if cam is None:
@@ -200,9 +227,13 @@ class _Peer:
                 reason = payload.decode("utf-8", errors="replace")[:200]
                 cam.need_init = True
                 self.client.on_reset(cam.cam_id, reason)
-                # Same owner restarted the stream: ask for the new init. A lost
-                # lease is not that; the caller picks a new owner.
-                if reason != "not_owner":
+                # Overflow: the server already catch_up's init and the GOP tail on
+                # this channel. A new SUBSCRIBE would open a second hub subscription.
+                # Reset the local hub once (above) and treat the following init as
+                # the continuation. Any other RESET (ffmpeg restart, generation)
+                # still asks for a new subscription. not_owner does not: the caller
+                # picks a new owner.
+                if reason not in ("not_owner", "overflow"):
                     await self._send(writer, TYPE_SUBSCRIBE, cam.channel, encode_subscribe(cam.cam_id))
             elif msg_type == TYPE_STATE:
                 self.client.on_state(cam.cam_id, payload.decode("utf-8", errors="replace")[:32])
@@ -230,6 +261,7 @@ class MediaClient:
         on_error: TextCb,
         reconnect_min: float = 0.5,
         reconnect_max: float = 5.0,
+        idle_timeout: float = 20.0,
     ) -> None:
         self.node_id = node_id
         self.secret = secret or ""
@@ -241,6 +273,7 @@ class MediaClient:
         self.on_error = on_error
         self.reconnect_min = reconnect_min
         self.reconnect_max = reconnect_max
+        self.idle_timeout = idle_timeout
         self._peers: dict[str, _Peer] = {}
         self._by_cam: dict[int, str] = {}
 

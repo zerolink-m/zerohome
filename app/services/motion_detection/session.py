@@ -93,7 +93,8 @@ class MotionDetectionSession:
 
     async def start(self):
         """Start motion detection."""
-        if self.is_running:
+        task = self.task
+        if self.is_running and task is not None and not task.done():
             logger.debug(f"[Cam {self.cam.id}] Already running, skipping start")
             return
 

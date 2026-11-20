@@ -45,3 +45,6 @@ class Assignment(Base):
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # Random id of the process that holds a live lease. Same NODE_ID in another
+    # process does not match, so it cannot renew or adopt the row until it expires.
+    holder: Mapped[str | None] = mapped_column(String(64), nullable=True)

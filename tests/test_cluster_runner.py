@@ -581,3 +581,229 @@ async def test_lifespan_does_not_start_global_tasks_in_cluster_mode(monkeypatch)
     async with main.lifespan(main.app):
         pass
     assert all(m.call_count == 1 for m in starts.values())
+
+
+# ---------------- the seven lease/worker fixes ----------------
+class _ShiftSession:
+    """Opens the real session, optionally moving the clock first (a slow call)."""
+
+    def __init__(self, sm, clock):
+        self.sm = sm
+        self.clock = clock
+        self.shift = 0
+
+    def __call__(self):
+        outer = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                if outer.shift:
+                    outer.clock.t += outer.shift
+                self.inner = outer.sm()
+                return await self.inner.__aenter__()
+
+            async def __aexit__(self, *exc):
+                return await self.inner.__aexit__(*exc)
+
+        return _Ctx()
+
+
+class _BlockSession:
+    """Holds the session open until released, after jumping the clock past the fence."""
+
+    def __init__(self, sm, clock):
+        self.sm = sm
+        self.clock = clock
+        self.block = False
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def __call__(self):
+        outer = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                if outer.block:
+                    outer.clock.t += 30
+                    outer.entered.set()
+                    await outer.release.wait()
+                self.inner = outer.sm()
+                return await self.inner.__aenter__()
+
+            async def __aexit__(self, *exc):
+                return await self.inner.__aexit__(*exc)
+
+        return _Ctx()
+
+
+async def test_stop_releases_only_after_local_work_has_stopped(sm):
+    clock = Clock()
+    fi = Fake("ingest", [1])
+    fg = Fake("healthcheck", [0], scope="global")
+    seen = []
+
+    def watch(fake, function):
+        real = fake.stop
+
+        async def stop(cam_id, real=real, function=function):
+            seen.append(function)
+            owner = (await owners(sm, function)).get(cam_id)
+            assert owner == "a"  # right still ours while this stop runs
+            assert cam_id in fake.running
+            await real(cam_id)
+
+        fake.stop = stop
+
+    watch(fi, "ingest")
+    watch(fg, "healthcheck")
+    runner = make("a", sm, clock, [fi, fg])
+    await step(runner)
+    assert fi.running == {1} and fg.running == {0}
+    await runner.stop()
+    assert seen == ["ingest", "healthcheck"] or set(seen) == {"ingest", "healthcheck"}
+    assert fi.running == set() and fg.running == set()
+    assert (await owners(sm, "ingest")).get(1) is None
+    assert (await owners(sm, "healthcheck")).get(0) is None
+
+
+async def test_renewed_at_is_the_time_the_renew_succeeded(sm):
+    clock = Clock()
+    shift = _ShiftSession(sm, clock)
+    fake = Fake("ingest", [1])
+    runner = make("a", shift, clock, [fake])
+    await step(runner)
+    assert runner._held[("ingest", 1)].renewed_at == 1000
+    clock.t += 10  # 1010, still inside the fence margin
+    shift.shift = 4  # the renew call itself moves the clock
+    await runner.reconcile_once()
+    await runner.drain()
+    assert clock.t == 1014
+    assert runner._held[("ingest", 1)].renewed_at == 1014
+    assert fake.running == {1}
+
+
+async def test_fence_stops_work_while_a_db_call_is_still_in_flight(sm):
+    clock = Clock()
+    blocker = _BlockSession(sm, clock)
+    fake = Fake("ingest", [1])
+    runner = make("a", blocker, clock, [fake])
+    runner._fence_poll_seconds = 0.05
+    await step(runner)
+    assert fake.running == {1}
+    clock.t += 10
+    blocker.block = True
+    task = asyncio.create_task(runner.reconcile_once())
+    try:
+        await asyncio.wait_for(blocker.entered.wait(), 2)
+        for _ in range(40):
+            if not fake.running:
+                break
+            await asyncio.sleep(0.05)
+        assert fake.running == set() and fake.stops == [1]
+        assert runner.held("ingest") == set()
+    finally:
+        blocker.release.set()
+        await task
+
+
+async def test_second_process_with_same_node_id_cannot_renew(sm):
+    from dataclasses import replace
+
+    clock = Clock()
+    fa, fb = Fake("ingest", [1]), Fake("ingest", [1])
+    a, b = make("same", sm, clock, [fa]), make("same", sm, clock, [fb])
+    assert a.holder != b.holder
+    await step(a)
+    clock.t += 10
+    await step(a, b)
+    assert fa.running == {1} and fb.running == set() and b.held("ingest") == set()
+    async with sm() as db:
+        row = (await leases.list_assignments(db))[0]
+        assert row.holder == a.holder and row.generation == 1 and row.owner_node_id == "same"
+    foreign = replace(a._held[("ingest", 1)].lease, holder=b.holder)
+    async with sm() as db:
+        assert await leases.renew(db, foreign, 30, clock.t) is False
+        assert await leases.renew(db, a._held[("ingest", 1)].lease, 30, clock.t) is True
+    # Old process is dead and the lease has expired: a restart takes it, as before.
+    clock.t += 40
+    await step(b)
+    assert fb.running == {1}
+    async with sm() as db:
+        row = (await leases.list_assignments(db))[0]
+        assert row.owner_node_id == "same" and row.generation == 2 and row.holder == b.holder
+
+
+async def test_apply_restarts_a_worker_whose_task_died(tmp_path):
+    from app.services.ingest.config import IngestConfig
+    from app.services.ingest.hub import IngestHub
+    from app.services.ingest.supervisor import IngestSupervisor, IngestTarget
+
+    sup = IngestSupervisor(
+        hub=IngestHub(),
+        config=IngestConfig(registry_path=str(tmp_path / "reg.json"), backoff_initial_seconds=30),
+    )
+    target = IngestTarget(1, "rtsp://u:pw@10.0.0.5/live", "cam")
+    crashes = {"n": 0}
+
+    async def crash_once(worker):
+        crashes["n"] += 1
+        if crashes["n"] == 1:
+            raise RuntimeError("worker crashed")
+        await asyncio.sleep(30)
+
+    sup._run = crash_once
+    try:
+        assert await sup.apply(1, target) == "started"
+        for _ in range(50):
+            task = sup._workers[1].task
+            if task is not None and task.done():
+                break
+            await asyncio.sleep(0.01)
+        assert sup._workers[1].task.done()
+        assert await sup.apply(1, target) == "restarting"
+        await asyncio.sleep(0)  # let the replacement task enter _run
+        assert crashes["n"] == 2
+        assert not sup._workers[1].task.done()
+    finally:
+        await sup.stop(1)
+
+
+async def test_dead_motion_session_is_started_again():
+    from app.services.motion_detection import manager as md
+    from app.services.motion_detection.session import MotionDetectionSession
+
+    ran = []
+    release = asyncio.Event()
+
+    async def fake_run(self):
+        ran.append(1)
+        await release.wait()
+        self.is_running = False  # what _run's finally does after retries are exhausted
+
+    session = MotionDetectionSession(type("C", (), {"id": 7})(), [])
+    session.is_running = False
+    session.task = None
+    md._active_sessions[7] = session
+    original = MotionDetectionSession._run
+    MotionDetectionSession._run = fake_run
+    try:
+        assert await md.start_motion_detection(7) is True
+        await asyncio.sleep(0)
+        assert ran == [1] and session.is_running
+        assert await md.start_motion_detection(7) is True
+        assert ran == [1]  # still alive: not started a second time
+        first = session.task
+        release.set()
+        await asyncio.wait({first}, timeout=1)
+        assert session.is_running is False and first.done()
+        release.clear()
+        assert await md.start_motion_detection(7) is True
+        await asyncio.sleep(0)
+        assert ran == [1, 1] and session.is_running
+    finally:
+        MotionDetectionSession._run = original
+        md._active_sessions.pop(7, None)
+        release.set()
+        if session.task is not None and not session.task.done():
+            session.task.cancel()
+            await asyncio.wait({session.task}, timeout=1)

@@ -25,6 +25,33 @@ def retry_delay(attempts: int) -> int:
     return min(300, 15 * (2 ** power))
 
 
+def delivered_ids(payload) -> set[int]:
+    """User ids already delivered, stored in the job payload so a retry can skip them."""
+    if not isinstance(payload, dict):
+        return set()
+    found: set[int] = set()
+    for uid in payload.get("delivered") or []:
+        if isinstance(uid, bool) or not isinstance(uid, int):
+            continue
+        found.add(uid)
+    return found
+
+
+def _merge_delivered(payload, user_ids: list[int]) -> dict:
+    base = dict(payload) if isinstance(payload, dict) else {}
+    merged: list[int] = []
+    seen: set[int] = set()
+    for uid in list(base.get("delivered") or []) + list(user_ids):
+        if isinstance(uid, bool) or not isinstance(uid, int):
+            continue
+        if uid in seen:
+            continue
+        seen.add(uid)
+        merged.append(uid)
+    base["delivered"] = merged
+    return base
+
+
 async def enqueue(
     db: AsyncSession,
     *,
@@ -138,20 +165,24 @@ async def complete(db: AsyncSession, job: NotificationJob, now: int) -> bool:
     return False
 
 
-async def fail(db: AsyncSession, job: NotificationJob, now: int, max_attempts: int) -> bool:
+async def fail(db: AsyncSession, job: NotificationJob, now: int, max_attempts: int,
+               delivered: list[int] | None = None) -> bool:
     """Retry with backoff while attempts < max_attempts, otherwise mark failed.
 
     ``attempts`` was already incremented by claim, so the first failure is attempt 1.
+    ``delivered`` is merged into the payload so the next attempt skips those recipients.
     False when this generation no longer owns the job.
     """
     if int(job.attempts) < max_attempts:
-        values = {
+        values: dict = {
             "state": "pending",
             "available_at": now + retry_delay(int(job.attempts)),
             "updated_at": now,
         }
     else:
         values = {"state": "failed", "updated_at": now}
+    if delivered:
+        values["payload"] = _merge_delivered(job.payload, delivered)
     res = await db.execute(
         update(NotificationJob).where(*_owned(job)).values(**values),
         execution_options=_NO_MATCH,

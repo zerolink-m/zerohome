@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 
 from sqlalchemy import select
@@ -48,6 +49,8 @@ _FILTERS = {
 _task: asyncio.Task | None = None
 _lease: leases.Lease | None = None
 _last_purge = 0
+# This process only. Another process with the same NODE_ID must not renew our notify lease.
+_HOLDER = secrets.token_hex(16)
 
 
 def start() -> None:
@@ -103,7 +106,7 @@ async def _allowed_to_send() -> bool:
                 return True
             _lease = None
             got = await leases.try_acquire(
-                db, _NOTIFY_FUNCTION, _NOTIFY_RESOURCE_ID, node_id, ttl, now,
+                db, _NOTIFY_FUNCTION, _NOTIFY_RESOURCE_ID, node_id, ttl, now, _HOLDER,
             )
     except Exception:
         logger.warning("notification worker lease failed", exc_info=True)
@@ -185,12 +188,12 @@ async def _handle(job, now: int) -> None:
                 await notify_queue.fail(db, job, int(time.time()), _MAX_ATTEMPTS)
             return
     async with AsyncSessionLocal() as db:
-        ok = await _send(db, job, photo)
+        ok, sent = await _send(db, job, photo)
     async with AsyncSessionLocal() as db:
         if ok:
             await notify_queue.complete(db, job, int(time.time()))
         else:
-            await notify_queue.fail(db, job, int(time.time()), _MAX_ATTEMPTS)
+            await notify_queue.fail(db, job, int(time.time()), _MAX_ATTEMPTS, delivered=sent)
 
 
 async def _photo_action(db, job, now: int) -> str:
@@ -212,44 +215,56 @@ async def _photo_action(db, job, now: int) -> str:
     return "text"
 
 
-async def _send(db, job, photo: bytes | None) -> bool:
+async def _send(db, job, photo: bytes | None) -> tuple[bool, list[int]]:
     payload = job.payload if isinstance(job.payload, dict) else {}
+    sent: list[int] = []
+    skip = notify_queue.delivered_ids(payload)
     if job.kind == "motion":
-        return await _send_motion(db, job, photo, payload)
+        return await _send_motion(db, job, photo, payload, sent, skip)
     filt = _FILTERS.get(payload.get("filter"))
     if payload.get("filter"):
         if filt is None:
             logger.warning("notification job %s has an unknown filter", job.id)
-            return True
-        return await push._notify_recipients_filtered(
+            return True, sent
+        ok = await push._notify_recipients_filtered(
             db, job.device_type or "", job.device_id or 0, 0, job.message, filter_func=filt,
+            delivered=sent, skip_ids=skip,
         )
-    return await _send_manual(db, job)
+        return ok, sent
+    return await _send_manual(db, job, sent, skip)
 
 
-async def _send_motion(db, job, photo: bytes | None, payload: dict) -> bool:
-    user_ids = [uid for uid in (payload.get("user_ids") or []) if isinstance(uid, int)]
+async def _send_motion(db, job, photo: bytes | None, payload: dict,
+                       sent: list[int], skip: set[int]) -> tuple[bool, list[int]]:
+    user_ids = [
+        uid for uid in (payload.get("user_ids") or [])
+        if isinstance(uid, int) and not isinstance(uid, bool) and uid not in skip
+    ]
     if not user_ids:
-        return True
+        return True, sent
     users = (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()
     name = job.photo_key.rsplit("/", 1)[-1] if job.photo_key else "photo.jpg"
     ok = True
     for user in users:
-        if not await push.notify_user(user, job.message, photo_bytes=photo, photo_name=name):
+        if await push.notify_user(user, job.message, photo_bytes=photo, photo_name=name):
+            sent.append(user.id)
+        else:
             ok = False
-    return ok
+    return ok, sent
 
 
-async def _send_manual(db, job) -> bool:
+async def _send_manual(db, job, sent: list[int], skip: set[int]) -> tuple[bool, list[int]]:
     if job.device_type == "cams":
         cam = await db.get(Cam, job.device_id)
         if cam is None:
-            return True
-        return await push.notify_cam_recipients(db, cam, job.message)
+            return True, sent
+        ok = await push.notify_cam_recipients(db, cam, job.message, delivered=sent, skip_ids=skip)
+        return ok, sent
     if job.device_type == "switches":
         switch = await db.get(Switch, job.device_id)
         if switch is None:
-            return True
-        return await push.notify_switch_recipients(db, switch, job.message)
+            return True, sent
+        ok = await push.notify_switch_recipients(db, switch, job.message, delivered=sent, skip_ids=skip)
+        return ok, sent
     logger.warning("notification job %s has no device", job.id)
-    return True
+    return True, sent

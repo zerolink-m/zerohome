@@ -37,9 +37,18 @@ async def start_motion_detection(cam_id: int) -> bool:
         return False
     logger.debug(f"[Cam {cam_id}] start_motion_detection() called")
 
-    if cam_id in _active_sessions:
-        logger.info(f"[Cam {cam_id}] Motion detection already running")
-        return True
+    existing = _active_sessions.get(cam_id)
+    if existing is not None:
+        task = existing.task
+        alive = existing.is_running and task is not None and not task.done()
+        if alive:
+            logger.info(f"[Cam {cam_id}] Motion detection already running")
+            return True
+        # Retries exhausted: the session stays in the map with is_running False.
+        # Starting it again is the only way the next call does not return True and do nothing.
+        logger.info(f"[Cam {cam_id}] Motion detection session is not running, starting again")
+        await existing.start()
+        return bool(existing.is_running)
 
     try:
         async with AsyncSessionLocal() as db:

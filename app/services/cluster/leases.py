@@ -28,6 +28,7 @@ class Lease:
     owner: str
     generation: int
     expires_at: int
+    holder: str | None = None  # process token; None only for callers that do not fence
 
 
 async def register_node(db: AsyncSession, node_id: str, capabilities: dict, address: str | None,
@@ -57,7 +58,14 @@ async def heartbeat(db: AsyncSession, node_id: str, capabilities: dict, address:
 
 
 async def try_acquire(db: AsyncSession, function: str, resource_id: int, node_id: str,
-                      ttl: int, now: int) -> Lease | None:
+                      ttl: int, now: int, holder: str | None = None) -> Lease | None:
+    """Take a free or expired lease.
+
+    ``holder`` is this process's token. A live row owned by ``node_id`` but stamped
+    with a different token belongs to another process: this one does not extend it
+    and is not its owner. A token-less caller (None) keeps the old same-node extend.
+    An expired row can be taken by anyone, including a restarted process.
+    """
     key = and_(Assignment.function == function, Assignment.resource_id == resource_id)
     new_expiry = now + ttl
     for _ in range(_MAX_ATTEMPTS):
@@ -66,42 +74,56 @@ async def try_acquire(db: AsyncSession, function: str, resource_id: int, node_id
             try:
                 async with db.begin_nested():
                     db.add(Assignment(function=function, resource_id=resource_id, owner_node_id=node_id,
-                                      generation=1, expires_at=new_expiry, updated_at=now))
+                                      generation=1, expires_at=new_expiry, updated_at=now, holder=holder))
                 await db.commit()
-                return Lease(function, resource_id, node_id, 1, new_expiry)
+                return Lease(function, resource_id, node_id, 1, new_expiry, holder)
             except IntegrityError:
                 await db.rollback()
                 continue  # someone created it first: re-read
         # Snapshot values now; the read starts a transaction we must end.
-        owner, gen, exp = row.owner_node_id, row.generation, row.expires_at
+        owner, gen, exp, row_holder = row.owner_node_id, row.generation, row.expires_at, row.holder
         await db.rollback()
         if owner == node_id and exp > now:
-            res = await db.execute(update(Assignment).where(
+            if holder is not None and row_holder not in (None, holder):
+                return None  # another live process with the same NODE_ID
+            conds = [
                 key, Assignment.owner_node_id == node_id, Assignment.generation == gen,
                 Assignment.expires_at == exp,
-            ).values(expires_at=new_expiry, updated_at=now))
+            ]
+            values: dict = dict(expires_at=new_expiry, updated_at=now)
+            if holder is not None:
+                values["holder"] = holder
+                conds.append(Assignment.holder.is_(None) if row_holder is None else Assignment.holder == holder)
+            res = await db.execute(update(Assignment).where(*conds).values(**values))
             new_gen = gen
         elif owner is None or exp <= now:
             owner_cond = Assignment.owner_node_id.is_(None) if owner is None else Assignment.owner_node_id == owner
             res = await db.execute(update(Assignment).where(
                 key, owner_cond, Assignment.generation == gen, Assignment.expires_at == exp,
-            ).values(owner_node_id=node_id, generation=gen + 1, expires_at=new_expiry, updated_at=now))
+            ).values(owner_node_id=node_id, generation=gen + 1, expires_at=new_expiry,
+                     updated_at=now, holder=holder))
             new_gen = gen + 1
         else:
             return None  # held by someone else
         if res.rowcount == 1:
             await db.commit()
-            return Lease(function, resource_id, node_id, new_gen, new_expiry)
+            return Lease(function, resource_id, node_id, new_gen, new_expiry, holder)
         await db.rollback()  # lost the race: re-read
     return None
 
 
 async def renew(db: AsyncSession, lease: Lease, ttl: int, now: int) -> bool:
-    res = await db.execute(update(Assignment).where(
+    """Extend a live lease. A token on ``lease`` must still be the row's holder."""
+    conds = [
         Assignment.function == lease.function, Assignment.resource_id == lease.resource_id,
         Assignment.owner_node_id == lease.owner, Assignment.generation == lease.generation,
         Assignment.expires_at > now,
-    ).values(expires_at=now + ttl, updated_at=now))
+    ]
+    values: dict = dict(expires_at=now + ttl, updated_at=now)
+    if lease.holder is not None:
+        conds.append(Assignment.holder == lease.holder)
+        values["holder"] = lease.holder
+    res = await db.execute(update(Assignment).where(*conds).values(**values))
     if res.rowcount == 1:
         await db.commit()
         return True
@@ -113,7 +135,7 @@ async def release(db: AsyncSession, lease: Lease) -> None:
     await db.execute(update(Assignment).where(
         Assignment.function == lease.function, Assignment.resource_id == lease.resource_id,
         Assignment.owner_node_id == lease.owner, Assignment.generation == lease.generation,
-    ).values(owner_node_id=None, expires_at=0))
+    ).values(owner_node_id=None, expires_at=0, holder=None))
     await db.commit()
 
 

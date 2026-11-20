@@ -143,3 +143,44 @@ async def test_concurrent_claim_single_winner(file_sm):
     won = [job for batch in results for job in batch]
     assert len(won) == 1
     assert won[0].state == "sending"
+
+
+async def test_partial_delivery_is_not_repeated(sessionmaker_, mk_user, monkeypatch):
+    """One recipient accepted, one did not: the retry goes only to the one who missed it."""
+    from app.services import notify_worker
+
+    ok_id = await mk_user("ok@x.io")
+    miss_id = await mk_user("miss@x.io")
+    async with sessionmaker_() as db:
+        job = NotificationJob(
+            kind="motion", device_type="cams", device_id=1, message="person",
+            payload={"object_type": "person", "user_ids": [ok_id, miss_id]},
+            state="pending", attempts=0, available_at=1_000, created_at=1_000, updated_at=1_000,
+        )
+        db.add(job)
+        await db.commit()
+        job_id = job.id
+
+    calls: list[int] = []
+    failing = {"id": miss_id}
+
+    async def fake_notify(user, message, photo_path=None, *, photo_bytes=None, photo_name="photo.jpg"):
+        calls.append(user.id)
+        return user.id != failing["id"]
+
+    monkeypatch.setattr(notify_worker, "AsyncSessionLocal", sessionmaker_)
+    monkeypatch.setattr(notify_worker.push, "notify_user", fake_notify)
+
+    assert await notify_worker.deliver_batch(now=1_000, node_id="n1") == 1
+    assert set(calls) == {ok_id, miss_id}
+    row = await _row(sessionmaker_, job_id)
+    assert row.state == "pending" and row.attempts == 1
+    assert set(row.payload["delivered"]) == {ok_id}
+    assert row.payload["user_ids"] == [ok_id, miss_id]
+
+    calls.clear()
+    failing["id"] = None
+    assert await notify_worker.deliver_batch(now=row.available_at, node_id="n1") == 1
+    assert calls == [miss_id]
+    sent = await _row(sessionmaker_, job_id)
+    assert sent.state == "sent"

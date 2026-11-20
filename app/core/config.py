@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     DB_USER: str = "zerocams"
     DB_PASSWORD: str
     DB_NAME: str = "zerocams"
+    # Seconds a pooled connection may wait on a silent MySQL. asyncmy.connect
+    # accepts read_timeout (queries and pool pre-ping share that read). It does
+    # not accept write_timeout; that value is forwarded only if the installed
+    # driver grows the argument. See app/db/session.py.
+    DB_READ_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    DB_WRITE_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
 
     # --- JWT: share links and previously issued refresh tokens only ---
     JWT_SECRET_SESSION: str
@@ -107,6 +113,8 @@ class Settings(BaseSettings):
     CLUSTER_MEDIA_PORT: int = 4700
     CLUSTER_SECRET: str = Field(default="", repr=False)  # media handshake HMAC, and the view-proxy header HMAC; does not encrypt
     CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS: float = 10.0
+    # Close a media connection when nothing (including PING/PONG) arrives for this long.
+    CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS: float = 20.0
     # View routing (stage 4). Host is the host part of nodes.address; the port in that
     # address stays the fMP4 port. 0 means dial HTTP on PORT.
     CLUSTER_VIEW_HTTP_PORT: int = 0
@@ -162,6 +170,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_lease_timing(self) -> "Settings":
+        if self.CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS <= 0:
+            raise ValueError("CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS must be > 0")
         if self.LEASE_RENEW_INTERVAL_SECONDS < 1 or self.NODE_HEARTBEAT_INTERVAL_SECONDS < 1:
             raise ValueError("LEASE_RENEW_INTERVAL_SECONDS and NODE_HEARTBEAT_INTERVAL_SECONDS must be >= 1")
         if self.LEASE_RENEW_INTERVAL_SECONDS * 2 > self.LEASE_TTL_SECONDS:

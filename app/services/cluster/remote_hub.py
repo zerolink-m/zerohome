@@ -92,6 +92,7 @@ class RemoteHub:
                 on_error=self._on_error,
                 reconnect_min=self._reconnect_min,
                 reconnect_max=self._reconnect_max,
+                idle_timeout=float(self.settings.CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS),
             )
         return self._client
 

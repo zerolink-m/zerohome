@@ -108,6 +108,9 @@ class _Channel:
         self.sub = None
         self.task: asyncio.Task | None = None
         self.sent_state: str | None = None
+        # Overflow catch-up already holds the one hub subscription. A SUBSCRIBE
+        # that the RESET provoked must not open a second one.
+        self.suppress_resubscribe = False
 
     def clear(self) -> None:
         self.buf.clear()
@@ -127,6 +130,7 @@ class _Conn:
         self._closed = False
         self._did_close = False
         self._writer_task: asyncio.Task | None = None
+        self._ping_task: asyncio.Task | None = None
 
     @property
     def buffered_bytes(self) -> int:
@@ -138,9 +142,15 @@ class _Conn:
     async def run(self) -> None:
         await self._handshake()
         self._writer_task = asyncio.create_task(self._write_loop(), name="cluster-media-write")
+        self._ping_task = asyncio.create_task(self._ping_loop(), name="cluster-media-ping")
         try:
             while not self._closed:
-                msg_type, channel, payload = await read_frame(self.reader)
+                try:
+                    msg_type, channel, payload = await asyncio.wait_for(
+                        read_frame(self.reader), timeout=self.server.idle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    raise ConnectionError(f"no frame for {self.server.idle_timeout:g}s")
                 if msg_type == TYPE_SUBSCRIBE:
                     await self._on_subscribe(channel, payload)
                 elif msg_type == TYPE_UNSUBSCRIBE:
@@ -192,9 +202,10 @@ class _Conn:
             if ch.task is not None and not ch.task.done():
                 ch.task.cancel()
         tasks = [ch.task for ch in self._channels.values() if ch.task is not None]
-        if self._writer_task is not None and not self._writer_task.done():
-            self._writer_task.cancel()
-            tasks.append(self._writer_task)
+        for extra in (self._writer_task, self._ping_task):
+            if extra is not None and not extra.done():
+                extra.cancel()
+                tasks.append(extra)
         if tasks:
             await asyncio.wait(tasks, timeout=1.0)
         self._channels.clear()
@@ -222,6 +233,15 @@ class _Conn:
             raise
         except (ConnectionError, OSError, RuntimeError):
             self._closed = True
+            self._wake.set()
+
+    async def _ping_loop(self) -> None:
+        interval = max(self.server.idle_timeout / 2.0, 0.05)
+        while not self._closed:
+            await asyncio.sleep(interval)
+            if self._closed:
+                return
+            self._control.append(encode_frame(TYPE_PING, 0, b""))
             self._wake.set()
 
     def _pop_frame(self) -> bytes | None:
@@ -253,6 +273,9 @@ class _Conn:
 
     def _enqueue_reset(self, ch: _Channel, reason: str) -> None:
         ch.clear()
+        # Overflow is followed by catch-up on this same channel and subscription.
+        # Any other RESET (ffmpeg restart, generation, not_owner) still wants a new one.
+        ch.suppress_resubscribe = reason == "overflow"
         frame = encode_frame(TYPE_RESET, ch.channel, reason.encode("utf-8", errors="replace")[:200])
         self._enqueue(ch, frame)
 
@@ -270,6 +293,15 @@ class _Conn:
             self._send_error(channel, ERR_NOT_OWNER)
             return
         existing = self._channels.get(channel)
+        if (
+            existing is not None
+            and existing.active
+            and existing.cam_id == cam_id
+            and existing.suppress_resubscribe
+            and existing.sub is not None
+        ):
+            # Catch-up after overflow already subscribed once. Do not open another.
+            return
         if existing is not None:
             await self._stop_channel(channel)
         ch = _Channel(channel, cam_id)
@@ -407,6 +439,7 @@ class MediaServer:
         host: str | None = None,
         port: int | None = None,
         secret: str | None = None,
+        idle_timeout: float | None = None,
     ) -> None:
         self.settings = settings or app_settings
         self._sessionmaker = sessionmaker
@@ -418,6 +451,9 @@ class MediaServer:
         self.host = self.settings.CLUSTER_MEDIA_HOST if host is None else host
         self.port = int(self.settings.CLUSTER_MEDIA_PORT if port is None else port)
         self.secret = self.settings.CLUSTER_SECRET if secret is None else secret
+        self.idle_timeout = float(
+            self.settings.CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS if idle_timeout is None else idle_timeout
+        )
         self.output_open = asyncio.Event()
         self.output_open.set()
         self.peak_buffered = 0

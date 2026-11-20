@@ -19,6 +19,8 @@ from app.services.cluster.media_protocol import (
     TYPE_FRAGMENT,
     TYPE_HELLO,
     TYPE_INIT,
+    TYPE_PING,
+    TYPE_PONG,
     TYPE_RESET,
     TYPE_STATE,
     TYPE_SUBSCRIBE,
@@ -71,7 +73,8 @@ async def grant(sm, node_id, cams, address, generation=1, expires=4_000_000_000)
         await db.commit()
 
 
-def make_server(sm, hub, port, owned, *, secret="", buffer_bytes=8 * 1024 * 1024, node_id="owner"):
+def make_server(sm, hub, port, owned, *, secret="", buffer_bytes=8 * 1024 * 1024, node_id="owner",
+                idle_timeout=None):
     gens = {cam_id: 1 for cam_id in owned}
 
     def generation_of(cam_id, _gens=gens):
@@ -80,7 +83,7 @@ def make_server(sm, hub, port, owned, *, secret="", buffer_bytes=8 * 1024 * 1024
     server = MediaServer(
         sessionmaker=sm, hub=hub, node_id=node_id, generation_of=generation_of,
         clock=lambda: 1_000_000, buffer_bytes=buffer_bytes, host="127.0.0.1",
-        port=port, secret=secret,
+        port=port, secret=secret, idle_timeout=idle_timeout,
     )
     return server, gens
 
@@ -111,7 +114,7 @@ async def media_frames(reader, n, timeout=2.0):
         if left <= 0:
             raise TimeoutError(f"got {len(out)} of {n} media frames")
         msg_type, channel, payload = await asyncio.wait_for(read_frame(reader), left)
-        if msg_type == TYPE_STATE:
+        if msg_type in (TYPE_STATE, TYPE_PING, TYPE_PONG):
             continue
         out.append((msg_type, channel, payload))
     return out
@@ -170,7 +173,7 @@ async def test_several_cameras_share_one_connection(sessionmaker_):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and (got.get(1) != [None, 10] or got.get(2) != [None, 20]):
             msg_type, channel, payload = await asyncio.wait_for(read_frame(reader), 1)
-            if msg_type == TYPE_STATE:
+            if msg_type in (TYPE_STATE, TYPE_PING, TYPE_PONG):
                 continue
             got.setdefault(channel, [])
             if msg_type == TYPE_INIT:
@@ -580,3 +583,208 @@ async def test_runner_stops_remote_on_acquire_and_starts_it_on_loss(sessionmaker
     await runner.drain()
     assert ("lost", 1) in media.events
     assert fake.running == set()
+
+
+def _count_subscribes(monkeypatch):
+    from app.services.cluster.media_server import _Conn
+
+    calls = {"n": 0}
+    original = _Conn._on_subscribe
+
+    async def wrapped(self, channel, payload):
+        calls["n"] += 1
+        return await original(self, channel, payload)
+
+    monkeypatch.setattr(_Conn, "_on_subscribe", wrapped)
+    return calls
+
+
+async def test_overflow_catchup_does_not_open_a_second_subscription(sessionmaker_, monkeypatch):
+    from app.services.ingest.hub import CamHub
+
+    port = free_port()
+    limit = 200_000
+    hub = IngestHub(max_buffer_bytes=8_000_000, subscriber_limit_bytes=8_000_000)
+    opened = []
+    real_subscribe = CamHub.subscribe
+
+    def counting(self, replay=True):
+        sub = real_subscribe(self, replay=replay)
+        opened.append(sub)
+        return sub
+
+    monkeypatch.setattr(CamHub, "subscribe", counting)
+    subscribes = _count_subscribes(monkeypatch)
+    server, _gens = make_server(sessionmaker_, hub, port, [1], buffer_bytes=limit)
+    await server.start()
+    resets = []
+    inits = []
+    client = MediaClient(
+        node_id="puller", secret="", default_port=port, reconnect_min=0.05, reconnect_max=0.2,
+        on_init=lambda _cam, data: inits.append(data),
+        on_fragment=lambda *_a: None,
+        on_reset=lambda _cam, reason: resets.append(reason),
+        on_state=lambda *_a: None, on_error=lambda *_a: None,
+    )
+    try:
+        await grant(sessionmaker_, "owner", [1], f"127.0.0.1:{port}")
+        hub.get(1).feed(init_segment())
+        hub.get(1).feed(fragment(0, key=True))
+        await client.subscribe(1, "owner", f"127.0.0.1:{port}")
+        for _ in range(100):
+            if inits and subscribes["n"] == 1 and len(opened) == 1:
+                break
+            await asyncio.sleep(0.02)
+        assert subscribes["n"] == 1 and len(opened) == 1
+        server.output_open.clear()
+        await asyncio.sleep(0.05)
+        for i in range(12):
+            hub.get(1).feed(fragment(i + 1, key=True, size=90_000))
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+        server.output_open.set()
+        for _ in range(100):
+            if "overflow" in resets and len(inits) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.3)  # a mistaken SUBSCRIBE would have been processed by now
+        assert "overflow" in resets
+        assert subscribes["n"] == 1  # client did not subscribe again
+        # Each overflow catch-up replaces the previous subscription; it must not
+        # leave a second one open beside it.
+        assert len(opened) >= 2
+        assert sum(not sub.closed for sub in opened) == 1
+    finally:
+        server.output_open.set()
+        await client.close()
+        await server.stop()
+
+
+async def test_restart_reset_still_subscribes_again(sessionmaker_, monkeypatch):
+    port = free_port()
+    hub = IngestHub()
+    subscribes = _count_subscribes(monkeypatch)
+    server, _gens = make_server(sessionmaker_, hub, port, [1])
+    await server.start()
+    resets = []
+    inits = []
+    client = MediaClient(
+        node_id="puller", secret="", default_port=port, reconnect_min=0.05, reconnect_max=0.2,
+        on_init=lambda _cam, data: inits.append(data),
+        on_fragment=lambda *_a: None,
+        on_reset=lambda _cam, reason: resets.append(reason),
+        on_state=lambda *_a: None, on_error=lambda *_a: None,
+    )
+    try:
+        await grant(sessionmaker_, "owner", [1], f"127.0.0.1:{port}")
+        hub.get(1).feed(init_segment())
+        hub.get(1).feed(fragment(0, key=True))
+        await client.subscribe(1, "owner", f"127.0.0.1:{port}")
+        for _ in range(100):
+            if inits and subscribes["n"] == 1:
+                break
+            await asyncio.sleep(0.02)
+        assert subscribes["n"] == 1
+        hub.get(1).reset_stream("restart")
+        hub.get(1).feed(init_segment())
+        hub.get(1).feed(fragment(1, key=True))
+        for _ in range(100):
+            if "restart" in resets and subscribes["n"] >= 2 and len(inits) >= 2:
+                break
+            await asyncio.sleep(0.02)
+        assert "restart" in resets
+        assert subscribes["n"] >= 2
+        assert len(inits) >= 2
+        assert hub.subscriber_count(1) == 1
+    finally:
+        await client.close()
+        await server.stop()
+
+
+async def test_silent_connection_is_closed_and_drops_the_hub_subscription(sessionmaker_):
+    port = free_port()
+    hub = IngestHub()
+    server, _gens = make_server(sessionmaker_, hub, port, [1], idle_timeout=0.4)
+    await server.start()
+    try:
+        await grant(sessionmaker_, "owner", [1], f"127.0.0.1:{port}")
+        reader, writer = await open_raw(port)
+        await subscribe(writer, 1, 1)
+        for _ in range(50):
+            if hub.subscriber_count(1) == 1:
+                break
+            await asyncio.sleep(0.02)
+        assert hub.subscriber_count(1) == 1 and hub.get(1).has_viewers.is_set()
+        # No further frames from this peer. Pings the server sends do not reset its own timer.
+        await asyncio.sleep(0.9)
+        assert hub.subscriber_count(1) == 0
+        assert not hub.get(1).has_viewers.is_set()
+        assert server.connection_count == 0
+        writer.close()
+    finally:
+        await server.stop()
+
+
+async def test_pings_keep_a_live_connection_and_a_silent_server_is_redialed(sessionmaker_):
+    port = free_port()
+    hub = IngestHub()
+    server, _gens = make_server(sessionmaker_, hub, port, [1], idle_timeout=0.4)
+    await server.start()
+    client = MediaClient(
+        node_id="puller", secret="", default_port=port, idle_timeout=0.4,
+        reconnect_min=0.05, reconnect_max=0.2,
+        on_init=lambda *_a: None, on_fragment=lambda *_a: None, on_reset=lambda *_a: None,
+        on_state=lambda *_a: None, on_error=lambda *_a: None,
+    )
+    try:
+        await grant(sessionmaker_, "owner", [1], f"127.0.0.1:{port}")
+        hub.get(1).feed(init_segment())
+        hub.get(1).feed(fragment(0, key=True))
+        await client.subscribe(1, "owner", f"127.0.0.1:{port}")
+        for _ in range(50):
+            if hub.subscriber_count(1) == 1:
+                break
+            await asyncio.sleep(0.02)
+        assert hub.subscriber_count(1) == 1
+        await asyncio.sleep(1.2)  # several idle periods; PINGs must keep both sides up
+        assert hub.subscriber_count(1) == 1
+        assert server.connection_count == 1
+        assert client.connection_count == 1
+    finally:
+        await client.close()
+        await server.stop()
+
+    silent_port = free_port()
+    accepted = []
+
+    async def silent(reader, writer):
+        accepted.append(1)
+        writer.write(encode_frame(TYPE_HELLO, 0, encode_hello("owner", b"")))
+        await writer.drain()
+        try:
+            await asyncio.wait_for(read_frame(reader), 1)
+        except Exception:
+            pass
+        try:
+            await asyncio.sleep(3)
+        finally:
+            writer.close()
+
+    fake = await asyncio.start_server(silent, "127.0.0.1", silent_port)
+    quiet = MediaClient(
+        node_id="puller", secret="", default_port=silent_port, idle_timeout=0.3,
+        reconnect_min=0.05, reconnect_max=0.1,
+        on_init=lambda *_a: None, on_fragment=lambda *_a: None, on_reset=lambda *_a: None,
+        on_state=lambda *_a: None, on_error=lambda *_a: None,
+    )
+    try:
+        await quiet.subscribe(1, "silent", f"127.0.0.1:{silent_port}")
+        for _ in range(40):
+            if len(accepted) >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert len(accepted) >= 2  # idle timeout closed the first connection; the client redialed
+    finally:
+        await quiet.close()
+        fake.close()
+        await fake.wait_closed()

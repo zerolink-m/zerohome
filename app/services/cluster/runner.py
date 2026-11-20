@@ -14,8 +14,10 @@ Not under leases: 'session_cleanup' (idempotent, runs everywhere), 'motion_clean
 (deletes through the storage layer, idempotent, still runs on every node) and 'notify'
 (its own loop takes that lease; see notify_worker).
 
-Self-fencing: a lease that was not successfully renewed for TTL - RENEW seconds is dropped
-locally (work stopped) before it can expire in the DB and be taken by another node.
+Self-fencing: if a lease was not successfully renewed for TTL - RENEW seconds, local
+work stops without waiting for another node to take the row. The clock starts at the
+last successful renew (not at the start of the attempt) and is checked even while a
+DB call is still in flight, so a slow query cannot eat the margin or hide a missed renew.
 
 Fair share: ceil(wanted cameras / live nodes with the capability). Cameras that stay without
 an owner for a full renew interval may be taken beyond the share, so none stays unserved.
@@ -28,9 +30,11 @@ somebody here is watching. CLUSTER_ENABLED=false starts neither side.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import math
+import secrets
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -134,18 +138,24 @@ def default_functions() -> list[ClusterFunction]:
 class ClusterRunner:
     def __init__(self, *, settings: Any = None, sessionmaker: Any = None,
                  clock: Callable[[], float] = time.time,
-                 functions: list[ClusterFunction] | None = None, node_id: str | None = None) -> None:
+                 functions: list[ClusterFunction] | None = None, node_id: str | None = None,
+                 holder: str | None = None) -> None:
         self.settings = settings or app_settings
         self._sessionmaker = sessionmaker
         self._clock = clock
         self._functions = functions
         self.node_id = node_id or get_node_id(self.settings)
+        # One token per process. A second process with the same NODE_ID has another.
+        self.holder = holder or secrets.token_hex(16)
         self._held: dict[tuple[str, int], _Held] = {}
         self._orphan_since: dict[tuple[str, int], int] = {}
         self._tasks: list[asyncio.Task] = []
         self._started = False
         self._wake = asyncio.Event()
         self._media = None  # remote fMP4 pull; None unless cluster media is attached
+        self._fence_enabled = True
+        self._fence_poll_seconds = 1.0
+        self._fence_lock = asyncio.Lock()
 
     def attach_media(self, media) -> None:
         """RemoteHub (or a test double): on_acquired / on_lost / has_local_viewers."""
@@ -172,11 +182,42 @@ class ClusterRunner:
         return int(self.settings.LEASE_RENEW_INTERVAL_SECONDS)
 
     async def _db(self, op: Callable[[Any], Awaitable[Any]]) -> Any:
-        """One short DB operation in its own session, bounded by the renew interval."""
+        """One short DB operation in its own session, bounded by the renew interval.
+
+        While it runs, the self-fence is checked on each poll. A slow query must not
+        postpone the decision to stop work whose last successful renew is too old.
+        """
         async def _run():
             async with self._sm()() as db:
                 return await op(db)
-        return await asyncio.wait_for(_run(), timeout=max(1, self._renew_interval))
+
+        work = asyncio.create_task(_run())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(1.0, float(self._renew_interval))
+        try:
+            while not work.done():
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(work), timeout=min(self._fence_poll_seconds, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    if loop.time() >= deadline:
+                        break
+                    await self._fence()
+            if not work.done():
+                work.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await work
+                raise asyncio.TimeoutError
+            return work.result()
+        except asyncio.CancelledError:
+            work.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await work
+            raise
 
     def held(self, function: str) -> set[int]:
         return {rid for (fn, rid) in self._held if fn == function}
@@ -192,6 +233,7 @@ class ClusterRunner:
         if self._started:
             return
         self._started = True
+        self._fence_enabled = True
         caps = local_capabilities(self.settings)
         for f in self._funcs():
             if f.prepare is not None and caps.get(f.name):
@@ -207,25 +249,31 @@ class ClusterRunner:
         ]
 
     async def stop(self) -> None:
-        """Stops the loops and releases every lease in the DB. Local ingest/motion work is
-        stopped by the regular stop_all() calls that follow in the shutdown sequence."""
+        """Stop every local worker, then release its lease.
+
+        Ingest and motion use the same ``stop`` as ``_drop``. Releasing first would
+        leave a window where the right is free and ffmpeg is still alive. Global
+        loops are stopped here too (nothing later in shutdown stops them); they were
+        already stopped before release, and that order stays.
+        """
+        self._fence_enabled = False
+        self._started = False
         tasks, self._tasks = self._tasks, []
         for t in tasks:
             t.cancel()
         if tasks:
             await asyncio.wait(tasks, timeout=5.0)
-        self._started = False
         for f in self._funcs():
-            if f.scope == "global":  # nothing later in the shutdown sequence stops these loops
-                for rid in sorted(self.held(f.name)):
-                    h = self._held[(f.name, rid)]
-                    self._cancel_start(h)
-                    try:
-                        await f.stop(rid)
-                    except Exception:
-                        logger.exception("cluster: %s stop failed", f.name)
+            for rid in sorted(self.held(f.name)):
+                h = self._held[(f.name, rid)]
+                self._cancel_start(h)
+                if h.task is not None:
+                    await asyncio.wait({h.task}, timeout=2.0)
+                try:
+                    await f.stop(rid)
+                except Exception:
+                    logger.exception("cluster: %s stop failed for cam %s", f.name, rid)
         for key, h in list(self._held.items()):
-            self._cancel_start(h)
             try:
                 await self._db(lambda db, lease=h.lease: leases.release(db, lease))
             except Exception:
@@ -317,14 +365,22 @@ class ClusterRunner:
 
     async def _fence(self) -> None:
         """Drop every right that was not renewed within TTL - RENEW (DB unreachable or stuck)."""
-        limit = self._ttl - self._renew_interval
-        now = self._now()
-        for f in self._funcs():
-            for rid in sorted(self.held(f.name)):
-                if now - self._held[(f.name, rid)].renewed_at >= limit:
-                    logger.error("cluster: %s cam %s not renewed for %ss, stopping local work",
-                                 f.name, rid, now - self._held[(f.name, rid)].renewed_at)
-                    await self._drop(f, rid, release=False)
+        if not self._fence_enabled or self._fence_lock.locked():
+            return
+        async with self._fence_lock:
+            if not self._fence_enabled:
+                return
+            limit = self._ttl - self._renew_interval
+            now = self._now()
+            for f in self._funcs():
+                for rid in sorted(self.held(f.name)):
+                    held = self._held.get((f.name, rid))
+                    if held is None:
+                        continue
+                    if now - held.renewed_at >= limit:
+                        logger.error("cluster: %s cam %s not renewed for %ss, stopping local work",
+                                     f.name, rid, now - held.renewed_at)
+                        await self._drop(f, rid, release=False)
 
     def _schedule_start(self, f: ClusterFunction, rid: int, payload: Any) -> None:
         h = self._held[(f.name, rid)]
@@ -380,14 +436,28 @@ class ClusterRunner:
 
         for rid in sorted(self.held(f.name)):
             h = self._held[(f.name, rid)]
-            now = self._now()
+            lease = h.lease
             try:
-                ok = await self._db(lambda db: leases.renew(db, h.lease, self._ttl, now))
+                # `now` is read inside the session, when the UPDATE actually runs.
+                ok = await self._db(lambda db, lease=lease: leases.renew(
+                    db, lease, self._ttl, self._now()))
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.warning("cluster: renew %s/%s failed", f.name, rid, exc_info=True)
                 continue
+            current = self._held.get((f.name, rid))
+            if current is None or current.lease is not lease:
+                # Fenced while the renew was in flight. A late success must not keep
+                # the row: local work is already stopped.
+                if ok:
+                    try:
+                        await self._db(lambda db, lease=lease: leases.release(db, lease))
+                    except Exception:
+                        logger.warning("cluster: release %s/%s after late renew failed", f.name, rid)
+                continue
             if ok:
-                h.renewed_at = now
+                current.renewed_at = self._now()
             else:
                 logger.warning("cluster: lost right %s/%s, stopping", f.name, rid)
                 await self._drop(f, rid, release=False)
@@ -422,6 +492,7 @@ class ClusterRunner:
             return rows, nodes
 
         rows, nodes = await self._db(_load)
+        now = self._now()  # the load may have been slow; expiry is judged after it
         if nodes is None or f.scope == "global":
             share = len(desired)  # live nodes unknown / no fair share for global functions
         else:
@@ -434,8 +505,13 @@ class ClusterRunner:
             key = (f.name, rid)
             row = rows.get(rid)
             if row is not None and row.owner_node_id == self.node_id and row.expires_at > now:
-                mine.append(rid)  # our own live lease (e.g. restart with the same NODE_ID)
-                self._orphan_since.pop(key, None)
+                # Our process's live row (holder matches, or an old row with no token).
+                # A different holder is another process with the same NODE_ID: not ours.
+                if row.holder not in (None, self.holder):
+                    self._orphan_since.pop(key, None)
+                else:
+                    mine.append(rid)
+                    self._orphan_since.pop(key, None)
             elif row is None or row.owner_node_id is None or row.expires_at <= now:
                 orphans.append(rid)
                 self._orphan_since.setdefault(key, now)
@@ -453,14 +529,14 @@ class ClusterRunner:
                 if allowed <= 0 and not unowned_long:
                     continue
             try:
-                lease = await self._db(
-                    lambda db: leases.try_acquire(db, f.name, rid, self.node_id, self._ttl, now))
+                lease = await self._db(lambda db, rid=rid: leases.try_acquire(
+                    db, f.name, rid, self.node_id, self._ttl, self._now(), self.holder))
             except Exception:
                 logger.warning("cluster: acquire %s/%s failed", f.name, rid, exc_info=True)
                 continue
             if lease is None:
                 continue
-            self._held[key] = _Held(lease=lease, renewed_at=now)
+            self._held[key] = _Held(lease=lease, renewed_at=self._now())
             self._orphan_since.pop(key, None)
             if not is_mine:
                 allowed -= 1
