@@ -130,7 +130,10 @@ def test_migration_chain():
     holder = script.get_revision("47700_lease_holder")
     assert holder.down_revision == "47600_notify_photo"
     assert len(holder.revision) <= 32
-    assert script.get_heads() == ["47700_lease_holder"]
+    names = script.get_revision("47800_schema_names")
+    assert names.down_revision == "47700_lease_holder"
+    assert len(names.revision) <= 32
+    assert script.get_heads() == ["47800_schema_names"]
 
 
 def _settings(**kw):
