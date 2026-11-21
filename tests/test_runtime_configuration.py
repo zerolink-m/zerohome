@@ -169,6 +169,8 @@ async def test_runtime_seeds_durable_secrets_and_recovers_pending_identity(tmp_p
     monkeypatch.setattr(identity, "_generated_id", None)
     identity_path.parent.mkdir(parents=True)
     identity_path.write_text(json.dumps({"node_id": "crash-recovery-node", "state": "pending"}))
+    monkeypatch.delenv("BOOTSTRAP_JWT_SECRET_SESSION", raising=False)
+    monkeypatch.delenv("BOOTSTRAP_JWT_SECRET_SHARE", raising=False)
     monkeypatch.setattr(runtime, "settings", Settings(_env_file=None))
     async with sessions() as db:
         await runtime.initialize_runtime_configuration(db)
