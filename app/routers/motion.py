@@ -1,12 +1,13 @@
 """Motion detection API endpoints."""
+import os
 import time
 
 from fastapi import APIRouter, Depends
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.codes import FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND
-from app.core.config import settings
 from app.core.errors import AppError
 from app.core.response import deleted, listing, single
 from app.core.rate_limit import rate_limit
@@ -18,6 +19,7 @@ from app.models.cams import Cam
 from app.models.motion_event import MotionEvent
 from app.schemas.motion import MotionEventResponse
 from app.services import motion_detection
+from app.services import storage as storage_layer
 
 router = APIRouter(prefix="/v1", tags=["motion"])
 
@@ -108,9 +110,6 @@ async def get_motion_event_photo(
     db: AsyncSession = Depends(get_db),
 ):
     """Download photo of a motion event."""
-    import os
-    from fastapi.responses import FileResponse
-
     event = await db.get(MotionEvent, event_id)
     if event is None:
         raise AppError(OBJECT_NOT_FOUND, "Событие не найдено")
@@ -118,21 +117,25 @@ async def get_motion_event_photo(
     # Check access to camera
     await _check_cam_access(db, event.cam_id, payload.uid, payload.role == "admin")
 
-    # Build photo path
-    photo_path = os.path.join(
-        settings.motion_files_path,
-        str(event.cam_id),
-        event.photo_filename
-    )
+    filename = os.path.basename(event.photo_filename or "photo.jpg").replace('"', "") or "photo.jpg"
+    if event.photo_key:
+        try:
+            data = await storage_layer.get_storage().get(event.photo_key)
+        except ValueError:
+            data = None
+        if not data:
+            raise AppError(OBJECT_NOT_FOUND, "Фото не найдено")
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
-    if not os.path.exists(photo_path):
+    # Rows written before photo_key: the file is still in the local directory.
+    photo_path = storage_layer.legacy_motion_path(event.cam_id, event.photo_filename)
+    if not os.path.isfile(photo_path):
         raise AppError(OBJECT_NOT_FOUND, "Фото не найдено")
-
-    return FileResponse(
-        photo_path,
-        media_type="image/jpeg",
-        filename=event.photo_filename,
-    )
+    return FileResponse(photo_path, media_type="image/jpeg", filename=filename)
 
 
 @router.delete(
@@ -145,8 +148,6 @@ async def delete_motion_event(
     db: AsyncSession = Depends(get_db),
 ):
     """Delete a motion event (owner only)."""
-    import os
-
     event = await db.get(MotionEvent, event_id)
     if event is None:
         raise AppError(OBJECT_NOT_FOUND, "Событие не найдено")
@@ -159,18 +160,18 @@ async def delete_motion_event(
     if payload.role != "admin" and cam.ownuser != payload.uid:
         raise AppError(FORBIDDEN_RESOURCE, "Только владелец камеры может удалять события")
 
-    # Delete photo from filesystem
-    photo_path = os.path.join(
-        settings.motion_files_path,
-        str(event.cam_id),
-        event.photo_filename
-    )
-
-    if os.path.exists(photo_path):
+    if event.photo_key:
         try:
-            os.remove(photo_path)
+            await storage_layer.get_storage().delete(event.photo_key)
         except Exception:
             pass  # Ignore errors, delete from DB anyway
+    elif event.photo_filename:
+        photo_path = storage_layer.legacy_motion_path(event.cam_id, event.photo_filename)
+        if os.path.isfile(photo_path):
+            try:
+                os.remove(photo_path)
+            except Exception:
+                pass  # Ignore errors, delete from DB anyway
 
     # Delete from database
     await db.delete(event)

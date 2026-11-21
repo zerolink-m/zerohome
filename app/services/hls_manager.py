@@ -39,7 +39,7 @@ class _HLSSession:
         self.active_clients: int = 0
         self.idle_task: asyncio.Task | None = None
         self.last_access_time: float = time.time()
-        self.temp_dir = Path(settings.HLS_TEMP_DIR) / str(cam_id)
+        self.temp_dir = Path(settings.hls_temp_path) / str(cam_id)
         self.playlist_path = self.temp_dir / "playlist.m3u8"
         self.active_marker = self.temp_dir / ".active"
         # --- source: "direct" (own RTSP ffmpeg) | "hub" (fMP4 from the ingest hub on stdin) ---
@@ -606,7 +606,7 @@ async def _cleanup_loop() -> None:
 
 async def _cleanup_old_files() -> None:
     """Remove old/orphaned HLS files"""
-    temp_dir = Path(settings.HLS_TEMP_DIR)
+    temp_dir = Path(settings.hls_temp_path)
     if not temp_dir.exists():
         return
 

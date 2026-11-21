@@ -127,6 +127,31 @@ class CamHub:
         if self.state != STATE_ONLINE:
             self.set_state(STATE_ONLINE)
 
+    def feed_remote(self, init: bytes | None = None, fragment: bytes | None = None) -> None:
+        """Whole init segment and/or one whole fragment from another node.
+
+        Same fan-out as `feed` (GOP buffer, subscriber queues, online flag) but no
+        byte scanner: the owner already cut the fMP4. Must not run together with
+        `feed` — the node either owns ingest or it is pulling, never both.
+        """
+        if init:
+            self.bytes_in += len(init)
+            self.last_data_at = time.monotonic()
+            if init != self.init_segment:
+                self.init_segment = init
+                self.gop = []
+                self.gop_bytes = 0
+                self._splitter = Fmp4Splitter()
+                for sub in list(self.subscribers):
+                    sub._push(init)
+        if fragment:
+            self.bytes_in += len(fragment)
+            self.last_data_at = time.monotonic()
+            if self.init_segment is not None:
+                self._on_fragment(fragment)
+        if self.init_segment is not None and self.state != STATE_ONLINE:
+            self.set_state(STATE_ONLINE)
+
     def _on_fragment(self, fragment: bytes) -> None:
         if not fragment_starts_with_non_sync(fragment) or not self.gop:
             self.gop = []  # a keyframe fragment starts a new GOP
@@ -158,9 +183,9 @@ class CamHub:
         self.set_state(state)
 
     # -- subscribers --
-    def subscribe(self) -> Subscription:
+    def subscribe(self, *, replay: bool = True) -> Subscription:
         sub = Subscription(self.cam_id, self, self._owner.subscriber_limit_bytes)
-        if self.init_segment is not None:
+        if replay and self.init_segment is not None:
             sub._push(self.init_segment)
             for fragment in self.gop:
                 sub._push(fragment)
@@ -229,8 +254,8 @@ class IngestHub:
     def peek(self, cam_id: int) -> CamHub | None:
         return self._cams.get(cam_id)
 
-    def subscribe(self, cam_id: int) -> Subscription:
-        return self.get(cam_id).subscribe()
+    def subscribe(self, cam_id: int, *, replay: bool = True) -> Subscription:
+        return self.get(cam_id).subscribe(replay=replay)
 
     def subscriber_count(self, cam_id: int) -> int:
         hub = self._cams.get(cam_id)
@@ -238,6 +263,12 @@ class IngestHub:
 
     def add_viewers_listener(self, listener: ViewersListener) -> None:
         self._listeners.append(listener)
+
+    def remove_viewers_listener(self, listener: ViewersListener) -> None:
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
 
     def _notify(self, cam_id: int, count: int) -> None:
         for listener in list(self._listeners):

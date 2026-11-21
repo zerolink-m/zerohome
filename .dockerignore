@@ -8,6 +8,7 @@
 !frontend_versions.json
 !deploy/
 !deploy/container-entrypoint.sh
+!deploy/migrate_locked.py
 !app/
 !app/**
 !alembic/

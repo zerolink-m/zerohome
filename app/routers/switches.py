@@ -37,7 +37,7 @@ from app.schemas.switch import (
     SwitchStateIn,
     SwitchStateOut,
 )
-from app.services import push, switch_client
+from app.services import notify_queue, switch_client
 
 router = APIRouter(prefix="/v1/switches", tags=["switches"])
 
@@ -366,7 +366,6 @@ async def patch_switches_bulk(
         )
     failed: list[dict] = []
     succeeded: list[dict] = []
-    pushes: list[Switch] = []
     for item, sid in zip(body.items, id_list):
         if item.error is not None:
             failed.append({"id": sid, "error": item.error})
@@ -382,14 +381,15 @@ async def patch_switches_bulk(
             continue
         succeeded.append(switch)
         if notify_on:
-            pushes.append(switch)
+            await notify_queue.enqueue(
+                db, kind="manual", device_type="switches", device_id=switch.id,
+                message=f"Push включён для устройства {switch.name or switch.id}",
+            )
 
     if failed and not succeeded:
         await db.rollback()
         return bulk("switches", [], failed, op="edit", partial=False)
     await db.commit()
-    for sw in pushes:
-        push.notify_switch_background(sw.id, f"Push включён для устройства {sw.name or sw.id}")
     return bulk("switches", [_serialize(s, payload) for s in succeeded], failed, op="edit", partial=body.partial_allowed)
 
 
@@ -402,10 +402,12 @@ async def patch_switch(
 ):
     switch = await _get_visible_switch(switch_id, payload, db)
     changed, notify_enabled = await _apply_patch(switch, body.obj.model_dump(exclude_unset=True), payload, db)
-    await db.commit()
-
     if notify_enabled:
-        push.notify_switch_background(switch.id, f"Push включён для устройства {switch.name or switch.id}")
+        await notify_queue.enqueue(
+            db, kind="manual", device_type="switches", device_id=switch.id,
+            message=f"Push включён для устройства {switch.name or switch.id}",
+        )
+    await db.commit()
 
     return edited("switch", _serialize(switch, payload), changed=changed)
 

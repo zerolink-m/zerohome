@@ -41,6 +41,7 @@ WORKDIR /app
 COPY --chown=10001:10001 app/ ./app/
 COPY --chown=10001:10001 alembic/ ./alembic/
 COPY --chown=10001:10001 main.py alembic.ini frontend_versions.json ./
+COPY --chown=10001:10001 deploy/migrate_locked.py ./deploy/migrate_locked.py
 COPY --from=dependencies --chown=10001:10001 /build/yolov8n.pt ./yolov8n.pt
 COPY --chmod=0555 deploy/container-entrypoint.sh /usr/local/bin/zerohome-entrypoint
 USER 10001:10001

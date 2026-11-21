@@ -7,7 +7,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.switch import Switch
-from app.services import push, switch_client
+from app.services import notify_queue, switch_client
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +31,16 @@ async def _sync_one(db, switch: Switch) -> None:
     previous = switch.state
     switch.state = state
     switch.state_updated_at = int(time.time())
-    await db.commit()
 
-    # Notify users with notify_state_change=1
+    # Notify users with notify_state_change=1 — same transaction as the state change.
     from datetime import datetime
     now = datetime.fromtimestamp(time.time()).strftime("%d.%m.%Y %H:%M:%S")
     message = f"🔌 Устройство {_switch_label(switch)} изменило состояние: {'включено' if state == 1 else 'выключено'}\n\nВремя: {now}"
-    await push._notify_recipients_filtered(
-        db, "switches", switch.id, switch.ownuser, message,
-        filter_func=lambda ps: ps.notify_state_change == 1
+    await notify_queue.enqueue(
+        db, kind="switch", device_type="switches", device_id=switch.id,
+        message=message, payload={"filter": "notify_state_change"},
     )
+    await db.commit()
 
     logger.info("switch_id=%s state changed %s -> %s via sync", switch.id, previous, state)
 
@@ -67,3 +67,17 @@ def start() -> None:
     global _task
     if _task is None or _task.done():
         _task = asyncio.create_task(_loop())
+
+
+async def stop() -> None:
+    """Stops the loop only (idempotent; safe when it was never started)."""
+    global _task
+    task, _task = _task, None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("%s loop raised during stop", __name__)

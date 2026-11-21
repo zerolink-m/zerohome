@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -24,6 +25,12 @@ class Settings(BaseSettings):
     DB_USER: str = "zerocams"
     DB_PASSWORD: str
     DB_NAME: str = "zerocams"
+    # Seconds a pooled connection may wait on a silent MySQL. asyncmy.connect
+    # accepts read_timeout (queries and pool pre-ping share that read). It does
+    # not accept write_timeout; that value is forwarded only if the installed
+    # driver grows the argument. See app/db/session.py.
+    DB_READ_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    DB_WRITE_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
 
     # --- JWT: share links and previously issued refresh tokens only ---
     JWT_SECRET_SESSION: str
@@ -49,6 +56,8 @@ class Settings(BaseSettings):
     TUYA_EVENTS_ENABLED: bool = True
     MOTION_DETECTION_ENABLED: bool = True
     MOTION_CLEANUP_ENABLED: bool = True
+    STARTUP_WARMUP_ENABLED: bool = True  # in-process DB/HTTP warm-up before serving; never fails startup
+    STARTUP_WARMUP_TIMEOUT_SECONDS: float = 10.0  # hard wall-clock bound for the whole warm-up
     HEALTHCHECK_INTERVAL_SECONDS: int = 60
     HEALTHCHECK_TCP_TIMEOUT_SECONDS: float = 5.0
     STREAM_IDLE_TIMEOUT_SECONDS: int = 30
@@ -91,6 +100,27 @@ class Settings(BaseSettings):
     WEBRTC_AUDIO_ENABLED: bool = True  # send the camera's audio (Opus, mono 48 kHz) when the stream has any
     WEBRTC_MAX_LATENCY_MS: int = 500  # frames queued beyond this are dropped (live edge wins)
 
+    # --- multi-node: node identity and leases (stage 1; nothing consumes these yet) ---
+    CLUSTER_ENABLED: bool = False
+    NODE_ID: str = ""  # required when CLUSTER_ENABLED; otherwise empty -> hostname + random suffix, see app.services.cluster.identity.get_node_id()
+    NODE_ADDRESS: str = ""
+    LEASE_TTL_SECONDS: int = 30
+    LEASE_RENEW_INTERVAL_SECONDS: int = 10
+    NODE_HEARTBEAT_INTERVAL_SECONDS: int = 10
+    # Plain TCP fMP4 between nodes (stage 3). TLS is not enabled: an empty secret
+    # listens and dials on loopback only. See app/services/cluster/media_transport.py.
+    CLUSTER_MEDIA_HOST: str = "127.0.0.1"
+    CLUSTER_MEDIA_PORT: int = 4700
+    CLUSTER_SECRET: str = Field(default="", repr=False)  # media handshake HMAC, and the view-proxy header HMAC; does not encrypt
+    CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS: float = 10.0
+    # Close a media connection when nothing (including PING/PONG) arrives for this long.
+    CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS: float = 20.0
+    # View routing (stage 4). Host is the host part of nodes.address; the port in that
+    # address stays the fMP4 port. 0 means dial HTTP on PORT.
+    CLUSTER_VIEW_HTTP_PORT: int = 0
+    CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS: float = 3.0
+    CLUSTER_VIEW_READ_TIMEOUT_SECONDS: float = 15.0  # silence between proxied chunks; also bounds waiting for headers
+
     # --- ingest: one persistent ffmpeg (RTSP -> fMP4, -c copy) per enabled camera ---
     # /stream, HLS, WebRTC, live snapshots and motion detection read this hub when it is on.
     INGEST_ENABLED: bool = False
@@ -118,6 +148,15 @@ class Settings(BaseSettings):
     CACHE_DIR: str = "caching"
     # Motion event photos; a relative path is resolved against the project root.
     MOTION_FILES_DIR: str = "motion_files"
+    # local (default) writes under MOTION_FILES_DIR. s3 never falls back to local.
+    STORAGE_BACKEND: str = "local"
+    S3_ENDPOINT: str = ""
+    S3_BUCKET: str = ""
+    S3_ACCESS_KEY: str = Field(default="", repr=False)
+    S3_SECRET_KEY: str = Field(default="", repr=False)
+    S3_REGION: str = ""  # blank is signed as us-east-1
+    NOTIFY_ENABLED: bool = True  # capability "notify"; off = this node does not send pushes
+    NOTIFY_JOB_RETENTION_DAYS: int = 7
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     VERSION: str = "v0.0.0-Alpha"
@@ -129,6 +168,64 @@ class Settings(BaseSettings):
     # filtering and why it was dropped / whether an event was created. Off by default.
     MOTION_DEBUG_LOG: bool = False
 
+    @model_validator(mode="after")
+    def _check_lease_timing(self) -> "Settings":
+        if self.CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS <= 0:
+            raise ValueError("CLUSTER_MEDIA_IDLE_TIMEOUT_SECONDS must be > 0")
+        if self.LEASE_RENEW_INTERVAL_SECONDS < 1 or self.NODE_HEARTBEAT_INTERVAL_SECONDS < 1:
+            raise ValueError("LEASE_RENEW_INTERVAL_SECONDS and NODE_HEARTBEAT_INTERVAL_SECONDS must be >= 1")
+        if self.LEASE_RENEW_INTERVAL_SECONDS * 2 > self.LEASE_TTL_SECONDS:
+            raise ValueError("LEASE_RENEW_INTERVAL_SECONDS * 2 must be <= LEASE_TTL_SECONDS")
+        if self.CLUSTER_ENABLED and not (self.NODE_ID or "").strip():
+            raise ValueError(
+                "NODE_ID must be set explicitly when CLUSTER_ENABLED=true: a random id changes on every "
+                "start, so orphaned processes of the previous run are not cleaned up"
+            )
+        if self.CLUSTER_ENABLED:
+            media_host = (self.CLUSTER_MEDIA_HOST or "").strip()
+            if not media_host:
+                raise ValueError("CLUSTER_MEDIA_HOST must be set when CLUSTER_ENABLED=true")
+            if self.CLUSTER_MEDIA_PORT < 1 or self.CLUSTER_MEDIA_PORT > 65535:
+                raise ValueError("CLUSTER_MEDIA_PORT must be between 1 and 65535")
+            if self.CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS < 0:
+                raise ValueError("CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS must be >= 0")
+            if self.CLUSTER_VIEW_HTTP_PORT < 0 or self.CLUSTER_VIEW_HTTP_PORT > 65535:
+                raise ValueError("CLUSTER_VIEW_HTTP_PORT must be 0 (use PORT) or between 1 and 65535")
+            if self.CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS <= 0 or self.CLUSTER_VIEW_READ_TIMEOUT_SECONDS <= 0:
+                raise ValueError(
+                    "CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS and CLUSTER_VIEW_READ_TIMEOUT_SECONDS must be > 0"
+                )
+            from app.services.cluster.media_protocol import is_loopback_host
+            if not is_loopback_host(media_host) and not (self.CLUSTER_SECRET or "").strip():
+                raise ValueError(
+                    "CLUSTER_SECRET must be set when CLUSTER_ENABLED=true and CLUSTER_MEDIA_HOST "
+                    f"({media_host}) is not loopback. TLS is not enabled, so the media stream would be "
+                    "sent in the clear; refusing to listen. Bind 127.0.0.1 or ::1 without a secret, "
+                    "or set CLUSTER_SECRET before using any other address."
+                )
+        backend = (self.STORAGE_BACKEND or "").strip().lower()
+        if backend not in ("local", "s3"):
+            raise ValueError("STORAGE_BACKEND must be 'local' or 's3'")
+        self.STORAGE_BACKEND = backend
+        if self.NOTIFY_JOB_RETENTION_DAYS < 0:
+            raise ValueError("NOTIFY_JOB_RETENTION_DAYS must be >= 0")
+        if backend == "s3":
+            missing = [
+                name for name in ("S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY", "S3_SECRET_KEY")
+                if not str(getattr(self, name) or "").strip()
+            ]
+            if missing:
+                raise ValueError(
+                    "STORAGE_BACKEND=s3 requires non-empty settings: " + ", ".join(missing)
+                    + ". Refusing to start; not falling back to local storage."
+                )
+            parts = urlsplit(self.S3_ENDPOINT.strip())
+            if parts.scheme not in ("http", "https") or not parts.hostname:
+                raise ValueError(
+                    "S3_ENDPOINT must be an absolute http(s) URL, for example http://minio:9000"
+                )
+        return self
+
     @property
     def database_url(self) -> str:
         """Single source of the async MySQL URL (asyncmy driver)."""
@@ -137,13 +234,37 @@ class Settings(BaseSettings):
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}?charset=utf8mb4"
         )
 
+    def _node_scoped(self, base: Path) -> Path:
+        """<base>/nodes/<safe node_id> in cluster mode, base unchanged otherwise."""
+        if not self.CLUSTER_ENABLED:
+            return base
+        from app.services.cluster.identity import get_node_id, safe_node_dir_name
+
+        return base / "nodes" / safe_node_dir_name(get_node_id(self))
+
     @property
     def ingest_registry_path(self) -> str:
-        """Absolute path of the ingest process registry file."""
-        base = Path(self.INGEST_REGISTRY_DIR or (Path(self.CACHE_DIR) / "ingest")).expanduser()
+        """Absolute path of the ingest process registry file.
+
+        Every pool (ingest, transcode, webrtc, hls, snapshot, motion) derives its registry
+        file from this directory. With CLUSTER_ENABLED and no explicit INGEST_REGISTRY_DIR the
+        directory is per node, so reap_orphans of one process never touches another's ffmpeg.
+        """
+        if self.INGEST_REGISTRY_DIR:
+            base = Path(self.INGEST_REGISTRY_DIR).expanduser()
+        else:
+            base = self._node_scoped(Path(self.CACHE_DIR) / "ingest")
         if not base.is_absolute():
             base = PROJECT_ROOT / base
         return str(base / "registry.json")
+
+    @property
+    def hls_temp_path(self) -> str:
+        """HLS temp directory; per node in cluster mode unless HLS_TEMP_DIR is set explicitly."""
+        base = Path(self.HLS_TEMP_DIR)
+        if "HLS_TEMP_DIR" not in self.model_fields_set:
+            base = self._node_scoped(base)
+        return str(base)
 
     @property
     def motion_files_path(self) -> str:

@@ -26,7 +26,7 @@ This is a CPU image, not a GPU-enabled or ARM build. Native dependencies and ML 
 
 ## First deployment on the target host
 
-Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), Bash, `flock`, gzip and Python 3. Docker access is root-equivalent. Use a dedicated trusted operator. Put this checkout (including `compose.yaml` and `deploy/`) at `/opt/zerohome`; if you use another location, adjust the service unit accordingly.
+Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), Bash, `flock`, gzip and Python 3. Docker access is root-equivalent. Use a dedicated trusted operator. Put this checkout (including `templates/compose.yaml` and `deploy/`) at `/opt/zerohome`; if you use another location, adjust the service unit accordingly.
 
 1. Authenticate **as the same OS user that runs the updater**. Use an account with package access and a GitHub PAT (classic) with `read:packages`, SSO-authorized if applicable. Do not place the token in this repository or a command-line argument:
 
@@ -67,17 +67,51 @@ Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), B
 
    ```sh
    cd /opt/zerohome
-   docker compose --env-file /etc/zerohome/deployment.conf pull db
+   docker compose --env-file /etc/zerohome/deployment.conf -f templates/compose.yaml pull db
    sudo ./deploy/update.sh
-   docker compose --env-file /etc/zerohome/deployment.conf ps
+   docker compose --env-file /etc/zerohome/deployment.conf -f templates/compose.yaml ps
    curl --fail http://127.0.0.1:8000/v1/health
    ```
 
-   Run all Docker commands under the authenticated operator (omit `sudo` if already root). The updater pulls the application, pins its digest, starts/waits for the existing or freshly initialized DB without upgrading it, stops the app, backs up the database, runs `alembic upgrade head` in a single disposable `migrate` container, and only then starts/waits for the app. Initial deployment also takes a backup of the newly initialized empty database. The app image itself never runs migrations at startup. **Use the script, not a bare `docker compose up -d app`, to deploy or update.** The maintenance-profile migrate service is not a continuously running replica.
+   Run all Docker commands under the authenticated operator (omit `sudo` if already root). The updater pulls the application, pins its digest, starts/waits for the existing or freshly initialized DB without upgrading it, stops the app, backs up the database, runs `alembic upgrade head` while holding MySQL `GET_LOCK('zerohome_migrate')` (`deploy/migrate_locked.py`) in a single disposable `migrate` container, and only then starts/waits for the app. Initial deployment also takes a backup of the newly initialized empty database. The app image itself never runs migrations at startup. **Use the script, not a bare `docker compose up -d app`, to deploy or update.** The maintenance-profile migrate service is not a continuously running replica.
 
-One app process/replica is supported: camera ownership and background jobs are in-process, not a distributed worker system. The container runs as UID/GID 10001, drops capabilities and uses an init process for child reaping. Named volumes persist MySQL data, motion event photos and OCR/model state. Cache/process registries and temporary media are disposable tmpfs. Never run `docker compose down -v` on a live installation. A healthcheck is HTTP **liveness**, not proof of camera reachability or database correctness; DB health and migration success are checked separately by deployment.
+The built-in file runs one app container. More than one node is the external-database layout below; camera work is then leased instead of started for every camera on every node. The container runs as UID/GID 10001, drops capabilities and uses an init process for child reaping. Named volumes persist MySQL data, motion event photos and OCR/model state. Cache/process registries and temporary media are disposable tmpfs. Never run `docker compose down -v` on a live installation. A healthcheck is HTTP **liveness**, not proof of camera reachability or database correctness; DB health and migration success are checked separately by deployment.
 
-The HTTP port is loopback-only by default; terminate HTTPS in a reverse proxy with WebSocket support and appropriate streaming timeouts. MySQL has no published host port. Camera RTSP/ONVIF addresses must be reachable from the Docker bridge network. WebRTC needs explicit UDP routing: choose `WEBRTC_UDP_PORT_MIN/MAX`, set `WEBRTC_PUBLIC_IP` and publish/forward the same UDP range in a local Compose override; HTTP proxying alone is insufficient. Supply that override explicitly in the updater's Compose command if used (the shipped script intentionally reads only `compose.yaml`). Review firewall/NAT and STUN/TURN client settings for the target host; do not assume the existing host configuration automatically transfers into bridge networking.
+The HTTP port is loopback-only by default; terminate HTTPS in a reverse proxy with WebSocket support and appropriate streaming timeouts. MySQL has no published host port. Camera RTSP/ONVIF addresses must be reachable from the Docker bridge network. WebRTC needs explicit UDP routing: choose `WEBRTC_UDP_PORT_MIN/MAX`, set `WEBRTC_PUBLIC_IP` and publish/forward the same UDP range in a local Compose override; HTTP proxying alone is insufficient. Supply that override explicitly in the updater's Compose command if used (the shipped script reads `templates/compose.yaml`, or `templates/compose.external-db.yaml` when `ZEROHOME_EXTERNAL_DB=1`, and no further file). Review firewall/NAT and STUN/TURN client settings for the target host; do not assume the existing host configuration automatically transfers into bridge networking.
+
+## One node, an external database, or a second node
+
+Node identity and cluster settings are not hardcoded. `templates/compose.yaml` and `templates/compose.external-db.yaml` pass `NODE_ID`, `NODE_ADDRESS`, `CLUSTER_ENABLED`, `CLUSTER_SECRET`, `CLUSTER_MEDIA_HOST`, `CLUSTER_MEDIA_PORT`, `STORAGE_BACKEND` and `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` from the Compose environment (the deployment env file or `export`). Those entries override the application env file. Put them there, not only in `app.conf`. Unset booleans and integers use the app defaults (`CLUSTER_ENABLED=false`, media on `127.0.0.1:4700`, `STORAGE_BACKEND=local`) because an empty string fails startup. `MIGRATE_LOCK_TIMEOUT_SECONDS` (default 300) is how long a node waits for the migration lock.
+
+### One node, built-in database
+
+Leave the variables above unset and run `./deploy/update.sh` with `templates/compose.yaml`, as in the first-deployment steps. The script starts the existing `db` container without recreating it, stops the app, takes the logical backup, migrates, and starts the app. `ZEROHOME_MIGRATE` stays unset: this node is the migration node. Do not point a second server at this Compose database; MySQL has no published port.
+
+### External database
+
+`templates/compose.external-db.yaml` is a separate file, not an overlay. Do not combine it with `templates/compose.yaml`. An overlay would still interpolate the built-in file, still require `MYSQL_ROOT_PASSWORD`, and still describe a `db` service. The external file has `app` and `migrate` only: no `db` service and no `depends_on`. The project name stays `zerohome`, so the motion and model volumes keep their names. Do not `up` both files at once.
+
+The app reads `DB_HOST`, `DB_PORT` (default 3306), `DB_USER`, `DB_PASSWORD` and `DB_NAME`. `DB_READ_TIMEOUT_SECONDS` (default 30) is passed to asyncmy as `read_timeout` on every pooled connection, including pool pre-ping, so a silent MySQL fails the read instead of holding a pool slot until the pool is exhausted; `pool_pre_ping` stays on and `pool_recycle` stays 3600. `DB_WRITE_TIMEOUT_SECONDS` (default 30) is passed only when this asyncmy accepts `write_timeout` (the installed driver does not). There is no second set of names and no `MYSQL_ROOT_PASSWORD`. `DB_HOST` must be reachable from the Compose network. `127.0.0.1` inside the container is the container, not the host; for MySQL on the same machine use a reachable address, or a local override with `extra_hosts: ["host.docker.internal:host-gateway"]` and `DB_HOST=host.docker.internal`.
+
+```sh
+ZEROHOME_EXTERNAL_DB=1 sudo -E ./deploy/update.sh
+```
+
+The script then uses `templates/compose.external-db.yaml`. It does not start a database container and it does not run `mysqldump`. That refusal is deliberate: back up the external database yourself before the run. Schema migration still runs, once, under the MySQL lock. The unattended timer is for the built-in single-node stack; do not enable it here unless backups are handled outside the script.
+
+### Second node
+
+Every node uses the external file and the same writable database. Replication is the operator's job. The application needs one writer for leases, notification jobs and sessions. It does not support multi-master writes. Read replicas are not used.
+
+On each node set a unique stable `NODE_ID`, that node's own `NODE_ADDRESS` (`host`, `host:port` or `[ipv6]:port`), `CLUSTER_ENABLED=true`, and `CLUSTER_SECRET` (required when the media listener is not loopback; it authenticates the handshake and does not encrypt). Publish the fMP4 port and the HTTP port yourself; neither Compose file opens 4700. Give each node its own cache volume. Do not share one.
+
+Exactly one node migrates. On that node leave `ZEROHOME_MIGRATE` unset or set it to `1`, with `ZEROHOME_EXTERNAL_DB=1`. On every other node:
+
+```sh
+ZEROHOME_EXTERNAL_DB=1 ZEROHOME_MIGRATE=0 sudo -E ./deploy/update.sh
+```
+
+Those nodes do not back up and do not run Alembic. They wait until `zerohome_migrate` is free, then replace only their app container. Start them after the migrating node has taken the lock, or after it has finished. A follower that starts earlier can pass the wait before the lock exists. Raise `MIGRATE_LOCK_TIMEOUT_SECONDS` if a migration can still be running when followers start waiting. The lock is one database session held for the whole `alembic upgrade head`, then released. Do not enable `zerohome-update.timer` on more than one host.
 
 ## Automatic stable updates (opt-in)
 
@@ -105,6 +139,75 @@ Fresh MySQL installs create Alembic's version table with a 128-character revisio
 
 Moving an existing production DB into the Compose volume is **not** performed by this setup. Plan and rehearse a stopped-writer export/import, preserve credentials and signing keys as appropriate, verify the Alembic revision, migrate, and cut over explicitly. Never point the fresh MySQL service at arbitrary existing host database files.
 
+## Existing `/opt/zerocams` host: systemd to Docker, host MySQL retained
+
+`compose.host.yaml` is a **standalone, host-specific alternative**, not an override to merge with `templates/compose.yaml`. It has only `app`: no database container, migration service, automatic schema changes or image pulls. **The shipped `deploy/update.sh` and `zerohome-update.timer` are NOT compatible with this deployment**: they assume Compose-managed MySQL and run migrations. Do not install/enable them; ensure no previously installed updater is active before cutover. Watchtower is explicitly excluded.
+
+Inspected host settings: systemd runs `/opt/zerocams/main.py` as root, with working directory `/opt/zerocams` and `KillMode=control-group`; HTTP binds `0.0.0.0:3805`, MySQL is `127.0.0.1:3306`, WebRTC uses UDP `49152–65535`. Host networking retains these routes and the existing firewall/NAT rules; Docker port publishing is deliberately absent. It also exposes the container to host-network services: this is not bridge-network isolation.
+
+The unchanged `/opt/zerocams/.env` is supplied via `env_file`; credentials, signing keys, worker flags and WebRTC settings remain there. Only container storage paths and the inspected HTTP bind are overridden. The image entrypoint restores the release `VERSION` from `/usr/local/share/zerohome-version`, ignoring a stale value in `.env`. If the host bind/port is deliberately changed later, update both Compose environment and healthcheck.
+
+### Storage and privilege choices
+
+- `/opt/zerocams/motion_files` is bind-mounted read/write at `/data/motion_files`. Existing photos and ownership remain unchanged; normal application retention cleanup still applies after startup.
+- `/opt/zerocams/caching` is **not mounted or copied**. Snapshots are regenerable; all ingest/transcode/HLS/WebRTC/snapshot/motion PID registries go into private `/data/cache` tmpfs. HLS segments use private `/tmp/zerocams/hls` tmpfs. Never share the host PID namespace or copy its process registries. These caches disappear on container stop.
+- Existing `/root/.EasyOCR` is narrowly mounted **read-only** at `/data/models/.EasyOCR`; no other `/root` files are exposed. The inspected cache contains `model/craft_mlt_25k.pth`, `model/cyrillic_g2.pth` and `user_network/`, matching the app's English/Russian EasyOCR reader. A missing/corrupt/incompatible model cannot be downloaded over this read-only mount: test OCR after cutover. If replacement models are needed, prepare a separate container-owned copy and change only this bind source, rather than modifying production cache ownership.
+- The fresh `zerohome-host_models` volume holds Ultralytics settings and other model-home caches. `nocopy` avoids inheriting UID 10001 ownership from the image. Existing `/root/.config/Ultralytics` is not required/copied; it is library configuration, not the app's detection model. YOLO loads `/app/yolov8n.pt`, the image's pinned/checksummed weights, not the host's untracked `yolov8n.pt`.
+- `frontend_versions.json` is read-only application input shipped in the image. Logging is stdout with bounded Docker log rotation; the host's existing `app.log` is not mounted. Camera recordings remain on the cameras; no additional local recording archive path was found.
+- The host-only config runs as `0:0`, matching systemd and allowing writes to root-owned motion data **without chmod/chown**. It drops all capabilities and uses `no-new-privileges` and a private PID namespace, but root plus host networking is weaker isolation than the default non-root deployment. Do not add Docker-socket or host-root mounts. Run only one app instance.
+
+### Operator-only preparation and cutover (not automatic)
+
+First verify a current recoverable host-MySQL backup plus photos/config backup, and that the chosen release is compatible with the existing schema **without migration**. If not, stop here and plan a separate schema change. Build the reviewed final release commit into `zerohome-host:v4.5.0-release`, with `--build-arg VERSION=v4.5.0-Release`, from an isolated checkout of that immutable commit. Do not merely retag `zerohome-release-check:v4.5.0-release`: it may predate the final fixes. Record the source commit and resulting image ID; do not overwrite the tag during cutover.
+
+Use the explicit file and an empty Compose interpolation env file every time. The service's `env_file` still loads `/opt/zerocams/.env`. Do not print `docker compose config`, container environment, raw logs, SQL rows or camera URLs; use quiet validation or narrow output instead. Do not source `.env` in a shell. Before stopping systemd, compare resolved environment values to the existing Python dotenv parser in-memory without printing values (especially if secrets contain `$` or quoting).
+
+Read-only preflight, safe output:
+
+```sh
+compose=(docker compose --env-file /dev/null -f /opt/zerocams/compose.host.yaml)
+"${compose[@]}" config --quiet
+"${compose[@]}" config --services  # must list only app
+# Inspect only identity/version, never the full image/container environment.
+docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.version"}}' zerohome-host:v4.5.0-release
+systemctl is-active zerocams
+systemctl is-enabled zerocams
+systemctl is-active zerohome-update.timer zerohome-update.service
+```
+
+Record the original systemd enablement for rollback. An absent/inactive updater is expected; these status commands may return nonzero. Check for any other automation outside these units. After approval, the operator runs the following **state-changing cutover**; no migration or DB service operation is included:
+
+```sh
+# Run in the same Bash shell as the compose array above.
+systemctl stop zerocams
+# Must report inactive before continuing; never run both app instances.
+systemctl is-active zerocams
+# Guard against a remaining HTTP listener before starting Docker.
+python3 -I - <<'PY'
+import socket
+with socket.socket() as s:
+    s.bind(('0.0.0.0', 3805))
+print('HTTP port available')
+PY
+# Only after both checks succeed:
+"${compose[@]}" up -d --no-deps --pull never --wait --wait-timeout 180 app
+```
+
+The `is-active` result `inactive` has a nonzero exit status; inspect it deliberately, not in a blindly pasted `set -e` chain. A healthcheck alone could hit the old process with host networking, hence the explicit stop/port checks. Startup resumes existing workers and their ordinary database writes/retention; “migration-free” does not mean the application is read-only.
+
+Safe-output smoke checks:
+
+```sh
+"${compose[@]}" ps
+curl --fail --silent --show-error --output /dev/null --write-out 'health HTTP %{http_code}\n' http://127.0.0.1:3805/v1/health
+curl --fail --silent --show-error --output /dev/null --write-out 'time HTTP %{http_code}\n' http://127.0.0.1:3805/v1/config/time
+"${compose[@]}" exec -T app python -c 'import os; from pathlib import Path; print("release", Path("/usr/local/share/zerohome-version").read_text().strip()); assert os.access("/data/motion_files", os.W_OK); assert Path("/data/models/.EasyOCR/model/craft_mlt_25k.pth").is_file(); assert Path("/data/models/.EasyOCR/model/cyrillic_g2.pth").is_file(); print("storage paths OK")'
+```
+
+HTTP health is liveness, **not** DB/camera readiness. Through the existing authenticated UI verify login/data reads (DB), access to an old motion photo, new motion capture, OCR, and WebRTC video **and audio** from the normal external client network. Verify HLS only if enabled. Review logs locally with credentials/addresses redacted before sharing. After successful smoke checks, `systemctl disable zerocams` prevents the old service competing after reboot; Docker's `unless-stopped` policy supplies restart behavior (also confirm Docker is enabled at boot).
+
+If startup or smoke checks fail, first `"${compose[@]}" stop -t 60 app` and verify `"${compose[@]}" ps --status running` shows no app before `systemctl start zerocams`. Restore the recorded original systemd enablement if it was changed. Leave MySQL, `.env`, photos and the model volume untouched; never use `down -v`. This rollback assumes the explicitly verified unchanged-schema compatibility; normal writes made during the Docker trial remain in the same DB.
+
 ## Per-task controls
 
 Settings are read at process startup. Edit the host's application configuration and restart/redeploy to change them; there is no unauthenticated runtime administration endpoint. New flags default to `true`, preserving existing behavior:
@@ -118,6 +221,54 @@ Settings are read at process startup. Edit the host's application configuration 
 | `TUYA_EVENTS_ENABLED` | Real-time Tuya/Pulsar consumers | Polling workers |
 | `MOTION_DETECTION_ENABLED` | Global motion detection gate: startup and every runtime start | Event/photo cleanup and stored user preferences |
 | `MOTION_CLEANUP_ENABLED` | Expired motion event/photo removal | Detection itself |
+| `STARTUP_WARMUP_ENABLED` / `STARTUP_WARMUP_TIMEOUT_SECONDS` (default `10.0`) | Bounded in-process DB/HTTP warm-up at startup (no tokens, no writes; failure or timeout never blocks startup) | All workers |
+| `CLUSTER_ENABLED` (default `false`) | Multi-node mode switch: per-camera ingest and motion detection and the global workers (health check, switch sync, connection sync, Tuya events) are owned through leases (see below); session and motion cleanup are unchanged | Other workers |
+| `NODE_ID` (default empty) | Node identifier; required (non-blank) when `CLUSTER_ENABLED=true`, startup fails otherwise. With `CLUSTER_ENABLED=false` empty means hostname plus a random suffix generated once per process | Leases |
+| `NODE_ADDRESS` (default empty) | Where other nodes reach this one: `host`, `host:port` or `[ipv6]:port`. The port (default `CLUSTER_MEDIA_PORT`) is the fMP4 port, not HTTP. View proxy uses the host only | Leases, media pull, view proxy |
+| `LEASE_TTL_SECONDS` (default `30`) / `LEASE_RENEW_INTERVAL_SECONDS` (default `10`) | Lease lifetime and renewal period; startup fails unless renew interval x 2 <= TTL | Workers |
+| `NODE_HEARTBEAT_INTERVAL_SECONDS` (default `10`) | Node heartbeat period | Leases |
+| `CLUSTER_MEDIA_HOST` (default `127.0.0.1`) / `CLUSTER_MEDIA_PORT` (default `4700`) | Where this node accepts fMP4 from other nodes. One TCP connection carries many cameras | `CLUSTER_ENABLED=false` (nothing listens) |
+| `CLUSTER_SECRET` (default empty) | Shared HMAC for the media handshake and for the view-proxy hop header. Empty: media accepts and dials loopback only, and the view proxy trusts `X-Zerocams-Proxied` only from a loopback connection. It does not encrypt | TLS (not implemented; bytes are plaintext) |
+| `CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS` (default `10`) | How long a pulled camera stays subscribed after the last local viewer leaves | The ingest lease |
+| `CLUSTER_VIEW_HTTP_PORT` (default `0`) | HTTP port other nodes dial when proxying HLS and WebRTC signaling. `0` uses `PORT`. Not the port inside `NODE_ADDRESS` | `CLUSTER_ENABLED=false` (no proxy) |
+| `CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS` (default `3`) / `CLUSTER_VIEW_READ_TIMEOUT_SECONDS` (default `15`) | TCP connect timeout, and how long a proxied response may stay silent. A dead owner becomes HTTP 503 instead of a hung client | The fMP4 connection |
+| `NOTIFY_ENABLED` (default `true`) | Push delivery. Off: this node never sends. On, with `CLUSTER_ENABLED=false`: the single process sends. On, with `CLUSTER_ENABLED=true`: only the node holding the `notify` lease sends | Other workers |
+| `NOTIFY_JOB_RETENTION_DAYS` (default `7`) | How long `sent` and `failed` notification jobs are kept | Delivery itself |
+| `STORAGE_BACKEND` (default `local`) | Where new motion photos are stored: `local` directory or an `s3` bucket. `s3` does not fall back to local | Reading old photos that have no object key |
+| `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | Required together when `STORAGE_BACKEND=s3`. Startup fails if any of them is empty. Path-style requests to the endpoint. Access keys are never logged | `STORAGE_BACKEND=local` |
+| `S3_REGION` (default empty) | Region used to sign S3 requests. Empty signs as `us-east-1` | The bucket name |
+
+### Multi-node mode (experimental)
+
+With `CLUSTER_ENABLED=true` a node no longer starts ingest and motion detection for every camera at startup. Instead it registers itself in the shared database (`nodes` table, refreshed every `NODE_HEARTBEAT_INTERVAL_SECONDS`) and, every `LEASE_RENEW_INTERVAL_SECONDS`, renews or acquires per-camera leases (`assignments` table) for `ingest` and `motion`. Local work for a camera runs only while the node holds its lease. Cameras are split evenly between live nodes that have the function enabled (`INGEST_ENABLED`, `MOTION_DETECTION_ENABLED`); if a node dies, its leases expire after `LEASE_TTL_SECONDS` and another node takes its cameras over. A node that cannot reach the database for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS` stops its per-camera work on its own and resumes after the database is back. Already owned cameras are not rebalanced when a node joins later. With `CLUSTER_ENABLED=false` (default) behavior is unchanged.
+
+Requirements for every node:
+
+- One shared writable database (all nodes use the same `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME`). Replication is the operator's job; multi-master writes are not supported. One node applies migrations under the MySQL lock; the others wait. See "One node, an external database, or a second node" above.
+- A unique `NODE_ID` per node, and its own `CACHE_DIR` and `INGEST_REGISTRY_DIR` (never share these between nodes).
+- `NODE_ID` is required on every node when `CLUSTER_ENABLED=true`: the settings validation fails at startup if it is empty or blank. A random id would change on every start, so the process registry of the previous run (kept under a directory named after the node id) is not found and ffmpeg processes orphaned by a crash are not reaped.
+- With `CLUSTER_ENABLED=true` and no explicit `INGEST_REGISTRY_DIR` / `HLS_TEMP_DIR`, the process registries and the HLS temp directory are placed in `<CACHE_DIR>/ingest/nodes/<NODE_ID>/` and `<HLS_TEMP_DIR>/nodes/<NODE_ID>/` (NODE_ID reduced to `[A-Za-z0-9._-]`), so two nodes on one host never reap each other's ffmpeg or clean each other's HLS files. Explicit values are used as given. Still give each node its own volume or `CACHE_DIR`; on different hosts or containers never share one.
+- Motion photos for new events are an object key `motion/<cam_id>/<filename>` plus a state (`uploading`, `ready`, `failed`). `STORAGE_BACKEND=local` (default) writes that key under `MOTION_FILES_DIR` by a temp file and `rename` in the same directory. Events saved before this change have no key and are still read and deleted from `<MOTION_FILES_DIR>/<cam_id>/<photo_filename>`. `STORAGE_BACKEND=s3` stores the same keys in a private S3-compatible bucket; `motion_cleanup` deletes them from the bucket. The API still returns `photo_filename` and does not return the object key.
+- Notifications are rows in `notification_jobs`, inserted in the same database transaction as the event that caused them. With `CLUSTER_ENABLED=false` the one process sends them. With `CLUSTER_ENABLED=true` only the node that holds the `notify` lease (`resource_id` 0) sends. That loop takes the lease itself; it is not one of the ClusterRunner global functions, but it is the same kind of right, so two nodes do not send at once. A node with `NOTIFY_ENABLED=false` never takes it. Delivery to Telegram can be repeated if a claim is lost before the provider answers. `sent` and `failed` jobs older than `NOTIFY_JOB_RETENTION_DAYS` are deleted by that loop.
+- A node that does not hold the `ingest` lease pulls that camera's fMP4 from the node that does and feeds its own hub. Snapshots, motion detection and `/stream` on the pulling node keep reading that local hub. The owning node's ingest code is unchanged: a remote viewer is an ordinary hub subscriber. The pull runs only while something on the pulling node wants the camera, and for `CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS` after the last local viewer leaves. One TCP connection to an owner carries every camera pulled from that owner. A slow peer cannot stall the owner's ffmpeg; its per-camera send buffer is capped at 8 MiB and, past that, the camera is reset to the latest init and keyframe. The fMP4 relay is not HTTP and does not carry playlists or WebRTC signaling.
+- **View routing** (`CLUSTER_ENABLED=true` only). `GET /v1/cams/{id}/hls/playlist.m3u8`, `GET /v1/cams/{id}/hls/{segment}` and the WebRTC signaling socket `/v1/cams/{id}/webrtc` are served by the node that holds the live `ingest` lease for that camera. Any other node checks the caller's token and camera access first, then proxies. Snapshots, the camera list and every other JSON route stay on the node that received them. With `CLUSTER_ENABLED=false` nothing is proxied and those routes behave as before.
+- The proxy target is `http://<host>:<CLUSTER_VIEW_HTTP_PORT or PORT>` (and `ws://` for signaling). `<host>` is the host part of the owner's `NODE_ADDRESS` (`host`, `host:port` or `[ipv6]:port`). The port written in `NODE_ADDRESS` remains the fMP4 port and is not the HTTP port. `NODE_ADDRESS` must be reachable from the other nodes on the HTTP port. WebRTC media (ICE, RTP) is produced by the owner, because signaling runs there: set that node's own `WEBRTC_PUBLIC_IP` and forward its `WEBRTC_UDP_PORT_MIN`/`MAX`. There is no address shared by every node.
+- If this node is the lease owner, or there is no live `ingest` row, or the owner's address is empty, the request is served locally. That keeps a single node working and avoids a proxy loop.
+- The proxy sets `X-Zerocams-Proxied: 1`. The owner, when it trusts that header, serves locally, does not proxy again, and does not repeat the access check or the rate limit. Trust is the TCP peer being loopback (`127.0.0.0/8`, `::1`, `localhost`, including IPv4-mapped loopback) **or** a matching HMAC: `X-Zerocams-Proxy-Sig` is hex HMAC-SHA256 of `METHOD\nPATH\nUNIX_TIMESTAMP` under `CLUSTER_SECRET`, and `X-Zerocams-Proxy-Ts` is that unix timestamp within 30 seconds. `PATH` is the URL path only, not the query. Without `CLUSTER_SECRET` only a loopback peer is trusted. A header from anywhere else is ignored: the node still checks access and proxies when it is not the owner. A non-loopback owner is not dialed without `CLUSTER_SECRET`, because the owner would ignore the hop and proxy back; the caller gets HTTP 503 instead. If the app sits behind a reverse proxy on the same machine, every external client looks like loopback — strip `X-Zerocams-Proxied`, `X-Zerocams-Proxy-Ts` and `X-Zerocams-Proxy-Sig` at that proxy.
+- The segment body is streamed through, not buffered. Status, `Content-Type` and the playlist cache headers are passed on. Playlist segment names are not rewritten to the owner's URL, so a relative name keeps the player on the node it already called (that node proxies each segment). If the TCP connection is refused or dropped, or response headers do not arrive within `CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS` + `CLUSTER_VIEW_READ_TIMEOUT_SECONDS`, the caller gets HTTP 503 with CursedJSON code `225` (`hint`: retry) and can retry. Silence after those headers have already been sent aborts the body after `CLUSTER_VIEW_READ_TIMEOUT_SECONDS`; the status line is the owner's and cannot be changed. A WebSocket upstream that never completes the handshake is the same failure: HTTP 503 when the server supports a denial response, otherwise close code 1013.
+- **No TLS yet.** Cluster media is plaintext TCP. `CLUSTER_SECRET` authenticates the handshake and does not encrypt the stream. Until TLS wraps that socket, do not run the cluster between hosts across a network you do not trust. With an empty `CLUSTER_SECRET` a node listens and connects only on loopback (`127.0.0.1`, `::1`, `localhost`); a non-loopback peer is rejected and a non-loopback dial raises, so two processes on one machine can be tested without a secret and a misconfigured node will not publish cameras onto the network. Startup fails when `CLUSTER_ENABLED=true`, `CLUSTER_MEDIA_HOST` is not loopback, and `CLUSTER_SECRET` is empty. Setting a secret allows a non-loopback listener, but the bytes are still readable by anyone who can reach the port: keep the listener on loopback until TLS exists, unless the network itself is trusted. `NODE_ADDRESS` is `host`, `host:port` or `[ipv6]:port` (the port defaults to `CLUSTER_MEDIA_PORT`).
+- Not yet covered: `session_cleanup` and `motion_cleanup` still run on every node (see below). A view request is not followed to a new owner if the lease moves after the response has started.
+
+Global functions under a single right (`resource_id` 0): `healthcheck`, `switch_sync`, `connection_sync` and `tuya_events`. With `CLUSTER_ENABLED=true` the application does not start these four at boot. Each reconcile cycle, a node whose flag is on (`HEALTHCHECK_ENABLED`, `SWITCH_SYNC_ENABLED`, `CONNECTION_SYNC_ENABLED`, `TUYA_EVENTS_ENABLED`) tries to acquire or renew the right; whoever gets it first runs the loop, a node with the flag off never takes it. If the right is lost, not renewed, or the database was unreachable for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS`, the node stops that loop; on a graceful shutdown the rights are released so another node takes over within one renew interval. There is no fair share for these (one right per function), so they can all end up on the same node.
+
+Not under a right (still run on every node whose flag is on): `session_cleanup` is idempotent, so concurrent runs are harmless. `motion_cleanup` deletes through the storage layer (the local directory, or the bucket when `STORAGE_BACKEND=s3`) and is idempotent, so it also stays per node. `notify` is a right, but its loop is separate from the four above.
+
+Limitations:
+
+- `healthcheck` keeps the last known online/offline state of each camera in memory only. After the right moves to another node, the new owner has no previous state: its first check only records the state, so one online/offline change that happened during the handover can go unreported (and no notification is repeated for the old state).
+- Camera create/update/delete on any node makes that node run an early reconcile. A camera owned by another node is picked up by its owner on the owner's next cycle (at most `LEASE_RENEW_INTERVAL_SECONDS`): ingest applies a changed URL by restarting ffmpeg, a motion session is restarted when the camera fields change, and a deleted or disabled camera is stopped and its right released. Stopping HLS/WebRTC/transcoder sessions and ONVIF cache invalidation stay local to the node that handled the request.
+
+`GET /v1/cluster` (admin only) shows the state: local `node_id`, `cluster_enabled`, nodes (address, heartbeat age, alive flag, capabilities, version), current rights (function, resource, owner, generation, seconds until expiry, expired flag) and `unassigned` - wanted per-camera and global functions with no live owner (`reason` is `no_capable_node` when no live node has the function enabled). It never returns camera URLs or credentials. With `CLUSTER_ENABLED=false` it returns `cluster_enabled=false` and empty lists.
 
 `MOTION_DETECTION_ENABLED=false` returns `started=false` from otherwise-authorized motion-start requests without querying the detector's database, loading YOLO or launching a detector. Camera/push-settings changes cannot override it. User motion preferences remain editable and are retained for a later restart with detection enabled. Existing permissions and per-camera checks still apply when enabled. Orphan-process reaping and shutdown remain available even with detection off.
 

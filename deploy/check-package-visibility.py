@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed before publication/promotion; never change package visibility."""
+"""Fail closed unless the GHCR package is public; never change visibility."""
 import json
 import os
 import sys
@@ -10,9 +10,9 @@ API = "https://api.github.com"
 PACKAGE = "/users/zerolink-m/packages/container/zerohome"
 
 
-def get(path):
+def get(path, token):
     request = urllib.request.Request(API + path, headers={
-        "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+        "Authorization": "Bearer " + token,
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     })
@@ -20,24 +20,36 @@ def get(path):
         return json.load(response)
 
 
-def verify(allow_new=False):
+def verify():
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("GH_TOKEN is required to verify GHCR package visibility; refusing release promotion.")
+
     try:
-        package = get(PACKAGE)
+        package = get(PACKAGE, token)
     except urllib.error.HTTPError as exc:
-        if exc.code != 404 or not allow_new:
-            raise SystemExit("Cannot verify private package visibility; refusing publication.") from None
-        # GitHub Container Registry creates new packages PRIVATE, independently
-        # of repository visibility (see deployment documentation). Only bootstrap
-        # from our private source repository; never infer privacy from a 403.
-        repository = get("/repos/zerolink-m/zerohome")
-        if repository.get("private") is not True:
-            raise SystemExit("New-package bootstrap requires the private source repository.")
-        print("Package absent: bootstrap SHA tag under GHCR's documented private-by-default policy; promotion requires a private visibility readback.")
-        return
-    if package.get("visibility") != "private":
-        raise SystemExit("Package is not private; refusing publication. No visibility changes are automatic.")
-    print("Verified: GHCR package visibility is private.")
+        if exc.code == 403:
+            message = "GitHub denied package visibility access. Grant the workflow token package read access; refusing release promotion."
+        elif exc.code == 404:
+            message = "GHCR package was not found or is not readable by this token; refusing release promotion."
+        else:
+            message = f"GitHub package visibility API returned HTTP {exc.code}; refusing release promotion."
+        raise SystemExit(message) from None
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"Cannot reach GitHub package visibility API ({exc.reason}); refusing release promotion.") from None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise SystemExit("GitHub returned invalid package visibility data; refusing release promotion.") from None
+
+    if not isinstance(package, dict):
+        raise SystemExit("GitHub returned an unexpected package record; refusing release promotion.")
+
+    visibility = package.get("visibility")
+    if visibility != "public":
+        raise SystemExit(f"Expected public GHCR package, API reported {visibility!r}; refusing release promotion.")
+    print("Verified: GHCR package visibility is public.")
 
 
 if __name__ == "__main__":
-    verify(allow_new=sys.argv[1:] == ["--allow-new"])
+    if len(sys.argv) != 1:
+        raise SystemExit("Usage: check-package-visibility.py")
+    verify()
