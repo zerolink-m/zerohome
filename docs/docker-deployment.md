@@ -79,9 +79,40 @@ Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), B
 
 ### Перенос настроек и ключей
 
-The application no longer reads `.env` or arbitrary runtime variables. On an upgrade, preserve the old `JWT_SECRET_SESSION` and `JWT_SECRET_SHARE` by supplying their values as `BOOTSTRAP_JWT_SECRET_SESSION` and `BOOTSTRAP_JWT_SECRET_SHARE` in the host-managed app environment **before the first startup against a database that does not yet have these settings**. Initialization copies them into `global_settings`; remove the bootstrap variables afterward. If they are omitted, new durable keys are generated, and previously issued share links or legacy refresh JWTs may stop working. Existing opaque bearer sessions use database hashes and do not need the old session signing key. The fresh-host setup generates new DB credentials, but it does not import legacy JWT keys; use the documented migration procedure instead of this fresh-install flow when preserving an existing database/session environment.
+The application never reads a legacy `.env` automatically. To explicitly transfer runtime settings from an existing dotenv-format file, first complete the database migration and start the app once so its persisted node identity is registered. From `/opt/zerohome`, use the same Compose env file and definition as the deployment commands above. Set `LEGACY_FILE` to the protected legacy file's host path; do not change its permissions or copy it over the deployment `.env`. `docker cp` can read a root-only source through the Docker daemon, and the temporary copy is handled only inside the container as root. The app normally runs as UID 10001.
 
-Other former `.env` runtime options are not imported automatically. Configure global settings and per-node paths/capabilities in the database after startup. The first user created by registration has role `user`; create the first administrator only through the operator bootstrap command described above. No public self-promotion flow is provided.
+```sh
+cd /opt/zerohome
+compose=(docker compose --env-file /etc/zerohome/deployment.conf -f templates/compose.yaml)
+LEGACY_FILE=/path/to/protected/legacy.env
+app_id=$("${compose[@]}" ps -q app)
+test -n "$app_id"
+docker cp "$LEGACY_FILE" "$app_id":/tmp/zerohome-legacy-import.env
+"${compose[@]}" exec --user 0 -T app python -m deploy.import_legacy_settings --source /tmp/zerohome-legacy-import.env
+```
+
+Review the dry-run counts and setting names; the command does not print values. If they are correct, apply and remove the temporary copy even if the import fails:
+
+```sh
+cd /opt/zerohome
+compose=(docker compose --env-file /etc/zerohome/deployment.conf -f templates/compose.yaml)
+app_id=$("${compose[@]}" ps -q app)
+test -n "$app_id"
+set +e
+"${compose[@]}" exec --user 0 -T app python -m deploy.import_legacy_settings --source /tmp/zerohome-legacy-import.env --apply
+import_status=$?
+"${compose[@]}" exec --user 0 -T app rm -f /tmp/zerohome-legacy-import.env
+cleanup_status=$?
+if [ "$cleanup_status" -ne 0 ]; then
+  echo "Could not remove temporary legacy import copy; remove /tmp/zerohome-legacy-import.env from app container $app_id as root." >&2
+fi
+if [ "$import_status" -ne 0 ]; then exit "$import_status"; fi
+if [ "$cleanup_status" -ne 0 ]; then exit "$cleanup_status"; fi
+```
+
+The importer inherits the app process's `DB_*` environment, validates values through `Settings`, and ignores database, listener, unknown, and other bootstrap fields. It refuses to apply if `system_settings.revision` is nonzero; that revision advances to `1` after a successful import, so an import cannot be repeated or overwrite configuration after an API edit. Keep the protected host source as your backup; the temporary container copy is removed by the command above. Restart the app after an applied import to load the database values. Do not set runtime fields as environment variables as a substitute: normal startup ignores them.
+
+The first user created by registration has role `user`; create the first administrator only through `docker compose exec -it app python -m deploy.bootstrap_admin` after the app health check. This operator-only command prompts for the password and refuses to run if an admin already exists. No public self-promotion flow is provided.
 
 3. Explicitly pull MySQL for first installation, then use the migration-aware deploy script:
 
@@ -230,7 +261,7 @@ If startup or smoke checks fail, first `"${compose[@]}" stop -t 60 app` and veri
 
 ## Per-task controls
 
-Settings are loaded from the database at process startup. Admins can inspect and update global settings through `GET/PATCH /v1/config/runtime`, and node-local settings/capabilities through `GET/PATCH /v1/config/runtime/nodes/{node_id}`; changes require restarting the affected app process. Runtime reads redact all secret-like settings, including deprecated keys. A worker runs only when its global switch and the local node capability are both enabled. Newly registered nodes start with all implemented capabilities enabled; this does not mean that every worker is assigned a cluster lease. The first-admin prerequisite above remains unresolved for a fresh deployment. The settings map is:
+Settings are loaded from the database at process startup. Admins can inspect and update global settings through `GET/PATCH /v1/config/runtime`, and node-local settings/capabilities through `GET/PATCH /v1/config/runtime/nodes/{node_id}`; changes require restarting the affected app process. Runtime reads redact all secret-like settings, including deprecated keys. A worker runs only when its global switch and the local node capability are both enabled. Newly registered nodes start with all implemented capabilities enabled; this does not mean that every worker is assigned a cluster lease. The first administrator is created with the `deploy.bootstrap_admin` operator command described above. The settings map is:
 
 | Setting | Controls | Independent of |
 | --- | --- | --- |
