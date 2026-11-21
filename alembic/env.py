@@ -9,7 +9,7 @@ from alembic import context
 from app.core.config import settings
 from app.db.base import Base
 from app.db import migration_impl  # noqa: F401  (register the wider MySQL version table)
-from app.models import cams, connection, invitation, session, sharing, switch, user  # noqa: F401  (register models on Base.metadata)
+from app.models import cams, connection, invitation, runtime_config, session, sharing, switch, user  # noqa: F401  (register models on Base.metadata)
 
 config = context.config
 

@@ -556,7 +556,7 @@ def _lazy_hub() -> IngestHub:
 
 def _lazy_node_id(settings: Any) -> str:
     from app.services.cluster.identity import get_node_id
-    return get_node_id(settings)
+    return get_node_id()
 
 
 _server: MediaServer | None = None

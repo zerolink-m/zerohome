@@ -28,6 +28,7 @@ class Node(Base):
     started_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
     heartbeat_at: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
     capabilities: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    configuration: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     address: Mapped[str | None] = mapped_column(String(255), nullable=True)
     version: Mapped[str] = mapped_column(String(64), nullable=False, default="")
 

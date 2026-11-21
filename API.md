@@ -332,6 +332,47 @@ OPTIONS на неизвестный путь — `083` (404). OPTIONS учиты
 | GET | `/v1/config/frontend` | — | `data.config = {version}` — версия приложения | — |
 | GET | `/v1/config/frontend/supported_streams` | — | `data.streams[]` — доступные форматы стриминга | — |
 | GET | `/v1/config/time` | — | `data.time` — текущее время UTC, unix timestamp (целое, секунды). Открытый, без токена; rate limit `config_time` 20 / 120 | `173` |
+| GET | `/v1/config/runtime` | — | Глобальные настройки из БД: `data.revision`, `data.settings`, `data.secret_fields` | `042`, `050` |
+| PATCH | `/v1/config/runtime` | Request object `data.runtime.settings` | Сохраняет разрешённые глобальные настройки; `data.revision`, `data.restart_required=true` | `042`, `050`, `040`, `109` |
+| GET | `/v1/config/runtime/nodes/{node_id}` | — | Настройки и capabilities ноды; секреты скрыты | `042`, `050`, `040` |
+| PATCH | `/v1/config/runtime/nodes/{node_id}` | Request object `data.runtime.settings` и/или `data.runtime.capabilities` | Сохраняет настройки ноды и локальные capability-политики; `data.revision`, `data.restart_required=true` | `042`, `050`, `040`, `109` |
+
+Runtime-конфигурация доступна только `admin`-сессии. PATCH принимает стандартный cursedapi Request object, как и остальные PATCH endpoints; прямой объект без `data.runtime` не поддерживается. Изменения в БД применяются при перезапуске процесса, поэтому PATCH всегда возвращает `restart_required: true`. GET глобальных и локальных настроек никогда не раскрывает значения секретных полей: для них возвращается только `{"configured": true|false}`; список имён глобальных секретов находится в `secret_fields`. При PATCH секрет можно передать обычным значением в теле запроса, но его не следует включать в логи.
+
+Глобальный PATCH:
+
+```json
+{
+  "data": {
+    "runtime": {
+      "settings": {
+        "MOTION_DETECTION_ENABLED": false,
+        "JWT_SECRET_SHARE": "<новый секрет>"
+      }
+    }
+  },
+  "options": {"partial_allowed": false}
+}
+```
+
+Локальный PATCH ноды:
+
+```json
+{
+  "data": {
+    "runtime": {
+      "settings": {"CACHE_DIR": "/srv/zerohome/cache"},
+      "capabilities": {
+        "motion": {"enabled": false, "capacity": 0}
+      }
+    }
+  }
+}
+```
+
+В `settings` разрешены только соответствующие глобальные или node-local ключи. В `capabilities` разрешены зарегистрированные для этой ноды имена, с полями `enabled` и/или `capacity`.
+
+Успешные PATCH-ответы имеют `data = {"revision": <номер>, "restart_required": true}`. GET `/runtime` возвращает `data = {"revision": <номер>, "settings": {...}, "secret_fields": [...]}`; GET `/runtime/nodes/{node_id}` возвращает `data = {"node": {"node_id", "address", "heartbeat_at", "version"}, "settings": {...}, "capabilities": {"<имя>": {"supported", "enabled", "capacity"}}}`. Во всех ответах-envelope также присутствуют стандартные `code`, `code_detail`, `error` и `metadata`.
 
 ### Логика версий фронтенда (`GET /v1/config?v=vM.m.p-Channel`)
 

@@ -1,40 +1,80 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from urllib.parse import quote_plus, urlsplit
 
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, PrivateAttr, model_validator
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
-    """Application configuration, loaded from environment / .env.
+    """Runtime configuration defaults plus DB connection bootstrap values.
 
-    Only the legacy-refresh and share JWT secrets remain required. Existing
-    access JWT settings are accepted for older deployments but never used to
-    authenticate requests. Everything else has a sensible default.
+    Runtime fields provide first-start defaults and are then hydrated from the
+    database. Environment input is limited to DB connectivity, initial image
+    storage paths, and explicitly prefixed one-time secret imports.
     """
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # Runtime fields are hydrated from the database during application startup.
+    model_config = SettingsConfigDict(env_file=None, env_prefix="BOOTSTRAP_", extra="ignore")
+
+    _node_capabilities: dict[str, bool] = PrivateAttr(default_factory=dict)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Allow DB values and seed paths only; never load dotenv files."""
+        db_fields = {
+            "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME",
+            "DB_READ_TIMEOUT_SECONDS", "DB_WRITE_TIMEOUT_SECONDS",
+        }
+        initial_node_defaults = {"CACHE_DIR", "MOTION_FILES_DIR"}
+
+        def bootstrap_environment() -> dict:
+            # Explicit process-only import path. Dotenv sources are deliberately
+            # excluded, so legacy secrets are never read from a mounted .env.
+            values = {}
+            for key in db_fields | initial_node_defaults | {"HOST", "PORT"}:
+                value = os.environ.get(f"BOOTSTRAP_{key}", os.environ.get(key))
+                if value is not None:
+                    values[key] = value
+            for key in ("JWT_SECRET_SESSION", "JWT_SECRET_SHARE"):
+                value = os.environ.get(f"BOOTSTRAP_{key}")
+                if value is not None:
+                    values[key] = value
+            return values
+
+        return init_settings, bootstrap_environment
 
     # --- database ---
-    DB_HOST: str = "127.0.0.1"
-    DB_PORT: int = 3306
-    DB_USER: str = "zerocams"
-    DB_PASSWORD: str
-    DB_NAME: str = "zerocams"
+    DB_HOST: str = Field(default="127.0.0.1", validation_alias=AliasChoices("DB_HOST", "BOOTSTRAP_DB_HOST"))
+    DB_PORT: int = Field(default=3306, validation_alias=AliasChoices("DB_PORT", "BOOTSTRAP_DB_PORT"))
+    DB_USER: str = Field(default="zerocams", validation_alias=AliasChoices("DB_USER", "BOOTSTRAP_DB_USER"))
+    DB_PASSWORD: str = Field(default="", repr=False, validation_alias=AliasChoices("DB_PASSWORD", "BOOTSTRAP_DB_PASSWORD"))
+    DB_NAME: str = Field(default="zerocams", validation_alias=AliasChoices("DB_NAME", "BOOTSTRAP_DB_NAME"))
     # Seconds a pooled connection may wait on a silent MySQL. asyncmy.connect
     # accepts read_timeout (queries and pool pre-ping share that read). It does
     # not accept write_timeout; that value is forwarded only if the installed
     # driver grows the argument. See app/db/session.py.
-    DB_READ_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
-    DB_WRITE_TIMEOUT_SECONDS: int = Field(default=30, gt=0)
+    DB_READ_TIMEOUT_SECONDS: int = Field(
+        default=30, gt=0, validation_alias=AliasChoices("DB_READ_TIMEOUT_SECONDS", "BOOTSTRAP_DB_READ_TIMEOUT_SECONDS")
+    )
+    DB_WRITE_TIMEOUT_SECONDS: int = Field(
+        default=30, gt=0, validation_alias=AliasChoices("DB_WRITE_TIMEOUT_SECONDS", "BOOTSTRAP_DB_WRITE_TIMEOUT_SECONDS")
+    )
 
     # --- JWT: share links and previously issued refresh tokens only ---
-    JWT_SECRET_SESSION: str
-    JWT_SECRET_SHARE: str
+    JWT_SECRET_SESSION: str = Field(default="", repr=False)
+    JWT_SECRET_SHARE: str = Field(default="", repr=False)
     JWT_ALGORITHM: str = "HS256"
     # Deprecated configuration, retained to accept existing deployment env files.
     JWT_SECRET_ACCESS: str = ""
@@ -42,8 +82,8 @@ class Settings(BaseSettings):
 
     # --- legacy refresh signing (expiry itself is in the signed JWT) ---
     SESSION_TOKEN_TTL_SECONDS: int = 86400
-    SHARE_TOKEN_MIN_TTL_SECONDS: int
-    SHARE_TOKEN_MAX_TTL_SECONDS: int
+    SHARE_TOKEN_MIN_TTL_SECONDS: int = 60
+    SHARE_TOKEN_MAX_TTL_SECONDS: int = 3600
 
     # --- push (Telegram) ---
     TELEGRAM_API_BASE: str = "https://api.telegram.org"
@@ -102,7 +142,6 @@ class Settings(BaseSettings):
 
     # --- multi-node: node identity and leases (stage 1; nothing consumes these yet) ---
     CLUSTER_ENABLED: bool = False
-    NODE_ID: str = ""  # required when CLUSTER_ENABLED; otherwise empty -> hostname + random suffix, see app.services.cluster.identity.get_node_id()
     NODE_ADDRESS: str = ""
     LEASE_TTL_SECONDS: int = 30
     LEASE_RENEW_INTERVAL_SECONDS: int = 10
@@ -159,7 +198,6 @@ class Settings(BaseSettings):
     NOTIFY_JOB_RETENTION_DAYS: int = 7
     HOST: str = "0.0.0.0"
     PORT: int = 8000
-    VERSION: str = "v0.0.0-Alpha"
 
     # --- logging ---
     LOGGING_LEVEL: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -176,11 +214,6 @@ class Settings(BaseSettings):
             raise ValueError("LEASE_RENEW_INTERVAL_SECONDS and NODE_HEARTBEAT_INTERVAL_SECONDS must be >= 1")
         if self.LEASE_RENEW_INTERVAL_SECONDS * 2 > self.LEASE_TTL_SECONDS:
             raise ValueError("LEASE_RENEW_INTERVAL_SECONDS * 2 must be <= LEASE_TTL_SECONDS")
-        if self.CLUSTER_ENABLED and not (self.NODE_ID or "").strip():
-            raise ValueError(
-                "NODE_ID must be set explicitly when CLUSTER_ENABLED=true: a random id changes on every "
-                "start, so orphaned processes of the previous run are not cleaned up"
-            )
         if self.CLUSTER_ENABLED:
             media_host = (self.CLUSTER_MEDIA_HOST or "").strip()
             if not media_host:
@@ -240,7 +273,7 @@ class Settings(BaseSettings):
             return base
         from app.services.cluster.identity import get_node_id, safe_node_dir_name
 
-        return base / "nodes" / safe_node_dir_name(get_node_id(self))
+        return base / "nodes" / safe_node_dir_name(get_node_id())
 
     @property
     def ingest_registry_path(self) -> str:

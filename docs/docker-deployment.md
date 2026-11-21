@@ -1,20 +1,20 @@
-# Private Docker deployment and background tasks
+# Docker deployment and background tasks
 
 This is an **opt-in deployment to a Docker host**, not an automatic conversion of an existing systemd installation or database. Nothing here installs a timer, moves data, or starts containers on the current server. Keep the existing production service until a separately planned migration/cutover.
 
 ## Image and publication
 
-- Image: `ghcr.io/zerolink-m/zerohome:stable` (private GHCR package owned by the **user** `zerolink-m`).
+- Image: `ghcr.io/zerolink-m/zerohome:stable` (public GHCR package owned by the **user** `zerolink-m`).
 - `.github/workflows/docker-release.yml` builds `linux/amd64` on Ubuntu 24.04. `workflow_dispatch` and pushes to `release/docker-task-controls` validate builds **without publishing**. GitHub requires a workflow to be on the default branch before it can be manually dispatched; the branch-push trigger permits first-build validation before merging.
-- A published GitHub Release builds and pushes `sha-<full-commit-sha>`, verifies package privacy, then promotes that exact digest to the lower-case release tag. `v4.5.0-Release` becomes `v4.5.0-release`; the image's `VERSION` retains the original release string. Only a release not marked prerelease moves `stable`. A prerelease gets its version tag but never `stable`.
+- A published GitHub Release builds and pushes `sha-<full-commit-sha>`, verifies the package is public, then promotes that exact digest to the lower-case release tag. A release not marked prerelease moves `stable`; prereleases get a version tag but never `stable`.
 - Releases are serialized, not cancelled mid-publication. Publishing an older release later deliberately moves `stable` to that release; publish in intended deployment order. A failed build/privacy check never promotes `stable`.
 - Publishing uses only the workflow's `GITHUB_TOKEN` with `contents: read` and `packages: write`; no publishing PAT or deployment-server secrets are required. The OCI source label links the image to `https://github.com/zerolink-m/zerohome`. If an existing package does not grant this repository Actions access, grant it in package settings rather than bypassing the check.
 
-### Privacy is checked, never changed automatically
+### Package visibility is checked, never changed automatically
 
-Before pushing, the workflow reads `GET /users/zerolink-m/packages/container/zerohome`. Existing packages must be `private`; public/internal packages, authorization failures and unexpected responses stop publication. A real 404 allows initial SHA-only publication only after verifying the source repository is private, under [GHCR's documented rule that first-published packages default to private](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry). Immediately after publication, a successful API read reporting `visibility: private` is mandatory before creating release or stable tags. The workflow never requests a visibility change. If readback is temporarily unavailable, it fails closed; investigate and rerun, rather than assuming success.
+Before publishing tags, the workflow reads `GET /users/zerolink-m/packages/container/zerohome` and requires `visibility: public`. Missing packages, non-public visibility, authorization failures and unexpected responses stop publication. The workflow never changes package visibility. If readback is temporarily unavailable, it fails closed; investigate and rerun, rather than assuming success.
 
-After the first release, the owner should independently confirm **Private** in the package settings before deploying. Repository privacy alone is not proof of an existing package's privacy. If an administrator later changes visibility, the next workflow refuses to publish; that cannot retroactively undo an external visibility change.
+The image can be pulled anonymously. If an administrator changes visibility away from public, the next workflow refuses to publish; this check cannot undo an external visibility change.
 
 ### Build characteristics
 
@@ -26,9 +26,27 @@ This is a CPU image, not a GPU-enabled or ARM build. Native dependencies and ML 
 
 ## First deployment on the target host
 
+For a genuinely fresh Debian/Ubuntu amd64 host, the supported interactive path is:
+
+```sh
+git clone https://github.com/zerolink-m/zerohome.git
+cd zerohome
+sudo bash deploy/setup.sh
+```
+
+The script fails closed if `/opt/zerohome`, ZeroHome config files/systemd updater units, or an active Compose project already exists. It does not merge or overwrite an existing deployment. `--dry-run` prints the planned work without changing the host. It installs Docker from Docker's official distro-specific apt repository only when Docker is absent; conflicting packages are left untouched and require operator resolution. Only Debian/Ubuntu amd64 is supported by the published image. The setup itself has not been exercised on a separate clean host; do not treat this documentation as evidence of a live fresh-host installation.
+
+The setup is fail-safe rather than a transactional host rollback: if it stops after creating `/opt/zerohome` or `/etc/zerohome` (for example, because an external DB credential was wrong), it leaves those files and any initialized volumes intact. Do not delete them and blindly rerun. Correct the root-only config after reviewing it, then continue with the matching Compose command and `deploy/update.sh`; if a migration may have started, inspect its status before retrying.
+
+The installer prompts for built-in MySQL or an external MySQL service, creates `/etc/zerohome/deployment.conf` and `app.conf` with mode `0600`, and never prints generated/database passwords. It copies committed checkout files to `/opt/zerohome` (not ignored local files), then uses the shipped `deploy/update.sh`; it does not invoke bare `docker compose up` or bypass the migration lock. Built-in MySQL's update timer is enabled only after migration, health check, and first-admin creation succeed. For an external DB, initial migration requires explicit confirmation of a backup. Unattended updates/migrations remain disabled unless the operator separately confirms the external backup and maintenance process.
+
+After the app health check, the installer runs `docker compose exec -it app python -m deploy.bootstrap_admin`. Enter the first administrator details in the terminal; the password is hidden and never supplied as a command-line argument. This is an operator-only command inside the already-running app container, not a public endpoint. It serializes against other bootstrap attempts using `system_settings` and refuses to run if an admin exists. Registration continues to create only ordinary users. Keep the service on its default loopback bind until a reverse proxy with TLS and WebSocket support is ready.
+
+For manual deployment or an already-prepared host, continue with the detailed steps below.
+
 Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), Bash, `flock`, gzip and Python 3. Docker access is root-equivalent. Use a dedicated trusted operator. Put this checkout (including `templates/compose.yaml` and `deploy/`) at `/opt/zerohome`; if you use another location, adjust the service unit accordingly.
 
-1. Authenticate **as the same OS user that runs the updater**. Use an account with package access and a GitHub PAT (classic) with `read:packages`, SSO-authorized if applicable. Do not place the token in this repository or a command-line argument:
+1. The published `ghcr.io/zerolink-m/zerohome` package is public, so a fresh installation can pull it anonymously. For a private fork/package, authenticate as the same OS user that runs the updater, using a GitHub PAT with `read:packages`; do not place that token in this repository or a command-line argument:
 
    ```sh
    read -rs GHCR_TOKEN
@@ -50,18 +68,20 @@ Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), B
    ZEROHOME_IMAGE=ghcr.io/zerolink-m/zerohome:stable
    ```
 
-   `/etc/zerohome/app.conf` supplies application settings (choose appropriate TTLs and preserve existing signing secrets when migrating an installation):
+   `/etc/zerohome/app.conf` is passed into the container as process environment. Application runtime configuration is stored in the database; these two explicitly named bootstrap values import existing signing keys once when the database does not yet contain them:
 
    ```ini
-   JWT_SECRET_SESSION=REPLACE_WITH_RANDOM_SESSION_SIGNING_SECRET
-   JWT_SECRET_SHARE=REPLACE_WITH_DIFFERENT_RANDOM_SHARE_SIGNING_SECRET
-   SHARE_TOKEN_MIN_TTL_SECONDS=60
-   SHARE_TOKEN_MAX_TTL_SECONDS=86400
-   MOTION_DETECTION_ENABLED=true
-   MOTION_CLEANUP_ENABLED=true
+   BOOTSTRAP_JWT_SECRET_SESSION=EXISTING_SESSION_SIGNING_SECRET_IF_MIGRATING
+   BOOTSTRAP_JWT_SECRET_SHARE=EXISTING_SHARE_SIGNING_SECRET_IF_MIGRATING
    ```
 
-   These examples are documentation, not generated environment files. Compose sets the internal database host/password and port explicitly; MySQL root credentials are not injected into the app. Use Compose-compatible quoting if values contain special characters. The container entrypoint always restores `VERSION` from a build-time version file, so even a stale `VERSION` copied from an existing host configuration cannot override the running image's release version.
+   These examples are documentation, not generated environment files. Compose sets the internal database host/password and port explicitly; MySQL root credentials are not injected into the app. Use Compose-compatible quoting if values contain special characters. Remove the bootstrap signing values after the first successful initialization; the DB copy is then authoritative. `VERSION` is removed from the app process environment; `APP_VERSION` comes from `app/version.py`. Never copy actual secret values into documentation, command output, or logs.
+
+### Перенос настроек и ключей
+
+The application no longer reads `.env` or arbitrary runtime variables. On an upgrade, preserve the old `JWT_SECRET_SESSION` and `JWT_SECRET_SHARE` by supplying their values as `BOOTSTRAP_JWT_SECRET_SESSION` and `BOOTSTRAP_JWT_SECRET_SHARE` in the host-managed app environment **before the first startup against a database that does not yet have these settings**. Initialization copies them into `global_settings`; remove the bootstrap variables afterward. If they are omitted, new durable keys are generated, and previously issued share links or legacy refresh JWTs may stop working. Existing opaque bearer sessions use database hashes and do not need the old session signing key. The fresh-host setup generates new DB credentials, but it does not import legacy JWT keys; use the documented migration procedure instead of this fresh-install flow when preserving an existing database/session environment.
+
+Other former `.env` runtime options are not imported automatically. Configure global settings and per-node paths/capabilities in the database after startup. The first user created by registration has role `user`; create the first administrator only through the operator bootstrap command described above. No public self-promotion flow is provided.
 
 3. Explicitly pull MySQL for first installation, then use the migration-aware deploy script:
 
@@ -75,13 +95,13 @@ Requirements: Linux amd64, Docker Engine + modern Compose v2/v5 (`up --wait`), B
 
    Run all Docker commands under the authenticated operator (omit `sudo` if already root). The updater pulls the application, pins its digest, starts/waits for the existing or freshly initialized DB without upgrading it, stops the app, backs up the database, runs `alembic upgrade head` while holding MySQL `GET_LOCK('zerohome_migrate')` (`deploy/migrate_locked.py`) in a single disposable `migrate` container, and only then starts/waits for the app. Initial deployment also takes a backup of the newly initialized empty database. The app image itself never runs migrations at startup. **Use the script, not a bare `docker compose up -d app`, to deploy or update.** The maintenance-profile migrate service is not a continuously running replica.
 
-The built-in file runs one app container. More than one node is the external-database layout below; camera work is then leased instead of started for every camera on every node. The container runs as UID/GID 10001, drops capabilities and uses an init process for child reaping. Named volumes persist MySQL data, motion event photos and OCR/model state. Cache/process registries and temporary media are disposable tmpfs. Never run `docker compose down -v` on a live installation. A healthcheck is HTTP **liveness**, not proof of camera reachability or database correctness; DB health and migration success are checked separately by deployment.
+The built-in file runs one app container. More than one node is the external-database layout below; camera work is then leased instead of started for every camera on every node. The container runs as UID/GID 10001, drops capabilities and uses an init process for child reaping. Named volumes persist MySQL data, motion event photos, OCR/model state, and node identity (`/data/zerocams`) independently. Cache/process registries and temporary media are disposable tmpfs. Never run `docker compose down -v` on a live installation. A healthcheck is HTTP **liveness**, not proof of camera reachability or database correctness; DB health and migration success are checked separately by deployment.
 
 The HTTP port is loopback-only by default; terminate HTTPS in a reverse proxy with WebSocket support and appropriate streaming timeouts. MySQL has no published host port. Camera RTSP/ONVIF addresses must be reachable from the Docker bridge network. WebRTC needs explicit UDP routing: choose `WEBRTC_UDP_PORT_MIN/MAX`, set `WEBRTC_PUBLIC_IP` and publish/forward the same UDP range in a local Compose override; HTTP proxying alone is insufficient. Supply that override explicitly in the updater's Compose command if used (the shipped script reads `templates/compose.yaml`, or `templates/compose.external-db.yaml` when `ZEROHOME_EXTERNAL_DB=1`, and no further file). Review firewall/NAT and STUN/TURN client settings for the target host; do not assume the existing host configuration automatically transfers into bridge networking.
 
 ## One node, an external database, or a second node
 
-Node identity and cluster settings are not hardcoded. `templates/compose.yaml` and `templates/compose.external-db.yaml` pass `NODE_ID`, `NODE_ADDRESS`, `CLUSTER_ENABLED`, `CLUSTER_SECRET`, `CLUSTER_MEDIA_HOST`, `CLUSTER_MEDIA_PORT`, `STORAGE_BACKEND` and `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` from the Compose environment (the deployment env file or `export`). Those entries override the application env file. Put them there, not only in `app.conf`. Unset booleans and integers use the app defaults (`CLUSTER_ENABLED=false`, media on `127.0.0.1:4700`, `STORAGE_BACKEND=local`) because an empty string fails startup. `MIGRATE_LOCK_TIMEOUT_SECONDS` (default 300) is how long a node waits for the migration lock.
+Node identity, cluster settings, storage integration and node capabilities are DB-managed. Compose only supplies database bootstrap credentials, the listener bind (`HOST`/`PORT`) and initial container paths that seed the first node's local settings. Later edits to those paths belong in the database. The named identity volume preserves the generated node ID across container recreation. `MIGRATE_LOCK_TIMEOUT_SECONDS` (default 300) is a migration-tool option, not an app runtime setting.
 
 ### One node, built-in database
 
@@ -103,7 +123,7 @@ The script then uses `templates/compose.external-db.yaml`. It does not start a d
 
 Every node uses the external file and the same writable database. Replication is the operator's job. The application needs one writer for leases, notification jobs and sessions. It does not support multi-master writes. Read replicas are not used.
 
-On each node set a unique stable `NODE_ID`, that node's own `NODE_ADDRESS` (`host`, `host:port` or `[ipv6]:port`), `CLUSTER_ENABLED=true`, and `CLUSTER_SECRET` (required when the media listener is not loopback; it authenticates the handshake and does not encrypt). Publish the fMP4 port and the HTTP port yourself; neither Compose file opens 4700. Give each node its own cache volume. Do not share one.
+After first startup, configure cluster mode and that node's own `NODE_ADDRESS` (`host`, `host:port` or `[ipv6]:port`) in the DB. The identity is generated and persisted in that node's dedicated named volume. Set the shared `CLUSTER_SECRET` in DB configuration when the media listener is not loopback; it authenticates the handshake but does not encrypt. Publish the fMP4 port and the HTTP port yourself; neither Compose file opens 4700. Give each node its own cache volume. Do not share one.
 
 Exactly one node migrates. On that node leave `ZEROHOME_MIGRATE` unset or set it to `1`, with `ZEROHOME_EXTERNAL_DB=1`. On every other node:
 
@@ -145,7 +165,7 @@ Moving an existing production DB into the Compose volume is **not** performed by
 
 Inspected host settings: systemd runs `/opt/zerocams/main.py` as root, with working directory `/opt/zerocams` and `KillMode=control-group`; HTTP binds `0.0.0.0:3805`, MySQL is `127.0.0.1:3306`, WebRTC uses UDP `49152–65535`. Host networking retains these routes and the existing firewall/NAT rules; Docker port publishing is deliberately absent. It also exposes the container to host-network services: this is not bridge-network isolation.
 
-The unchanged `/opt/zerocams/.env` is supplied via `env_file`; credentials, signing keys, worker flags and WebRTC settings remain there. Only container storage paths and the inspected HTTP bind are overridden. The image entrypoint restores the release `VERSION` from `/usr/local/share/zerohome-version`, ignoring a stale value in `.env`. If the host bind/port is deliberately changed later, update both Compose environment and healthcheck.
+The existing `/opt/zerocams/.env` is not read by the new Settings source. Transfer DB connection values to the host-managed container environment, and import existing signing keys with the `BOOTSTRAP_JWT_SECRET_*` names before the new app's first startup against a database without runtime settings (see above). Runtime settings move to the DB. If the host bind/port is deliberately changed later, update both Compose environment and healthcheck.
 
 ### Storage and privilege choices
 
@@ -160,7 +180,7 @@ The unchanged `/opt/zerocams/.env` is supplied via `env_file`; credentials, sign
 
 First verify a current recoverable host-MySQL backup plus photos/config backup, and that the chosen release is compatible with the existing schema **without migration**. If not, stop here and plan a separate schema change. Build the reviewed final release commit into `zerohome-host:v4.5.0-release`, with `--build-arg VERSION=v4.5.0-Release`, from an isolated checkout of that immutable commit. Do not merely retag `zerohome-release-check:v4.5.0-release`: it may predate the final fixes. Record the source commit and resulting image ID; do not overwrite the tag during cutover.
 
-Use the explicit file and an empty Compose interpolation env file every time. The service's `env_file` still loads `/opt/zerocams/.env`. Do not print `docker compose config`, container environment, raw logs, SQL rows or camera URLs; use quiet validation or narrow output instead. Do not source `.env` in a shell. Before stopping systemd, compare resolved environment values to the existing Python dotenv parser in-memory without printing values (especially if secrets contain `$` or quoting).
+Use the explicit file and an empty Compose interpolation env file every time. The service's `env_file` injects `/opt/zerocams/.env` into the process, but the new Settings source intentionally ignores ordinary application runtime keys from it. Do not print `docker compose config`, container environment, raw logs, SQL rows or camera URLs; use quiet validation or narrow output instead. Do not source `.env` in a shell. Before stopping systemd, transfer required bootstrap values using protected host-managed configuration and keep signing-key values out of output.
 
 Read-only preflight, safe output:
 
@@ -210,58 +230,54 @@ If startup or smoke checks fail, first `"${compose[@]}" stop -t 60 app` and veri
 
 ## Per-task controls
 
-Settings are read at process startup. Edit the host's application configuration and restart/redeploy to change them; there is no unauthenticated runtime administration endpoint. New flags default to `true`, preserving existing behavior:
+Settings are loaded from the database at process startup. Admins can inspect and update global settings through `GET/PATCH /v1/config/runtime`, and node-local settings/capabilities through `GET/PATCH /v1/config/runtime/nodes/{node_id}`; changes require restarting the affected app process. Runtime reads redact all secret-like settings, including deprecated keys. A worker runs only when its global switch and the local node capability are both enabled. Newly registered nodes start with all implemented capabilities enabled; this does not mean that every worker is assigned a cluster lease. The first-admin prerequisite above remains unresolved for a fresh deployment. The settings map is:
 
 | Setting | Controls | Independent of |
 | --- | --- | --- |
-| `SESSION_CLEANUP_ENABLED` | Expired session row cleanup | Authentication and expiry checks |
-| `HEALTHCHECK_ENABLED` | Periodic camera reachability checks/status notifications | HTTP container liveness check |
-| `SWITCH_SYNC_ENABLED` | Switch polling | Tuya event consumer |
-| `CONNECTION_SYNC_ENABLED` | Connection/device synchronization polling | Switch polling and Tuya event consumer |
-| `TUYA_EVENTS_ENABLED` | Real-time Tuya/Pulsar consumers | Polling workers |
-| `MOTION_DETECTION_ENABLED` | Global motion detection gate: startup and every runtime start | Event/photo cleanup and stored user preferences |
-| `MOTION_CLEANUP_ENABLED` | Expired motion event/photo removal | Detection itself |
-| `STARTUP_WARMUP_ENABLED` / `STARTUP_WARMUP_TIMEOUT_SECONDS` (default `10.0`) | Bounded in-process DB/HTTP warm-up at startup (no tokens, no writes; failure or timeout never blocks startup) | All workers |
-| `CLUSTER_ENABLED` (default `false`) | Multi-node mode switch: per-camera ingest and motion detection and the global workers (health check, switch sync, connection sync, Tuya events) are owned through leases (see below); session and motion cleanup are unchanged | Other workers |
-| `NODE_ID` (default empty) | Node identifier; required (non-blank) when `CLUSTER_ENABLED=true`, startup fails otherwise. With `CLUSTER_ENABLED=false` empty means hostname plus a random suffix generated once per process | Leases |
-| `NODE_ADDRESS` (default empty) | Where other nodes reach this one: `host`, `host:port` or `[ipv6]:port`. The port (default `CLUSTER_MEDIA_PORT`) is the fMP4 port, not HTTP. View proxy uses the host only | Leases, media pull, view proxy |
-| `LEASE_TTL_SECONDS` (default `30`) / `LEASE_RENEW_INTERVAL_SECONDS` (default `10`) | Lease lifetime and renewal period; startup fails unless renew interval x 2 <= TTL | Workers |
-| `NODE_HEARTBEAT_INTERVAL_SECONDS` (default `10`) | Node heartbeat period | Leases |
-| `CLUSTER_MEDIA_HOST` (default `127.0.0.1`) / `CLUSTER_MEDIA_PORT` (default `4700`) | Where this node accepts fMP4 from other nodes. One TCP connection carries many cameras | `CLUSTER_ENABLED=false` (nothing listens) |
-| `CLUSTER_SECRET` (default empty) | Shared HMAC for the media handshake and for the view-proxy hop header. Empty: media accepts and dials loopback only, and the view proxy trusts `X-Zerocams-Proxied` only from a loopback connection. It does not encrypt | TLS (not implemented; bytes are plaintext) |
-| `CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS` (default `10`) | How long a pulled camera stays subscribed after the last local viewer leaves | The ingest lease |
-| `CLUSTER_VIEW_HTTP_PORT` (default `0`) | HTTP port other nodes dial when proxying HLS and WebRTC signaling. `0` uses `PORT`. Not the port inside `NODE_ADDRESS` | `CLUSTER_ENABLED=false` (no proxy) |
-| `CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS` (default `3`) / `CLUSTER_VIEW_READ_TIMEOUT_SECONDS` (default `15`) | TCP connect timeout, and how long a proxied response may stay silent. A dead owner becomes HTTP 503 instead of a hung client | The fMP4 connection |
-| `NOTIFY_ENABLED` (default `true`) | Push delivery. Off: this node never sends. On, with `CLUSTER_ENABLED=false`: the single process sends. On, with `CLUSTER_ENABLED=true`: only the node holding the `notify` lease sends | Other workers |
-| `NOTIFY_JOB_RETENTION_DAYS` (default `7`) | How long `sent` and `failed` notification jobs are kept | Delivery itself |
-| `STORAGE_BACKEND` (default `local`) | Where new motion photos are stored: `local` directory or an `s3` bucket. `s3` does not fall back to local | Reading old photos that have no object key |
-| `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` | Required together when `STORAGE_BACKEND=s3`. Startup fails if any of them is empty. Path-style requests to the endpoint. Access keys are never logged | `STORAGE_BACKEND=local` |
-| `S3_REGION` (default empty) | Region used to sign S3 requests. Empty signs as `us-east-1` | The bucket name |
+| DB global setting | Local node capability | Worker/effect | Cluster ownership |
+| --- | --- | --- | --- |
+| `SESSION_CLEANUP_ENABLED` | `session_cleanup` | Expired session row cleanup | Runs on each capable node; idempotent |
+| `HEALTHCHECK_ENABLED` | `healthcheck` | Periodic camera reachability checks/status notifications | One `healthcheck` lease in cluster mode |
+| `SWITCH_SYNC_ENABLED` | `switch_sync` | Switch polling | One `switch_sync` lease in cluster mode |
+| `CONNECTION_SYNC_ENABLED` | `connection_sync` | Connection/device synchronization polling | One `connection_sync` lease in cluster mode |
+| `TUYA_EVENTS_ENABLED` | `tuya_events` | Real-time Tuya/Pulsar consumers | One `tuya_events` lease in cluster mode |
+| `MOTION_DETECTION_ENABLED` | `motion` | Motion detection startup and API start requests | Per-camera leases in cluster mode |
+| `MOTION_CLEANUP_ENABLED` | `motion_cleanup` | Expired motion event/photo removal | Runs on each capable node |
+| `INGEST_ENABLED` | `ingest` | Persistent RTSP ingest | Per-camera leases in cluster mode |
+| `HLS_ENABLED` | `hls` | HLS cleanup and local HLS capability | HLS views route to the ingest owner |
+| `WEBRTC_ENABLED` | `webrtc` | WebRTC decoder cleanup and local WebRTC capability | Signaling routes to the ingest owner |
+| `NOTIFY_ENABLED` | `notify` | Notification delivery | One `notify` lease in cluster mode |
+| `CLUSTER_ENABLED` | — | Enables leases, media relay and view proxy | Global mode switch |
+| `STARTUP_WARMUP_ENABLED` / `STARTUP_WARMUP_TIMEOUT_SECONDS` | — | Bounded in-process DB/HTTP warm-up; failure/timeout never blocks startup | Local process |
+| `STORAGE_BACKEND`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION` | — | Global photo storage integration; secrets are redacted | Shared configuration |
+
+The values in this table live in the database, not in the application `.env`. Each worker requires both its global setting and the node capability to be enabled. Node paths, `NODE_ADDRESS`, cluster listener/proxy options and resource limits live in that node's DB configuration. The database connection plus listener bind (`HOST`/`PORT`) are bootstrap environment values. The identity volume is local persistent state and is never shared between nodes.
 
 ### Multi-node mode (experimental)
 
-With `CLUSTER_ENABLED=true` a node no longer starts ingest and motion detection for every camera at startup. Instead it registers itself in the shared database (`nodes` table, refreshed every `NODE_HEARTBEAT_INTERVAL_SECONDS`) and, every `LEASE_RENEW_INTERVAL_SECONDS`, renews or acquires per-camera leases (`assignments` table) for `ingest` and `motion`. Local work for a camera runs only while the node holds its lease. Cameras are split evenly between live nodes that have the function enabled (`INGEST_ENABLED`, `MOTION_DETECTION_ENABLED`); if a node dies, its leases expire after `LEASE_TTL_SECONDS` and another node takes its cameras over. A node that cannot reach the database for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS` stops its per-camera work on its own and resumes after the database is back. Already owned cameras are not rebalanced when a node joins later. With `CLUSTER_ENABLED=false` (default) behavior is unchanged.
+With `CLUSTER_ENABLED=true` a node no longer starts ingest and motion detection for every camera at startup. Instead it registers itself in the shared database (`nodes` table, refreshed every `NODE_HEARTBEAT_INTERVAL_SECONDS`) and, every `LEASE_RENEW_INTERVAL_SECONDS`, renews or acquires per-camera leases (`assignments` table) for `ingest` and `motion`. Local work for a camera runs only while the node holds its lease. Cameras are split between live nodes whose global setting and matching node capability are enabled; if a node dies, its leases expire after `LEASE_TTL_SECONDS` and another eligible node takes its cameras over. A node that cannot reach the database for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS` stops its per-camera work on its own and resumes after the database is back. Already owned cameras are not rebalanced when a node joins later. With `CLUSTER_ENABLED=false` (default) a node starts only the workers enabled both globally and for that node.
 
 Requirements for every node:
 
 - One shared writable database (all nodes use the same `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME`). Replication is the operator's job; multi-master writes are not supported. One node applies migrations under the MySQL lock; the others wait. See "One node, an external database, or a second node" above.
-- A unique `NODE_ID` per node, and its own `CACHE_DIR` and `INGEST_REGISTRY_DIR` (never share these between nodes).
-- `NODE_ID` is required on every node when `CLUSTER_ENABLED=true`: the settings validation fails at startup if it is empty or blank. A random id would change on every start, so the process registry of the previous run (kept under a directory named after the node id) is not found and ffmpeg processes orphaned by a crash are not reaped.
-- With `CLUSTER_ENABLED=true` and no explicit `INGEST_REGISTRY_DIR` / `HLS_TEMP_DIR`, the process registries and the HLS temp directory are placed in `<CACHE_DIR>/ingest/nodes/<NODE_ID>/` and `<HLS_TEMP_DIR>/nodes/<NODE_ID>/` (NODE_ID reduced to `[A-Za-z0-9._-]`), so two nodes on one host never reap each other's ffmpeg or clean each other's HLS files. Explicit values are used as given. Still give each node its own volume or `CACHE_DIR`; on different hosts or containers never share one.
+- Every node gets a stable generated identity in its own persistent identity volume. Do not share that volume between nodes or delete it during a container recreate.
+- Each node has its own DB-managed `CACHE_DIR` and `INGEST_REGISTRY_DIR` (never share these between nodes).
+- With cluster mode and no explicit `INGEST_REGISTRY_DIR` / `HLS_TEMP_DIR`, the process registries and the HLS temp directory are placed in node-specific subdirectories derived from the persistent node identity, so two nodes on one host never reap each other's ffmpeg or clean each other's HLS files. Explicit DB values are used as given. Still give each node its own volume or `CACHE_DIR`; on different hosts or containers never share one.
 - Motion photos for new events are an object key `motion/<cam_id>/<filename>` plus a state (`uploading`, `ready`, `failed`). `STORAGE_BACKEND=local` (default) writes that key under `MOTION_FILES_DIR` by a temp file and `rename` in the same directory. Events saved before this change have no key and are still read and deleted from `<MOTION_FILES_DIR>/<cam_id>/<photo_filename>`. `STORAGE_BACKEND=s3` stores the same keys in a private S3-compatible bucket; `motion_cleanup` deletes them from the bucket. The API still returns `photo_filename` and does not return the object key.
-- Notifications are rows in `notification_jobs`, inserted in the same database transaction as the event that caused them. With `CLUSTER_ENABLED=false` the one process sends them. With `CLUSTER_ENABLED=true` only the node that holds the `notify` lease (`resource_id` 0) sends. That loop takes the lease itself; it is not one of the ClusterRunner global functions, but it is the same kind of right, so two nodes do not send at once. A node with `NOTIFY_ENABLED=false` never takes it. Delivery to Telegram can be repeated if a claim is lost before the provider answers. `sent` and `failed` jobs older than `NOTIFY_JOB_RETENTION_DAYS` are deleted by that loop.
+- Notifications are rows in `notification_jobs`, inserted in the same database transaction as the event that caused them. With cluster mode off, a node sends only when its global `NOTIFY_ENABLED` and local `notify` capability are both on. With cluster mode on, only an eligible node that holds the `notify` lease (`resource_id` 0) sends. Delivery to Telegram can be repeated if a claim is lost before the provider answers. `sent` and `failed` jobs older than `NOTIFY_JOB_RETENTION_DAYS` are deleted by that loop.
 - A node that does not hold the `ingest` lease pulls that camera's fMP4 from the node that does and feeds its own hub. Snapshots, motion detection and `/stream` on the pulling node keep reading that local hub. The owning node's ingest code is unchanged: a remote viewer is an ordinary hub subscriber. The pull runs only while something on the pulling node wants the camera, and for `CLUSTER_MEDIA_UNSUBSCRIBE_GRACE_SECONDS` after the last local viewer leaves. One TCP connection to an owner carries every camera pulled from that owner. A slow peer cannot stall the owner's ffmpeg; its per-camera send buffer is capped at 8 MiB and, past that, the camera is reset to the latest init and keyframe. The fMP4 relay is not HTTP and does not carry playlists or WebRTC signaling.
 - **View routing** (`CLUSTER_ENABLED=true` only). `GET /v1/cams/{id}/hls/playlist.m3u8`, `GET /v1/cams/{id}/hls/{segment}` and the WebRTC signaling socket `/v1/cams/{id}/webrtc` are served by the node that holds the live `ingest` lease for that camera. Any other node checks the caller's token and camera access first, then proxies. Snapshots, the camera list and every other JSON route stay on the node that received them. With `CLUSTER_ENABLED=false` nothing is proxied and those routes behave as before.
+- In cluster mode the supported-stream list follows the global HLS/WebRTC settings so an ingress node can advertise and proxy those views even when its local capability is off. After proxying, the ingest owner enforces its own HLS/WebRTC capability. Leases currently select owners by `ingest`, not by HLS/WebRTC capability; the system does not reroute a view to a different node when the ingest owner has that specific stream capability disabled. That capability-aware fallback remains a separate design item.
 - The proxy target is `http://<host>:<CLUSTER_VIEW_HTTP_PORT or PORT>` (and `ws://` for signaling). `<host>` is the host part of the owner's `NODE_ADDRESS` (`host`, `host:port` or `[ipv6]:port`). The port written in `NODE_ADDRESS` remains the fMP4 port and is not the HTTP port. `NODE_ADDRESS` must be reachable from the other nodes on the HTTP port. WebRTC media (ICE, RTP) is produced by the owner, because signaling runs there: set that node's own `WEBRTC_PUBLIC_IP` and forward its `WEBRTC_UDP_PORT_MIN`/`MAX`. There is no address shared by every node.
 - If this node is the lease owner, or there is no live `ingest` row, or the owner's address is empty, the request is served locally. That keeps a single node working and avoids a proxy loop.
 - The proxy sets `X-Zerocams-Proxied: 1`. The owner, when it trusts that header, serves locally, does not proxy again, and does not repeat the access check or the rate limit. Trust is the TCP peer being loopback (`127.0.0.0/8`, `::1`, `localhost`, including IPv4-mapped loopback) **or** a matching HMAC: `X-Zerocams-Proxy-Sig` is hex HMAC-SHA256 of `METHOD\nPATH\nUNIX_TIMESTAMP` under `CLUSTER_SECRET`, and `X-Zerocams-Proxy-Ts` is that unix timestamp within 30 seconds. `PATH` is the URL path only, not the query. Without `CLUSTER_SECRET` only a loopback peer is trusted. A header from anywhere else is ignored: the node still checks access and proxies when it is not the owner. A non-loopback owner is not dialed without `CLUSTER_SECRET`, because the owner would ignore the hop and proxy back; the caller gets HTTP 503 instead. If the app sits behind a reverse proxy on the same machine, every external client looks like loopback — strip `X-Zerocams-Proxied`, `X-Zerocams-Proxy-Ts` and `X-Zerocams-Proxy-Sig` at that proxy.
 - The segment body is streamed through, not buffered. Status, `Content-Type` and the playlist cache headers are passed on. Playlist segment names are not rewritten to the owner's URL, so a relative name keeps the player on the node it already called (that node proxies each segment). If the TCP connection is refused or dropped, or response headers do not arrive within `CLUSTER_VIEW_CONNECT_TIMEOUT_SECONDS` + `CLUSTER_VIEW_READ_TIMEOUT_SECONDS`, the caller gets HTTP 503 with CursedJSON code `225` (`hint`: retry) and can retry. Silence after those headers have already been sent aborts the body after `CLUSTER_VIEW_READ_TIMEOUT_SECONDS`; the status line is the owner's and cannot be changed. A WebSocket upstream that never completes the handshake is the same failure: HTTP 503 when the server supports a denial response, otherwise close code 1013.
 - **No TLS yet.** Cluster media is plaintext TCP. `CLUSTER_SECRET` authenticates the handshake and does not encrypt the stream. Until TLS wraps that socket, do not run the cluster between hosts across a network you do not trust. With an empty `CLUSTER_SECRET` a node listens and connects only on loopback (`127.0.0.1`, `::1`, `localhost`); a non-loopback peer is rejected and a non-loopback dial raises, so two processes on one machine can be tested without a secret and a misconfigured node will not publish cameras onto the network. Startup fails when `CLUSTER_ENABLED=true`, `CLUSTER_MEDIA_HOST` is not loopback, and `CLUSTER_SECRET` is empty. Setting a secret allows a non-loopback listener, but the bytes are still readable by anyone who can reach the port: keep the listener on loopback until TLS exists, unless the network itself is trusted. `NODE_ADDRESS` is `host`, `host:port` or `[ipv6]:port` (the port defaults to `CLUSTER_MEDIA_PORT`).
-- Not yet covered: `session_cleanup` and `motion_cleanup` still run on every node (see below). A view request is not followed to a new owner if the lease moves after the response has started.
+- `session_cleanup` and `motion_cleanup` are not leased; each runs only on a node where both its global setting and local capability are enabled. A view request is not followed to a new owner if the lease moves after the response has started.
 
-Global functions under a single right (`resource_id` 0): `healthcheck`, `switch_sync`, `connection_sync` and `tuya_events`. With `CLUSTER_ENABLED=true` the application does not start these four at boot. Each reconcile cycle, a node whose flag is on (`HEALTHCHECK_ENABLED`, `SWITCH_SYNC_ENABLED`, `CONNECTION_SYNC_ENABLED`, `TUYA_EVENTS_ENABLED`) tries to acquire or renew the right; whoever gets it first runs the loop, a node with the flag off never takes it. If the right is lost, not renewed, or the database was unreachable for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS`, the node stops that loop; on a graceful shutdown the rights are released so another node takes over within one renew interval. There is no fair share for these (one right per function), so they can all end up on the same node.
+Global functions under a single right (`resource_id` 0): `healthcheck`, `switch_sync`, `connection_sync` and `tuya_events`. With cluster mode enabled, each node whose global setting and matching local capability are on tries to acquire or renew the right; the lease holder runs the loop. If the right is lost, not renewed, or the database was unreachable for `LEASE_TTL_SECONDS - LEASE_RENEW_INTERVAL_SECONDS`, the node stops that loop; on graceful shutdown the rights are released so another eligible node takes over within one renew interval. There is no fair share for these (one right per function), so they can all end up on the same node.
 
-Not under a right (still run on every node whose flag is on): `session_cleanup` is idempotent, so concurrent runs are harmless. `motion_cleanup` deletes through the storage layer (the local directory, or the bucket when `STORAGE_BACKEND=s3`) and is idempotent, so it also stays per node. `notify` is a right, but its loop is separate from the four above.
+Not under a right: `session_cleanup` and `motion_cleanup` are idempotent, but start only on nodes where both the corresponding global setting and local capability are enabled. `motion_cleanup` deletes through the configured storage layer. `notify` uses a global lease, managed by its own loop.
 
 Limitations:
 
@@ -270,6 +286,6 @@ Limitations:
 
 `GET /v1/cluster` (admin only) shows the state: local `node_id`, `cluster_enabled`, nodes (address, heartbeat age, alive flag, capabilities, version), current rights (function, resource, owner, generation, seconds until expiry, expired flag) and `unassigned` - wanted per-camera and global functions with no live owner (`reason` is `no_capable_node` when no live node has the function enabled). It never returns camera URLs or credentials. With `CLUSTER_ENABLED=false` it returns `cluster_enabled=false` and empty lists.
 
-`MOTION_DETECTION_ENABLED=false` returns `started=false` from otherwise-authorized motion-start requests without querying the detector's database, loading YOLO or launching a detector. Camera/push-settings changes cannot override it. User motion preferences remain editable and are retained for a later restart with detection enabled. Existing permissions and per-camera checks still apply when enabled. Orphan-process reaping and shutdown remain available even with detection off.
+When the global `MOTION_DETECTION_ENABLED` setting or this node's `motion` capability is off, motion-start requests return `started=false` without loading YOLO or launching a detector. Camera/push-settings changes cannot override it. User motion preferences remain editable and are retained for a later restart with detection enabled. Existing permissions and per-camera checks still apply when enabled. Orphan-process reaping and shutdown remain available even with detection off.
 
 Existing `INGEST_ENABLED`, `HLS_ENABLED`, and `WEBRTC_ENABLED` switches are reused and retain their defaults (`false`). HLS cleanup follows HLS activation. Rate-limit bucket cleanup is deliberately **always enabled**: disabling memory-maintenance housekeeping would leak state and is not a useful functionality switch. Disabling session or motion cleanup does not invalidate existing data, but it allows expired rows/files to accumulate; provide another retention mechanism if disabling long-term.

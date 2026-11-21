@@ -6,6 +6,7 @@ from app.models.motion_event import MotionEvent
 from app.models.node import Assignment, Node
 from app.models.notification import NotificationJob
 from app.models.push_settings import PushSettings
+from app.models.runtime_config import GlobalConfig, GlobalSetting, NodeCapability, NodeSetting, SystemSettings
 from app.models.session import Session
 from app.models.sharing import Sharing
 from app.models.switch import Switch
@@ -16,6 +17,11 @@ __all__ = [
     "Cam",
     "Connection",
     "Invitation",
+    "GlobalConfig",
+    "GlobalSetting",
+    "NodeCapability",
+    "NodeSetting",
+    "SystemSettings",
     "MotionEvent",
     "Node",
     "NotificationJob",

@@ -14,6 +14,7 @@ from app.deps.auth import AccessContext, resolve_stream_access
 from app.models.cams import Cam
 from app.services import hls_manager
 from app.services.cluster import view_proxy
+from app.services.cluster.identity import worker_enabled
 
 from app.routers.cams._common import _LONG_CACHE_HEADERS, _NO_CACHE_HEADERS, _get_cam_for_access, router
 
@@ -62,6 +63,11 @@ async def get_hls_playlist(
         target = await view_proxy.view_target(db, cam.id)
         if target is not None:
             return await view_proxy.proxy_http(request, target)
+
+    # Apply node-local policy only after routing: an ingress node with HLS
+    # disabled locally must still proxy to the node that owns this camera.
+    if not worker_enabled(settings, "hls"):
+        raise AppError(BAD_REQUEST, "HLS стриминг отключен на этой ноде")
 
     try:
         session = await hls_manager.get_or_create_session(cam)
@@ -123,6 +129,9 @@ async def get_hls_segment(
         target = await view_proxy.view_target(db, cam.id)
         if target is not None:
             return await view_proxy.proxy_http(request, target)
+
+    if not worker_enabled(settings, "hls"):
+        raise AppError(BAD_REQUEST, "HLS стриминг отключен на этой ноде")
 
     try:
         session = await hls_manager.get_or_create_session(cam)

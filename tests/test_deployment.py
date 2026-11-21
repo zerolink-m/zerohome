@@ -60,17 +60,14 @@ def test_visibility_readback_fails_closed(monkeypatch, status):
         visibility.verify()
 
 
-def test_container_version_overrides_stale_host_configuration(tmp_path):
-    fake_cat = tmp_path / "cat"
-    fake_cat.write_text(f"#!{sys.executable}\nprint('v4.5.0-Release')\n")
-    fake_cat.chmod(0o755)
+def test_container_does_not_export_runtime_version_environment():
     result = subprocess.run([
         "sh", str(ROOT / "deploy/container-entrypoint.sh"), sys.executable,
-        "-c", "import os; print(os.environ['VERSION'])",
+        "-c", "import os; from app.version import APP_VERSION; assert 'VERSION' not in os.environ; print(APP_VERSION)",
     ], env={**os.environ, "VERSION": "v0.0.0-stale",
-            "PATH": f"{tmp_path}:{os.environ['PATH']}"}, capture_output=True, text=True)
+            "PYTHONPATH": str(ROOT)}, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "v4.5.0-Release"
+    assert result.stdout.strip() == "4.7.0"
 
 
 FAKE_DOCKER = r'''

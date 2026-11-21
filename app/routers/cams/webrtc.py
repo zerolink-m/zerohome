@@ -11,6 +11,7 @@ from app.core.errors import AppError
 from app.models.cams import Cam
 from app.services import webrtc_manager
 from app.services.cluster import view_proxy
+from app.services.cluster.identity import worker_enabled
 
 from app.routers.cams._common import _get_cam_for_access, router
 
@@ -88,6 +89,12 @@ async def webrtc_stream(
         if target is not None:
             await view_proxy.proxy_websocket(websocket, target)
             return
+
+    # This node is the actual media/signaling owner (or clustering is off).
+    # Ingress nodes proxy above before consulting their own local capability.
+    if not worker_enabled(settings, "webrtc"):
+        await websocket.close(code=1008, reason="WebRTC отключён на этой ноде")
+        return
 
     print(f"[WebRTC] Camera found: {cam.name} ({cam.addr}:{cam.port})")
 

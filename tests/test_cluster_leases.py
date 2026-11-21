@@ -133,7 +133,10 @@ def test_migration_chain():
     names = script.get_revision("47800_schema_names")
     assert names.down_revision == "47700_lease_holder"
     assert len(names.revision) <= 32
-    assert script.get_heads() == ["47800_schema_names"]
+    runtime = script.get_revision("47900_runtime_configuration")
+    assert runtime.down_revision == "47800_schema_names"
+    assert len(runtime.revision) <= 32
+    assert script.get_heads() == ["47900_runtime_configuration"]
 
 
 def _settings(**kw):
@@ -146,23 +149,22 @@ def test_lease_timing_validation():
         _settings(LEASE_TTL_SECONDS=15, LEASE_RENEW_INTERVAL_SECONDS=10)
 
 
-@pytest.mark.parametrize("node_id", ["", "   "])
-def test_cluster_requires_explicit_node_id(node_id):
-    with pytest.raises(ValidationError, match="NODE_ID must be set explicitly"):
-        _settings(CLUSTER_ENABLED=True, NODE_ID=node_id)
-    with pytest.raises(ValidationError, match="NODE_ID must be set explicitly"):
-        _settings(CLUSTER_ENABLED=True)
+def test_cluster_allows_file_backed_node_identity():
+    assert _settings(CLUSTER_ENABLED=True).CLUSTER_ENABLED is True
 
 
-def test_cluster_with_node_id_and_standalone_without():
-    assert _settings(CLUSTER_ENABLED=True, NODE_ID="n1").NODE_ID == "n1"
-    assert _settings(CLUSTER_ENABLED=False).NODE_ID == ""
+def test_cluster_and_standalone_settings():
+    assert _settings(CLUSTER_ENABLED=True).CLUSTER_ENABLED is True
+    assert _settings(CLUSTER_ENABLED=False).CLUSTER_ENABLED is False
 
 
-def test_node_id_and_capabilities():
+def test_node_id_and_capabilities(tmp_path, monkeypatch):
+    from app.services.cluster import identity
+
+    monkeypatch.setattr(identity, "IDENTITY_FILE", tmp_path / "identity" / "node-id")
+    monkeypatch.setattr(identity, "_generated_id", None)
     s = _settings()
-    a = get_node_id(s)
-    assert a and a == get_node_id(s) and len(a) <= 64
-    assert get_node_id(_settings(NODE_ID="n1")) == "n1"
+    a = get_node_id()
+    assert a and a == get_node_id() and len(a) <= 64
     caps = local_capabilities(_settings(INGEST_ENABLED=True, MOTION_DETECTION_ENABLED=False))
     assert caps["ingest"] is True and caps["motion"] is False and caps["notify"] is True

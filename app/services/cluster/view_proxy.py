@@ -189,7 +189,7 @@ async def view_target(db, cam_id: int) -> ViewTarget | None:
     ))).scalar_one_or_none()
     if row is None or not row.owner_node_id:
         return None
-    if row.owner_node_id == get_node_id(settings):
+    if row.owner_node_id == get_node_id():
         return None
     node = await db.get(Node, row.owner_node_id)
     address = (node.address or "").strip() if node is not None else ""
