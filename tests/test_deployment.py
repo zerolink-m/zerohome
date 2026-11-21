@@ -15,42 +15,49 @@ visibility = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(visibility)
 
 
-@pytest.mark.parametrize("value", ["public", "internal", None])
-def test_public_or_unknown_package_is_never_published(monkeypatch, value):
-    monkeypatch.setattr(visibility, "get", lambda _: {"visibility": value})
-    with pytest.raises(SystemExit):
-        visibility.verify(allow_new=True)
+def test_public_package_can_be_published(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    calls = []
 
+    def get(path, token):
+        calls.append((path, token))
+        return {"visibility": "public"}
 
-def test_private_package_can_be_published(monkeypatch):
-    monkeypatch.setattr(visibility, "get", lambda _: {"visibility": "private"})
+    monkeypatch.setattr(visibility, "get", get)
     visibility.verify()
+    assert calls == [(visibility.PACKAGE, "test-token")]
+
+
+@pytest.mark.parametrize("value", ["private", "internal", None, "PUBLIC", 1])
+def test_non_public_or_unknown_package_is_never_published(monkeypatch, value):
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setattr(visibility, "get", lambda path, token: {"visibility": value})
+    with pytest.raises(SystemExit):
+        visibility.verify()
+
+
+def test_missing_github_token_fails_closed(monkeypatch):
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    def unexpected_get(*args):
+        pytest.fail("GitHub API must not be called without GH_TOKEN")
+
+    monkeypatch.setattr(visibility, "get", unexpected_get)
+    with pytest.raises(SystemExit, match="GH_TOKEN is required"):
+        visibility.verify()
 
 
 @pytest.mark.parametrize("status", [403, 404, 500])
 def test_visibility_readback_fails_closed(monkeypatch, status):
-    def get(_):
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+
+    def get(path, token):
+        assert path == visibility.PACKAGE
+        assert token == "test-token"
         raise urllib.error.HTTPError("url", status, "error", {}, None)
     monkeypatch.setattr(visibility, "get", get)
     with pytest.raises(SystemExit):
         visibility.verify()
-    if status != 404:
-        with pytest.raises(SystemExit):
-            visibility.verify(allow_new=True)
-
-
-@pytest.mark.parametrize("private", [False, True])
-def test_new_package_requires_private_source_repository(monkeypatch, private):
-    def get(path):
-        if path == visibility.PACKAGE:
-            raise urllib.error.HTTPError("url", 404, "absent", {}, None)
-        return {"private": private}
-    monkeypatch.setattr(visibility, "get", get)
-    if private:
-        visibility.verify(allow_new=True)
-    else:
-        with pytest.raises(SystemExit):
-            visibility.verify(allow_new=True)
 
 
 def test_container_version_overrides_stale_host_configuration(tmp_path):
