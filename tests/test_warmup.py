@@ -16,6 +16,7 @@ main = importlib.import_module("app.main")
 
 
 def _stub_lifespan_deps(monkeypatch):
+    monkeypatch.setattr(main, "initialize_runtime_configuration", AsyncMock())
     monkeypatch.setattr(main, "start_cleanup_task", Mock())
     for flag in ("SESSION_CLEANUP_ENABLED", "HEALTHCHECK_ENABLED", "SWITCH_SYNC_ENABLED",
                  "CONNECTION_SYNC_ENABLED", "TUYA_EVENTS_ENABLED", "MOTION_CLEANUP_ENABLED",
@@ -29,6 +30,7 @@ def _stub_lifespan_deps(monkeypatch):
         (main.webrtc_manager, ("startup",)),
         (main.snapshot, ("startup", "stop_all")),
         (main.motion_detection, ("startup",)),
+        (main.notify_worker, ("start", "stop")),
         (main.motion_lifecycle, ("start_all_enabled", "stop_all")),
         (main.tuya_events, ("stop_all",)),
         (main.tuya_client_pool, ("close_all",)),

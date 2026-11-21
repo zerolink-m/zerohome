@@ -3,8 +3,9 @@
 Env vars are set BEFORE `app` is imported so that `app.core.config.settings`
 never uses the real .env values (environment wins over the .env file in
 pydantic-settings). The DB is an in-memory SQLite (aiosqlite); `get_db` and every
-`AsyncSessionLocal` used by request handlers are replaced. Lifespan is never run
-(httpx.ASGITransport does not trigger it), so no background workers start.
+`AsyncSessionLocal` used by request handlers are replaced. `httpx.ASGITransport`
+does not trigger lifespan; tests that enter it explicitly stub runtime hydration
+and background workers.
 """
 import os
 
@@ -14,17 +15,10 @@ _TEST_ENV = {
     "DB_USER": "test",
     "DB_PASSWORD": "test",
     "DB_NAME": "test_never_connect",
-    "JWT_SECRET_SESSION": "test-secret-session-0123456789abcdef0123",
-    "JWT_SECRET_ACCESS": "test-secret-access-0123456789abcdef01234",
-    "JWT_SECRET_ACCESS_ADMIN": "test-secret-admin-0123456789abcdef01234",
-    "JWT_SECRET_SHARE": "test-secret-share-0123456789abcdef012345",
-    "JWT_ALGORITHM": "HS256",
-    "ACCESS_TOKEN_TTL_SECONDS": "900",
-    "SESSION_TOKEN_TTL_SECONDS": "86400",
-    "SHARE_TOKEN_MIN_TTL_SECONDS": "60",
-    "SHARE_TOKEN_MAX_TTL_SECONDS": "3600",
-    "HLS_ENABLED": "false",
-    "WEBRTC_ENABLED": "false",
+    # One-time test bootstrap values. Runtime signing keys are loaded from the
+    # database by production; tests provide these explicitly for DB seeding.
+    "BOOTSTRAP_JWT_SECRET_SESSION": "test-secret-session-0123456789abcdef0123",
+    "BOOTSTRAP_JWT_SECRET_SHARE": "test-secret-share-0123456789abcdef012345",
 }
 os.environ.update(_TEST_ENV)
 
@@ -46,6 +40,7 @@ from app.main import create_app  # noqa: E402
 from app.models.cams import Cam  # noqa: E402
 from app.models.user import User  # noqa: E402
 from app.models.session import Session  # noqa: E402
+from app.services.cluster import identity as node_identity  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +56,14 @@ def _reset_session_activity():
     session_activity.reset()
     yield
     session_activity.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_node_identity(monkeypatch, tmp_path):
+    """Use a per-test node-id file; never write identity under the host path."""
+    monkeypatch.setattr(node_identity, "IDENTITY_FILE", tmp_path / "node-id")
+    monkeypatch.setattr(node_identity, "_generated_id", None)
+    monkeypatch.setattr(node_identity, "_identity_pending_registration", False)
 
 
 @pytest_asyncio.fixture

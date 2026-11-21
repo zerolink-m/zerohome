@@ -111,7 +111,7 @@ async def test_old_access_is_rejected_even_with_live_session(client, mk_user):
     await login_access(client, "u@x.io")
     now = int(time.time())
     legacy = jwt.encode({"uid": uid, "sid": 1, "role": "user", "iat": now, "exp": now + 300},
-                        settings.JWT_SECRET_ACCESS, algorithm="HS256")
+                        "test-legacy-access-secret-for-rejection-only", algorithm="HS256")
     assert (await client.get("/v1/cams", headers=bearer(legacy))).status_code == 401
     assert (await client.post("/v1/auth/new-refresh", headers=bearer(legacy))).status_code == 401
 

@@ -6,6 +6,7 @@ import pytest
 from app.core.config import settings
 from app.models.node import Assignment, Node
 from app.services.cluster import runner as runner_mod
+from app.services.cluster import status as status_mod
 from app.services.cluster.runner import ClusterFunction
 from tests.conftest import bearer, mint_test_token
 
@@ -47,7 +48,7 @@ async def test_cluster_requires_admin(client, mk_user):
 
 async def test_disabled_cluster_returns_empty_lists(client, mk_user, monkeypatch):
     monkeypatch.setattr(settings, "CLUSTER_ENABLED", False)
-    monkeypatch.setattr(settings, "NODE_ID", "local-1")
+    monkeypatch.setattr(status_mod, "get_node_id", lambda: "local-1")
     r = await client.get("/v1/cluster", headers=bearer(await tok(mk_user, "a@x.io", "admin")))
     assert r.status_code == 200 and r.json()["code"] == "000"
     c = r.json()["data"]["cluster"]
@@ -56,7 +57,7 @@ async def test_disabled_cluster_returns_empty_lists(client, mk_user, monkeypatch
 
 async def test_cluster_status_shape_and_unassigned(client, mk_user, sessionmaker_, monkeypatch):
     monkeypatch.setattr(settings, "CLUSTER_ENABLED", True)
-    monkeypatch.setattr(settings, "NODE_ID", "a")
+    monkeypatch.setattr(status_mod, "get_node_id", lambda: "a")
     now = int(time.time())
     await seed(sessionmaker_, now)
     monkeypatch.setattr(runner_mod, "default_functions", lambda: [

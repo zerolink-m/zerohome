@@ -16,6 +16,10 @@ from app.version import APP_VERSION
 
 
 def test_runtime_environment_is_limited_to_database_bootstrap(monkeypatch):
+    # The suite-wide credentials are an explicit bootstrap fixture. This test
+    # starts without that one-time import to prove ordinary env secrets are ignored.
+    monkeypatch.delenv("BOOTSTRAP_JWT_SECRET_SESSION", raising=False)
+    monkeypatch.delenv("BOOTSTRAP_JWT_SECRET_SHARE", raising=False)
     monkeypatch.setenv("DB_HOST", "database.internal")
     monkeypatch.setenv("HOST", "127.0.0.1")
     monkeypatch.setenv("PORT", "8123")

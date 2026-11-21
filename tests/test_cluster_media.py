@@ -441,13 +441,13 @@ async def test_disabled_cluster_does_not_listen(monkeypatch):
 
 def test_settings_reject_plaintext_off_loopback():
     with pytest.raises(ValidationError, match="CLUSTER_SECRET"):
-        Settings(_env_file=None, CLUSTER_ENABLED=True, NODE_ID="n1", CLUSTER_MEDIA_HOST="0.0.0.0")
+        Settings(_env_file=None, CLUSTER_ENABLED=True, CLUSTER_MEDIA_HOST="0.0.0.0")
     ok = Settings(
-        _env_file=None, CLUSTER_ENABLED=True, NODE_ID="n1",
+        _env_file=None, CLUSTER_ENABLED=True,
         CLUSTER_MEDIA_HOST="0.0.0.0", CLUSTER_SECRET="s",
     )
     assert ok.CLUSTER_MEDIA_PORT == 4700
-    assert Settings(_env_file=None, CLUSTER_ENABLED=True, NODE_ID="n1").CLUSTER_MEDIA_HOST == "127.0.0.1"
+    assert Settings(_env_file=None, CLUSTER_ENABLED=True).CLUSTER_MEDIA_HOST == "127.0.0.1"
 
 
 async def test_feed_remote_fans_out_like_a_local_feed():

@@ -38,7 +38,7 @@ def test_legacy_refresh_validation():
     assert exc.value.code == "043"
     with pytest.raises(AppError):
         sec.decode_legacy_refresh(jwt.encode({"uid": 1, "sid": 1, "exp": now + 100},
-                                              settings.JWT_SECRET_ACCESS, algorithm="HS256"))
+                                              "test-legacy-access-secret-for-rejection-only", algorithm="HS256"))
 
 
 @pytest.mark.parametrize("token", ["", "garbage", "a.b.c"])
