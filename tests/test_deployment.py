@@ -67,7 +67,7 @@ def test_container_does_not_export_runtime_version_environment():
     ], env={**os.environ, "VERSION": "v0.0.0-stale",
             "PYTHONPATH": str(ROOT)}, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "4.7.0"
+    assert result.stdout.strip() == "4.8.0"
 
 
 FAKE_DOCKER = r'''
