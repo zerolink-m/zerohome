@@ -91,33 +91,36 @@ def test_builtin_compose_has_db_migrate_and_app(tmp_path):
     assert app["DB_PORT"] == "3306"
 
 
-def test_app_environment_receives_node_and_cluster_settings(tmp_path):
+@pytest.mark.parametrize("template", ["compose.yaml", "compose.external-db.yaml"])
+def test_app_compose_keeps_identity_and_only_bootstrap_environment(tmp_path, template):
+    compose = ROOT / "templates" / template
     rendered = _compose_config(
-        tmp_path, ROOT / "templates" / "compose.yaml",
-        {
-            "MYSQL_ROOT_PASSWORD": "test-root-password",
-            "NODE_ID": "node-a",
-            "NODE_ADDRESS": "10.1.0.8:4700",
-            "CLUSTER_ENABLED": "true",
-        },
+        tmp_path, compose,
+        {"MYSQL_ROOT_PASSWORD": "test-root-password", "DB_HOST": "db.example"},
     )
     env = rendered["services"]["app"]["environment"]
-    assert env["NODE_ID"] == "node-a"
-    assert env["NODE_ADDRESS"] == "10.1.0.8:4700"
-    assert env["CLUSTER_ENABLED"] == "true"
-    for name in (
-        "CLUSTER_SECRET", "CLUSTER_MEDIA_HOST", "CLUSTER_MEDIA_PORT",
-        "STORAGE_BACKEND", "S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY",
-        "S3_SECRET_KEY", "S3_REGION",
-    ):
-        assert name in env
-    assert env["CLUSTER_MEDIA_HOST"] == "127.0.0.1"
-    assert env["CLUSTER_MEDIA_PORT"] == "4700"
-    assert env["STORAGE_BACKEND"] == "local"
-    source = (ROOT / "templates" / "compose.yaml").read_text()
-    assert "NODE_ID: ${NODE_ID:-}" in source
-    assert "NODE_ADDRESS: ${NODE_ADDRESS:-}" in source
-    assert 'CLUSTER_ENABLED: "${CLUSTER_ENABLED:-false}"' in source
+    assert env["DB_HOST"] == ("db" if template == "compose.yaml" else "db.example")
+    assert env["HOST"] == "0.0.0.0"
+    assert env["PORT"] == "8000"
+    assert env["CACHE_DIR"] == "/data/cache"
+    assert env["MOTION_FILES_DIR"] == "/data/motion_files"
+    forbidden = {
+        "NODE_ID", "NODE_ADDRESS", "CLUSTER_ENABLED", "CLUSTER_SECRET",
+        "CLUSTER_MEDIA_HOST", "CLUSTER_MEDIA_PORT", "STORAGE_BACKEND",
+        "S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_REGION",
+        "MIGRATE_LOCK_TIMEOUT_SECONDS",
+    }
+    assert forbidden.isdisjoint(env)
+    assert "VERSION" not in env
+    app_volumes = rendered["services"]["app"]["volumes"]
+    identity_mounts = [mount for mount in app_volumes if isinstance(mount, dict)
+                       and mount.get("target") == "/data/zerocams"]
+    assert len(identity_mounts) == 1 and identity_mounts[0].get("type") == "volume"
+    identity_source = identity_mounts[0].get("source")
+    other_named_volumes = {mount.get("source") for mount in app_volumes if isinstance(mount, dict)
+                           and mount.get("target") in {"/data/motion_files", "/data/models"}}
+    assert identity_source not in other_named_volumes
+    assert "identity" in rendered["volumes"]
 
 
 def test_external_compose_has_no_database_service(tmp_path):
@@ -132,7 +135,6 @@ def test_external_compose_has_no_database_service(tmp_path):
     migrate = rendered["services"]["migrate"]
     assert app["environment"]["DB_HOST"] == "10.9.9.9"
     assert app["environment"]["DB_PORT"] == "3307"
-    assert app["environment"]["NODE_ID"] == ""
     assert "depends_on" not in app
     assert "depends_on" not in migrate
     assert migrate.get("profiles") == ["maintenance"]

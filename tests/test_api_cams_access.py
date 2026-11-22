@@ -349,12 +349,11 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
 async def test_forged_admin_role_via_user_secret_is_not_admin(client, mk_user, mk_cam):
     """An old access JWT with a forged admin claim is rejected outright."""
     import time, jwt
-    from app.core.config import settings
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner)
     now = int(time.time())
     forged = jwt.encode({"uid": other, "sid": 1, "role": "admin", "iat": now, "exp": now + 99},
-                        settings.JWT_SECRET_ACCESS, algorithm="HS256")
+                        "test-legacy-access-secret-for-rejection-only", algorithm="HS256")
     r = await client.get(f"/v1/cams/{cid}", headers=bearer(forged))
     assert r.json()["code"] == TOKEN_ERROR
 

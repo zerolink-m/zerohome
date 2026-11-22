@@ -97,7 +97,7 @@ async def _allowed_to_send() -> bool:
         return False
     if not settings.CLUSTER_ENABLED:
         return True
-    node_id = get_node_id(settings)
+    node_id = get_node_id()
     now = int(time.time())
     ttl = int(settings.LEASE_TTL_SECONDS)
     try:
@@ -156,7 +156,7 @@ async def deliver_batch(now: int | None = None, node_id: str | None = None) -> i
     ``now`` and ``node_id`` are injectable so tests can move the clock.
     """
     now = int(time.time()) if now is None else int(now)
-    node_id = node_id or get_node_id(settings)
+    node_id = node_id or get_node_id()
     async with AsyncSessionLocal() as db:
         jobs = await notify_queue.claim(db, node_id, now, _BATCH_LIMIT, _CLAIM_LEASE_SECONDS)
     for job in jobs:

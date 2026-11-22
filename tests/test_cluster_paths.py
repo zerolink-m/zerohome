@@ -15,7 +15,7 @@ def make(monkeypatch, *, cluster, node_id="", registry_dir="", hls_explicit=None
     s = settings.model_copy()
     s.__pydantic_fields_set__.discard("HLS_TEMP_DIR")
     object.__setattr__(s, "CLUSTER_ENABLED", cluster)
-    object.__setattr__(s, "NODE_ID", node_id)
+    monkeypatch.setattr(identity, "_generated_id", node_id or "test-node")
     object.__setattr__(s, "INGEST_REGISTRY_DIR", registry_dir)
     object.__setattr__(s, "CACHE_DIR", "caching")
     object.__setattr__(s, "HLS_TEMP_DIR", "/tmp/zerocams/hls")
@@ -34,10 +34,14 @@ def test_disabled_paths_unchanged(monkeypatch):
 def test_different_nodes_different_dirs(monkeypatch):
     a = make(monkeypatch, cluster=True, node_id="n1")
     b = make(monkeypatch, cluster=True, node_id="n2")
-    assert a.ingest_registry_path != b.ingest_registry_path
-    assert a.hls_temp_path != b.hls_temp_path
-    assert a.ingest_registry_path == str(PROJECT_ROOT / "caching/ingest/nodes/n1/registry.json")
-    assert a.hls_temp_path == "/tmp/zerocams/hls/nodes/n1"
+    monkeypatch.setattr(identity, "_generated_id", "n1")
+    a_registry, a_hls = a.ingest_registry_path, a.hls_temp_path
+    monkeypatch.setattr(identity, "_generated_id", "n2")
+    b_registry, b_hls = b.ingest_registry_path, b.hls_temp_path
+    assert a_registry != b_registry
+    assert a_hls != b_hls
+    assert a_registry == str(PROJECT_ROOT / "caching/ingest/nodes/n1/registry.json")
+    assert a_hls == "/tmp/zerocams/hls/nodes/n1"
 
 
 def test_explicit_values_untouched(monkeypatch):
@@ -49,7 +53,7 @@ def test_explicit_values_untouched(monkeypatch):
 def test_random_node_id_stable_in_process(monkeypatch):
     s = make(monkeypatch, cluster=True)
     assert s.ingest_registry_path == s.ingest_registry_path
-    assert identity.get_node_id(s) in s.ingest_registry_path
+    assert identity.get_node_id() in s.ingest_registry_path
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -69,6 +73,7 @@ def test_safe_node_dir_name(raw, expected):
 
 def test_hostile_node_id_stays_inside(monkeypatch):
     s = make(monkeypatch, cluster=True, node_id="../../x/..")
+    monkeypatch.setattr(identity, "_generated_id", "../../x/..")
     p = Path(s.ingest_registry_path)
     assert (PROJECT_ROOT / "caching/ingest/nodes") in p.parents
 
@@ -76,7 +81,9 @@ def test_hostile_node_id_stays_inside(monkeypatch):
 async def test_registries_of_two_nodes_are_independent(monkeypatch, tmp_path):
     a = make(monkeypatch, cluster=True, node_id="n1", registry_dir="")
     b = make(monkeypatch, cluster=True, node_id="n2", registry_dir="")
+    monkeypatch.setattr(identity, "_generated_id", "n1")
     pa = tmp_path / Path(a.ingest_registry_path).relative_to(PROJECT_ROOT / "caching/ingest")
+    monkeypatch.setattr(identity, "_generated_id", "n2")
     pb = tmp_path / Path(b.ingest_registry_path).relative_to(PROJECT_ROOT / "caching/ingest")
     assert pa != pb
     proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")

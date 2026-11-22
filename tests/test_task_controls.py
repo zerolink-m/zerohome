@@ -32,6 +32,7 @@ def test_task_defaults_preserve_behavior():
 
 @pytest.mark.parametrize("disabled", [entry[0] for entry in WORKERS])
 async def test_each_worker_can_be_disabled_independently(monkeypatch, disabled):
+    monkeypatch.setattr(main, "initialize_runtime_configuration", AsyncMock())
     mocks = {}
     for flag, module, name in WORKERS:
         monkeypatch.setattr(settings, flag, flag != disabled)
@@ -48,6 +49,7 @@ async def test_each_worker_can_be_disabled_independently(monkeypatch, disabled):
         (main.webrtc_manager, ("startup",)),
         (main.snapshot, ("startup", "stop_all")),
         (main.motion_detection, ("startup",)),
+        (main.notify_worker, ("start", "stop")),
         (main.motion_lifecycle, ("start_all_enabled", "stop_all")),
         (main.tuya_events, ("stop_all",)),
         (main.tuya_client_pool, ("close_all",)),
@@ -55,7 +57,10 @@ async def test_each_worker_can_be_disabled_independently(monkeypatch, disabled):
         (main.auth, ("stop_session_cleanup",)),
     ]:
         for name in names:
-            monkeypatch.setattr(module, name, AsyncMock())
+            monkeypatch.setattr(
+                module, name,
+                Mock() if module is main.notify_worker and name == "start" else AsyncMock(),
+            )
     async with main.lifespan(main.app):
         pass
     rate_cleanup.assert_called_once()

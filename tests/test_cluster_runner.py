@@ -73,7 +73,8 @@ async def sm(tmp_path):
 
 def cfg(node, **kw):
     kw.setdefault("INGEST_ENABLED", True)
-    return Settings(_env_file=None, CLUSTER_ENABLED=True, NODE_ID=node, **kw)
+    # Node identity is resolved from the persistent identity file, not env/config.
+    return Settings(_env_file=None, CLUSTER_ENABLED=True, **kw)
 
 
 def make(node, sm, clock, fakes, **kw):
@@ -252,6 +253,7 @@ async def test_runner_start_is_noop_when_cluster_disabled(monkeypatch):
 
 
 def _stub_lifespan(monkeypatch):
+    monkeypatch.setattr(main, "initialize_runtime_configuration", AsyncMock())
     monkeypatch.setattr(main, "start_cleanup_task", Mock())
     monkeypatch.setattr(main.session_activity, "start", Mock())
     monkeypatch.setattr(main.session_activity, "stop", AsyncMock())
@@ -259,6 +261,8 @@ def _stub_lifespan(monkeypatch):
                  "CONNECTION_SYNC_ENABLED", "TUYA_EVENTS_ENABLED", "MOTION_CLEANUP_ENABLED",
                  "HLS_ENABLED", "WEBRTC_ENABLED", "STARTUP_WARMUP_ENABLED"):
         monkeypatch.setattr(settings, flag, False)
+    monkeypatch.setattr(settings, "INGEST_ENABLED", True)
+    monkeypatch.setattr(settings, "MOTION_DETECTION_ENABLED", True)
     for module, names in [
         (main.ingest, ("start_all_enabled", "stop_all")),
         (main.stream_manager, ("startup", "stop_all")),
@@ -266,6 +270,7 @@ def _stub_lifespan(monkeypatch):
         (main.webrtc_manager, ("startup",)),
         (main.snapshot, ("startup", "stop_all")),
         (main.motion_detection, ("startup",)),
+        (main.notify_worker, ("start", "stop")),
         (main.motion_lifecycle, ("start_all_enabled", "stop_all")),
         (main.tuya_events, ("stop_all",)),
         (main.tuya_client_pool, ("close_all",)),
@@ -275,7 +280,10 @@ def _stub_lifespan(monkeypatch):
         (main.media_server, ("start", "stop")),
     ]:
         for name in names:
-            monkeypatch.setattr(module, name, AsyncMock())
+            monkeypatch.setattr(
+                module, name,
+                Mock() if module is main.notify_worker and name == "start" else AsyncMock(),
+            )
 
 
 async def test_lifespan_legacy_path_when_cluster_disabled(monkeypatch):

@@ -46,7 +46,7 @@ def _isolate_proxy(monkeypatch):
 @pytest.fixture
 def cluster(monkeypatch):
     monkeypatch.setattr(settings, "CLUSTER_ENABLED", True)
-    monkeypatch.setattr(settings, "NODE_ID", "edge")
+    monkeypatch.setattr(view_proxy, "get_node_id", lambda: "edge")
     monkeypatch.setattr(settings, "HLS_ENABLED", True)
     monkeypatch.setattr(settings, "CLUSTER_SECRET", "view-secret")
     monkeypatch.setattr(settings, "PORT", 8000)
@@ -268,7 +268,7 @@ async def test_segment_is_streamed_not_buffered(app, db, mk_user, mk_cam, cluste
 async def test_owner_node_serves_locally_without_proxy(
     app, client, db, mk_user, mk_cam, cluster, hls_fake, monkeypatch,
 ):
-    monkeypatch.setattr(settings, "NODE_ID", "owner-a")
+    monkeypatch.setattr(view_proxy, "get_node_id", lambda: "owner-a")
     owner_uid = await mk_user("o@x.io")
     cid = await mk_cam(owner_uid)
     await _lease(db, cid)
@@ -402,7 +402,7 @@ async def test_cluster_disabled_does_not_proxy(
 ):
     monkeypatch.setattr(settings, "HLS_ENABLED", True)
     monkeypatch.setattr(settings, "CLUSTER_ENABLED", False)
-    monkeypatch.setattr(settings, "NODE_ID", "edge")
+    monkeypatch.setattr(view_proxy, "get_node_id", lambda: "edge")
     owner_uid = await mk_user("o@x.io")
     cid = await mk_cam(owner_uid)
     await _lease(db, cid)

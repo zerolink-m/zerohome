@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 async def collect(db, settings: Any, functions: list[ClusterFunction] | None = None,
                   now: int | None = None) -> dict[str, Any]:
     result: dict[str, Any] = {
-        "node_id": get_node_id(settings),
+        "node_id": get_node_id(),
         "cluster_enabled": bool(settings.CLUSTER_ENABLED),
         "nodes": [],
         "assignments": [],

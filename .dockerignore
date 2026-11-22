@@ -9,6 +9,8 @@
 !deploy/
 !deploy/container-entrypoint.sh
 !deploy/migrate_locked.py
+!deploy/bootstrap_admin.py
+!deploy/import_legacy_settings.py
 !app/
 !app/**
 !alembic/

@@ -24,12 +24,12 @@ LABEL org.opencontainers.image.source="https://github.com/zerolink-m/zerohome" \
 ENV PATH="/venv/bin:$PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     HOME=/data/models YOLO_CONFIG_DIR=/data/models/ultralytics \
     CACHE_DIR=/data/cache MOTION_FILES_DIR=/data/motion_files \
-    HOST=0.0.0.0 PORT=8000 VERSION=${VERSION}
+    HOST=0.0.0.0 PORT=8000
 # OpenCV's wheel loads GL even though no display server is used.
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libgomp1 ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 zerohome && useradd --uid 10001 --gid 10001 --no-create-home zerohome \
-    && mkdir -p /app /data/cache /data/motion_files /data/models \
+    && mkdir -p /app /data/cache /data/motion_files /data/models /data/zerocams \
     && chown -R 10001:10001 /app /data \
     && printf '%s\n' "$VERSION" > /usr/local/share/zerohome-version
 COPY --from=ffmpeg /ffmpeg /ffprobe /usr/local/bin/
@@ -42,6 +42,8 @@ COPY --chown=10001:10001 app/ ./app/
 COPY --chown=10001:10001 alembic/ ./alembic/
 COPY --chown=10001:10001 main.py alembic.ini frontend_versions.json ./
 COPY --chown=10001:10001 deploy/migrate_locked.py ./deploy/migrate_locked.py
+COPY --chown=10001:10001 deploy/bootstrap_admin.py ./deploy/bootstrap_admin.py
+COPY --chown=10001:10001 deploy/import_legacy_settings.py ./deploy/import_legacy_settings.py
 COPY --from=dependencies --chown=10001:10001 /build/yolov8n.pt ./yolov8n.pt
 COPY --chmod=0555 deploy/container-entrypoint.sh /usr/local/bin/zerohome-entrypoint
 USER 10001:10001

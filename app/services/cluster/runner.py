@@ -45,6 +45,7 @@ from app.core.config import settings as app_settings
 from app.db import session as db_session
 from app.services.cluster import leases
 from app.services.cluster.identity import get_node_id, local_capabilities
+from app.version import APP_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ class ClusterRunner:
         self._sessionmaker = sessionmaker
         self._clock = clock
         self._functions = functions
-        self.node_id = node_id or get_node_id(self.settings)
+        self.node_id = node_id or get_node_id()
         # One token per process. A second process with the same NODE_ID has another.
         self.holder = holder or secrets.token_hex(16)
         self._held: dict[tuple[str, int], _Held] = {}
@@ -287,7 +288,7 @@ class ClusterRunner:
         fn = leases.register_node if register else leases.heartbeat
         try:
             await self._db(lambda db: fn(db, self.node_id, caps, self.settings.NODE_ADDRESS,
-                                         self.settings.VERSION, self._now()))
+                                         APP_VERSION, self._now()))
         except Exception:
             logger.warning("cluster: node %s failed", "register" if register else "heartbeat", exc_info=True)
 

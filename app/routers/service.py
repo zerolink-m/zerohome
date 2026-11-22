@@ -1,8 +1,8 @@
 """Service paths (docs/cursedapi/docs/paths.md): /v1/health, /v1/version."""
 from fastapi import APIRouter
 
-from app.core.config import settings
 from app.core.response import CURSED_VERSION, success
+from app.version import APP_VERSION
 
 router = APIRouter(prefix="/v1", tags=["service"])
 
@@ -21,6 +21,6 @@ async def version():
             "api": "v1",
             "supported": SUPPORTED_VERSIONS,
             "cursed": CURSED_VERSION,
-            "app": settings.VERSION,
+            "app": APP_VERSION,
         }
     })

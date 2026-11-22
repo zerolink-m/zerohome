@@ -12,6 +12,7 @@ from app.models.cams import Cam
 from app.models.push_settings import PushSettings
 from app.models.user import User
 from app.services import motion_detection
+from app.services.cluster.identity import worker_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ async def select_cams() -> list[tuple[int, str]]:
 
 async def start_all_enabled() -> None:
     """Start motion detection on all cameras where users have it enabled."""
-    if not settings.MOTION_DETECTION_ENABLED:
+    if not worker_enabled(settings, "motion"):
         return
     try:
         cams = await select_cams()

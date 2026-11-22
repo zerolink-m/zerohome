@@ -20,6 +20,7 @@ from app.models.push_settings import PushSettings
 from app.models.user import User
 from app.services import license_plate_ocr, push
 from app.services.object_tracker import ObjectTracker
+from app.services.cluster.identity import worker_enabled
 
 logger = logging.getLogger("app.services.motion_detection")
 from app.services.motion_detection.session import MotionDetectionSession, pool as process_pool
@@ -33,7 +34,7 @@ async def start_motion_detection(cam_id: int) -> bool:
     """Start motion detection for a camera."""
     # Central gate: startup, explicit API starts and future camera/settings hooks
     # all pass here. Do not touch the DB, model or ffmpeg while disabled.
-    if not settings.MOTION_DETECTION_ENABLED:
+    if not worker_enabled(settings, "motion"):
         return False
     logger.debug(f"[Cam {cam_id}] start_motion_detection() called")
 

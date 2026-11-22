@@ -266,6 +266,8 @@ def fv(tmp_path, monkeypatch):
 
 
 async def test_config_endpoints(client, fv):
+    from app.version import APP_VERSION
+
     fv({"v*.*.*-*": 0})
     r = await client.get("/v1/config/frontend")
     assert r.json()["code"] == "000" and "version" in r.json()["data"]["config"]
@@ -276,14 +278,19 @@ async def test_config_endpoints(client, fv):
     assert r.json()["data"] == {"status": "ok"}
     r = await client.get("/v1/version")
     assert r.json()["data"]["version"]["api"] == "v1"
+    assert r.json()["data"]["version"]["app"] == APP_VERSION
+    r = await client.get("/v1/config/frontend")
+    assert r.json()["data"]["config"]["version"] == APP_VERSION
 
 
 async def test_config_frontend_versions(client, fv):
+    from app.version import APP_VERSION
+
     fv({"v*.*.*-*": 63 - 63 + 67, "v3.(0-4).*-*": 5, "v3.5.*-*": 0})
     r = await client.get("/v1/config?v=v3.5.1-Release")
     assert r.status_code == 200 and r.json()["code"] == "000"
     assert r.json()["data"]["config"]["version"] == "v3.5.1-Release"
-    assert "actual_version" in r.json()["data"]["config"]
+    assert r.json()["data"]["config"]["actual_version"] == APP_VERSION
     # update available: data is returned
     r = await client.get("/v1/config?v=v3.2.0-Beta")
     assert r.status_code == 200 and r.json()["code"] == "020"
