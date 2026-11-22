@@ -33,7 +33,55 @@ ZeroCams — сервер видеонаблюдения. Он ведёт кам
 sudo bash deploy/setup.sh
 ```
 
-Он проверит, что установка новая, предложит встроенную или внешнюю MySQL, создаст конфиги с правами `0600`, развернёт checkout в `/opt/zerohome` и конфиги в `/etc/zerohome`, установит Docker из официального apt-репозитория только если Docker отсутствует, затем вызовет `deploy/update.sh` для backup/migration-lock/migration/startup и предложит создать первого администратора локально внутри контейнера. Приложение остаётся привязано к `127.0.0.1:8000`; reverse proxy/TLS настраиваются отдельно. Установщик не поддерживает перенос существующей БД и откажется перезаписывать найденные конфиги или установку. Проверочный режим: `sudo bash deploy/setup.sh --dry-run`.
+Он проверит, что установка новая, предложит встроенную или внешнюю MySQL, создаст конфиги с правами `0600`, развернёт checkout в `/opt/zerohome`, а конфиги — в `/etc/zerohome`, установит Docker из официального apt-репозитория только если Docker отсутствует, затем вызовет `deploy/update.sh` для backup/migration-lock/migration/startup и предложит создать первого администратора локально внутри контейнера. Приложение остаётся привязано к `127.0.0.1:8000`; reverse proxy/TLS настраиваются отдельно. Установщик не поддерживает перенос существующей БД и откажется перезаписывать найденную установку, конфиги или systemd unit/timer. Проверочный режим: `sudo bash deploy/setup.sh --dry-run`.
+
+Обычный запуск использует стандартные каталоги выше. Если `/opt/zerohome` уже занят посторонними файлами, можно осознанно выбрать другие абсолютные пути. Каталог установки должен отсутствовать; каталог конфигурации может существовать только пустым. Пути должны состоять из букв, цифр, `.`, `_`, `-` и `/` без пробелов. Например:
+
+```sh
+sudo bash deploy/setup.sh --install-dir /srv/zerohome --config-dir /etc/zerohome-prod
+```
+
+Установщик создаст update systemd unit с выбранным каталогом приложения и передаст updater-у `deployment.conf` из выбранного каталога конфигурации. Сами конфиги останутся в нём (`app.conf` и `deployment.conf`); существующие файлы и системные unit/timer он не перезаписывает.
+
+#### Восстановление после остановки на создании администратора
+
+Если setup уже создал конфиги и приложение стало healthy, но остановился до bootstrap первого администратора, не запускайте `setup.sh` повторно: установщик откажется перезаписывать созданные конфиги. Выполните bootstrap вручную из уже подготовленной установки. Для стандартных путей и встроенной БД:
+
+```sh
+INSTALL_DIR=/opt/zerohome
+CONFIG_DIR=/etc/zerohome
+sudo docker compose --env-file "$CONFIG_DIR/deployment.conf" \
+  -f "$INSTALL_DIR/templates/compose.yaml" exec -it app \
+  python -m deploy.bootstrap_admin
+```
+
+После успешного создания администратора установите и включите автообновление:
+
+```sh
+INSTALL_DIR=/opt/zerohome
+CONFIG_DIR=/etc/zerohome
+sudo tee /etc/systemd/system/zerohome-update.service >/dev/null <<EOF
+[Unit]
+Description=Backup, migrate and update ZeroHome stable image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$INSTALL_DIR
+Environment=ZEROHOME_DEPLOY_CONFIG=$CONFIG_DIR/deployment.conf
+ExecStart=$INSTALL_DIR/deploy/update.sh
+TimeoutStartSec=30min
+UMask=0077
+EOF
+sudo install -m 0644 "$INSTALL_DIR/deploy/zerohome-update.timer" \
+  /etc/systemd/system/zerohome-update.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now zerohome-update.timer
+```
+
+Для каталогов, выбранных через `--install-dir` и `--config-dir`, задайте в командах выше фактические значения, например `INSTALL_DIR=/srv/zerohome` и `CONFIG_DIR=/etc/zerohome-prod`. В unit обязательно передайте `ZEROHOME_DEPLOY_CONFIG=$CONFIG_DIR/deployment.conf`, чтобы updater читал конфигурацию именно оттуда. Если используется внешняя БД, bootstrap запускайте с `-f "$INSTALL_DIR/templates/compose.external-db.yaml"`; в `[Service]` также добавьте `Environment=ZEROHOME_EXTERNAL_DB=1`.
 
 Для внешней БД установщик требует отдельное подтверждение резервной копии перед миграцией. Автообновление для неё включается только после второго явного подтверждения; иначе остаётся выключенным. Для встроенной MySQL update timer включается после успешного первого admin-bootstrap.
 
@@ -51,6 +99,12 @@ sudo bash deploy/setup.sh
 ```sh
 docker compose --env-file /etc/zerohome/deployment.conf -f templates/compose.yaml pull db
 sudo ./deploy/update.sh
+```
+
+Для вручную подготовленных альтернативных каталогов передайте updater-у `ZEROHOME_DEPLOY_CONFIG` с полным путём к `deployment.conf`:
+
+```sh
+sudo env ZEROHOME_DEPLOY_CONFIG=/etc/zerohome-prod/deployment.conf /srv/zerohome/deploy/update.sh
 ```
 
 Внешняя база:

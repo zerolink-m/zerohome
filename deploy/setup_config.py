@@ -24,7 +24,11 @@ def compose_env_quote(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
-def render_configs(mode: str, values: dict[str, str]) -> tuple[str, str]:
+def render_configs(
+    mode: str,
+    values: dict[str, str],
+    config_dir: Path = Path("/etc/zerohome"),
+) -> tuple[str, str]:
     if mode not in {"builtin", "external"}:
         raise ValueError("mode must be builtin or external")
     required = {"DB_NAME", "DB_USER", "DB_PASSWORD"}
@@ -38,9 +42,10 @@ def render_configs(mode: str, values: dict[str, str]) -> tuple[str, str]:
         raise ValueError("missing required configuration values: " + ", ".join(missing))
     checked_keys = required | {"DB_HOST", "DB_PORT"}
     checked = {key: _check_value(key, values[key]) for key in checked_keys}
+    config_dir = config_dir.resolve()
     deployment = {
         **checked,
-        "ZEROHOME_CONFIG": "/etc/zerohome/app.conf",
+        "ZEROHOME_CONFIG": str(config_dir / "app.conf"),
         "ZEROHOME_BIND": "127.0.0.1",
         "ZEROHOME_IMAGE": "ghcr.io/zerolink-m/zerohome:stable",
     }
@@ -51,7 +56,8 @@ def render_configs(mode: str, values: dict[str, str]) -> tuple[str, str]:
 
 
 def write_config_pair(config_dir: Path, mode: str, values: dict[str, str]) -> tuple[Path, Path]:
-    deployment_text, app_text = render_configs(mode, values)
+    config_dir = config_dir.resolve()
+    deployment_text, app_text = render_configs(mode, values, config_dir)
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     deployment = config_dir / "deployment.conf"
     app = config_dir / "app.conf"

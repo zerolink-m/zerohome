@@ -20,6 +20,7 @@ def test_builtin_config_contains_no_external_or_root_password_in_app_file(tmp_pa
     assert "MYSQL_ROOT_PASSWORD" not in app
     assert "fixture-root-password" not in app
     assert "DB_PASSWORD='fixture-db-password'" in app
+    assert "ZEROHOME_CONFIG='/etc/zerohome/app.conf'" in deployment
 
 
 def test_external_config_quotes_compose_metacharacters_without_echoing(tmp_path):
@@ -37,13 +38,27 @@ def test_config_files_are_private_and_never_overwritten(tmp_path):
         "MYSQL_ROOT_PASSWORD": "fixture-root-password",
     })
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in paths)
-    before = paths[0].read_text()
+    before = paths[0].stat()
     with pytest.raises(FileExistsError):
         setup_config.write_config_pair(tmp_path / "etc", "builtin", {
             "DB_NAME": "other", "DB_USER": "other", "DB_PASSWORD": "replacement",
             "MYSQL_ROOT_PASSWORD": "replacement-root",
         })
-    assert paths[0].read_text() == before
+    after = paths[0].stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+
+
+def test_custom_config_directory_is_written_into_compose_environment(tmp_path):
+    config_dir = tmp_path / "etc" / "zerohome-prod"
+    values = {
+        "DB_NAME": "zerocams", "DB_USER": "zero", "DB_PASSWORD": "fixture-password",
+        "MYSQL_ROOT_PASSWORD": "fixture-root-password",
+    }
+    deployment, _app = setup_config.render_configs("builtin", values, config_dir)
+    deployment_path, app_path = setup_config.write_config_pair(config_dir, "builtin", values)
+    assert deployment_path == config_dir.resolve() / "deployment.conf"
+    assert app_path == config_dir.resolve() / "app.conf"
+    assert f"ZEROHOME_CONFIG='{config_dir.resolve() / 'app.conf'}'" in deployment
 
 
 def test_image_contract_copies_operator_admin_bootstrap_into_image():
@@ -61,6 +76,25 @@ def test_setup_documents_the_real_update_paths_and_does_not_remove_volumes():
     assert "python -m deploy.bootstrap_admin" in source
     assert "docker compose down -v" not in source
     assert "rm -rf" not in source
+
+
+def test_setup_custom_paths_are_passed_to_config_writer_updater_and_timer_unit():
+    source = (ROOT / "deploy/setup.sh").read_text()
+    assert "--install-dir)" in source
+    assert "--config-dir)" in source
+    assert 'setup_config.py" --mode "$DB_MODE" --config-dir "$CONFIG_DIR"' in source
+    assert 'ZEROHOME_DEPLOY_CONFIG="$CONFIG_DIR/deployment.conf" bash ./deploy/update.sh' in source
+    assert "WorkingDirectory=$INSTALL_DIR" in source
+    assert "Environment=ZEROHOME_DEPLOY_CONFIG=$CONFIG_DIR/deployment.conf" in source
+    assert "ExecStart=$INSTALL_DIR/deploy/update.sh" in source
+    assert '[[ ! -e "$SERVICE" ]] || fail' in source
+    assert '[[ ! -e "$TIMER" ]] || fail' in source
+
+
+def test_setup_shell_syntax_is_valid():
+    import subprocess
+
+    subprocess.run(["bash", "-n", str(ROOT / "deploy/setup.sh")], check=True)
 
 
 def test_setup_guards_stopped_projects_and_existing_database_volumes():
