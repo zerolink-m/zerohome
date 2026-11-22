@@ -7,6 +7,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/zerohome
+Environment=ZEROHOME_DEPLOY_CONFIG=/etc/zerohome/deployment.conf
 ExecStart=/opt/zerohome/deploy/update.sh
 TimeoutStartSec=30min
 UMask=0077

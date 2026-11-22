@@ -136,7 +136,10 @@ def test_migration_chain():
     runtime = script.get_revision("47900_runtime_configuration")
     assert runtime.down_revision == "47800_schema_names"
     assert len(runtime.revision) <= 32
-    assert script.get_heads() == ["47900_runtime_configuration"]
+    nullable = script.get_revision("48000_user_nullable_settings")
+    assert nullable.down_revision == "47900_runtime_configuration"
+    assert len(nullable.revision) <= 32
+    assert script.get_heads() == ["48000_user_nullable_settings"]
 
 
 def _settings(**kw):

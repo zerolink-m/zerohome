@@ -13,22 +13,40 @@ DRY_RUN=0
 
 usage() {
     cat <<'EOF'
-Usage: sudo bash deploy/setup.sh [--dry-run] [--help]
+Usage: sudo bash deploy/setup.sh [--install-dir ABSOLUTE_PATH] [--config-dir ABSOLUTE_PATH] [--dry-run] [--help]
 
 Installs ZeroHome on a fresh Debian/Ubuntu amd64 host. It does not migrate an
 existing installation, remove packages, or delete Docker volumes/data.
+Defaults: --install-dir /opt/zerohome --config-dir /etc/zerohome.
 EOF
 }
 
-for arg in "$@"; do
-    case "$arg" in
+while (($#)); do
+    case "$1" in
         --help|-h) usage; exit 0 ;;
-        --dry-run) DRY_RUN=1 ;;
-        *) printf 'Unknown argument: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --install-dir)
+            (($# >= 2)) || { printf '%s\n' '--install-dir requires a path' >&2; exit 2; }
+            INSTALL_DIR=$2; shift 2 ;;
+        --config-dir)
+            (($# >= 2)) || { printf '%s\n' '--config-dir requires a path' >&2; exit 2; }
+            CONFIG_DIR=$2; shift 2 ;;
+        *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
+validate_target_path() {
+    local label=$1 path=$2
+    [[ "$path" == /* && "$path" != / && "$path" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+        || fail "$label must be an absolute path containing only letters, digits, '.', '_', '-', and '/' (no spaces)"
+    [[ "/$path/" != */../* ]] || fail "$label must not contain a '..' path component"
+}
+
 fail() { printf 'ZeroHome setup stopped: %s\n' "$*" >&2; exit 1; }
+validate_target_path "--install-dir" "$INSTALL_DIR"
+validate_target_path "--config-dir" "$CONFIG_DIR"
+INSTALL_DIR="${INSTALL_DIR%/}"
+CONFIG_DIR="${CONFIG_DIR%/}"
 ask_yes() {
     local answer
     read -r -p "$1 [yes/no]: " answer
@@ -43,6 +61,7 @@ SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 if [[ "$DRY_RUN" == 1 ]]; then
     printf 'Dry run only. Source checkout: %s\n' "$SOURCE_DIR"
+    printf 'Install directory: %s\nConfiguration directory: %s\n' "$INSTALL_DIR" "$CONFIG_DIR"
     printf 'Would validate Debian/Ubuntu amd64, inspect Docker conflicts, optionally install Docker from its official apt repository, create root-only config, deploy via deploy/update.sh, bootstrap the first admin, and enable updates when approved. No changes made.\n'
     exit 0
 fi
@@ -139,15 +158,15 @@ if [[ "$SOURCE_DIR" != "$INSTALL_DIR" ]]; then
     git -C "$SOURCE_DIR" archive --format=tar HEAD | tar -xf - -C "$INSTALL_DIR"
 fi
 install -d -o root -g root -m 0700 "$CONFIG_DIR"
-python3 "$INSTALL_DIR/deploy/setup_config.py" --mode "$DB_MODE"
+python3 "$INSTALL_DIR/deploy/setup_config.py" --mode "$DB_MODE" --config-dir "$CONFIG_DIR"
 
 if [[ "$DB_MODE" == builtin ]]; then
     export COMPOSE_DISABLE_ENV_FILE=1
     docker compose --env-file "$CONFIG_DIR/deployment.conf" -f "$INSTALL_DIR/templates/compose.yaml" pull db
-    (cd "$INSTALL_DIR" && bash ./deploy/update.sh)
+    (cd "$INSTALL_DIR" && ZEROHOME_DEPLOY_CONFIG="$CONFIG_DIR/deployment.conf" bash ./deploy/update.sh)
 else
     export ZEROHOME_EXTERNAL_DB=1
-    (cd "$INSTALL_DIR" && ZEROHOME_EXTERNAL_DB=1 bash ./deploy/update.sh)
+    (cd "$INSTALL_DIR" && ZEROHOME_DEPLOY_CONFIG="$CONFIG_DIR/deployment.conf" ZEROHOME_EXTERNAL_DB=1 bash ./deploy/update.sh)
 fi
 
 if ! python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/v1/health", timeout=5).read()' >/dev/null 2>&1; then
@@ -164,8 +183,41 @@ docker compose --env-file "$CONFIG_DIR/deployment.conf" -f "$compose_file" \
     exec -it app python -m deploy.bootstrap_admin
 
 if [[ "$ENABLE_TIMER" == 1 ]]; then
-    install -m 0644 "$INSTALL_DIR/deploy/zerohome-update.service" "$SERVICE"
-    install -m 0644 "$INSTALL_DIR/deploy/zerohome-update.timer" "$TIMER"
+    [[ ! -e "$SERVICE" ]] || fail "$SERVICE appeared during setup; refusing to overwrite it"
+    [[ ! -e "$TIMER" ]] || fail "$TIMER appeared during setup; refusing to overwrite it"
+    # Exclusive shell redirections keep a file that appears after preflight
+    # from being truncated or replaced.
+    set -o noclobber
+    cat > "$SERVICE" <<EOF
+[Unit]
+Description=Backup, migrate and update ZeroHome stable image
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$INSTALL_DIR
+Environment=ZEROHOME_DEPLOY_CONFIG=$CONFIG_DIR/deployment.conf
+ExecStart=$INSTALL_DIR/deploy/update.sh
+TimeoutStartSec=30min
+UMask=0077
+EOF
+    chmod 0644 "$SERVICE"
+    cat > "$TIMER" <<'EOF'
+[Unit]
+Description=Check for a new ZeroHome stable image every 15 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=2min
+Unit=zerohome-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 0644 "$TIMER"
     if [[ "$DB_MODE" == external ]]; then
         install -d -m 0755 /etc/systemd/system/zerohome-update.service.d
         [[ ! -e "$EXTERNAL_OVERRIDE" ]] || fail "$EXTERNAL_OVERRIDE appeared during setup; refusing to overwrite it"
