@@ -177,5 +177,5 @@ async def mint_test_token(uid, role="user"):
 async def login_access(client, email, password="Passw0rd!"):
     """Log in and return the database-backed bearer token."""
     r = await client.post("/v1/auth/login", json={"data": {"credentials": {"email": email, "password": password}}})
-    assert r.json()["code"] == "010", r.text
+    assert r.json()["code"] == "014", r.text
     return r.json()["data"]["token"]

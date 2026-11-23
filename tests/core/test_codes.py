@@ -10,9 +10,9 @@ def test_all_codes_are_three_digit_strings():
 
 
 @pytest.mark.parametrize("code,status", [
-    ("000", 200), ("001", 201), ("006", 202), ("042", 401), ("048", 403), ("081", 404), ("096", 405),
-    ("109", 422), ("114", 429), ("201", 500), ("221", 501), ("188", 422), ("181", 400), ("215", 501),
-    ("172", 429), ("187", 429), ("075", 403), ("090", 404), ("190", 400), ("218", 500),
+    ("000", 200), ("039", 201), ("044", 202), ("167", 401), ("181", 403), ("212", 404), ("226", 405),
+    ("269", 422), ("314", 429), ("332", 500), ("353", 501), ("297", 422), ("153", 400), ("215", 404),
+    ("172", 401), ("326", 429), ("075", 400), ("217", 404), ("393", 400), ("380", 504),
 ])
 def test_http_status(code, status):
     assert codes.http_status(code) == status
@@ -20,18 +20,20 @@ def test_http_status(code, status):
 
 def test_detail_texts():
     assert codes.code_detail("000") == "Success."
-    assert codes.code_detail("109") == "Validation error."
-    assert codes.code_detail("046").startswith("No header or query")
+    assert codes.code_detail("269") == "Validation error."
+    assert codes.code_detail("177").startswith("No header or query")
 
 
 def test_custom_codes_in_reserved_ranges():
-    custom = {"FRONTEND_UPDATE_AVAILABLE": (20, 29), "TUYA_LOCAL_NOT_ALLOWED": (61, 80), "RECORDING_NOT_ALLOWED": (61, 80),
-              "FRONTEND_UPDATE_NEEDED": (61, 80), "PTZ_NOT_CONFIGURED": (176, 200), "RECORDING_NOT_CONFIGURED": (176, 200),
-              "INVITATION_INVALID": (176, 200), "PUSH_INVALID": (176, 200), "SHARE_INVALID": (176, 200),
-              "CONNECTION_INVALID": (176, 200)}
-    for name, (lo, hi) in custom.items():
-        assert lo <= int(getattr(codes, name)) <= hi, name
+    custom = {"FRONTEND_UPDATE_AVAILABLE": (384, 511), "TUYA_LOCAL_NOT_ALLOWED": (384, 511),
+              "RECORDING_NOT_ALLOWED": (384, 511), "FRONTEND_UPDATE_NEEDED": (384, 511),
+              "PTZ_NOT_CONFIGURED": (384, 511), "RECORDING_NOT_CONFIGURED": (384, 511),
+              "INVITATION_INVALID": (384, 511), "PUSH_INVALID": (384, 511), "SHARE_INVALID": (384, 511),
+              "CONNECTION_INVALID": (384, 511)}
+    for name in custom:
+        low, high = custom[name]
+        assert low <= int(getattr(codes, name)) <= high, name
 
 
 def test_legacy_aliases():
-    assert codes.TOKEN_ERROR == "042" and codes.EMAIL_TAKEN == "139" and codes.LOCKED == "110"
+    assert codes.TOKEN_ERROR == "167" and codes.EMAIL_TAKEN == "115" and codes.LOCKED == "302"

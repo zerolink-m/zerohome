@@ -16,10 +16,40 @@ class ServerTimeOut(StrictModel):
     time: int
 
 
-class RuntimeGlobalPatch(StrictModel):
+class SettingOut(StrictModel):
+    key: str
+    value: Any
+
+
+class SettingPatch(StrictModel):
+    value: Any
+
+
+class NodeCapabilityOut(StrictModel):
+    supported: bool
+    enabled: bool
+    capacity: int | None = None
+
+
+class NodeConfigurationOut(StrictModel):
+    node_id: str
+    address: str | None = None
+    started_at: int
+    heartbeat_at: int
+    version: str
     settings: dict[str, Any]
+    capabilities: dict[str, NodeCapabilityOut]
 
 
-class RuntimeNodePatch(StrictModel):
+class AssignmentOut(StrictModel):
+    function: str
+    resource_id: int
+    owner_node_id: str | None = None
+    generation: int
+    expires_at: int
+    updated_at: int
+
+
+class NodeConfigurationPatch(StrictModel):
     settings: dict[str, Any] = Field(default_factory=dict)
     capabilities: dict[str, dict[str, Any]] = Field(default_factory=dict)

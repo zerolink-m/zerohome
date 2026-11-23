@@ -53,7 +53,7 @@ async def test_photo_get_and_delete_use_configured_dir(client, mk_user, mk_cam, 
     assert r.status_code == 200 and r.content == b"\xff\xd8jpegdata"
 
     r = await client.delete(f"/v1/motion/events/{eid}", headers=h)
-    assert r.json()["code"] == "007"
+    assert r.json()["code"] == "009"
     assert not photo.exists()
 
 

@@ -95,7 +95,7 @@ async def test_crud_hooks_follow_enabled_and_connection_fields(ingest_on, client
 
         # address/path change -> restart
         r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"path": "ok?rate=10"}))
-        assert r.json()["code"] == "003"
+        assert r.json()["code"] == "002"
         assert await wait_until(lambda: len(starts(fake_log)) == 2)
         assert await wait_until(lambda: not alive(pid1))
         pid2 = starts(fake_log)[1][0]
@@ -115,7 +115,7 @@ async def test_crud_hooks_follow_enabled_and_connection_fields(ingest_on, client
 
         # delete -> stopped
         r = await client.delete(f"/v1/cams/{cid}", headers=h)
-        assert r.json()["code"] == "007"
+        assert r.json()["code"] == "009"
         assert not ingest_on.is_running(cid)
         assert await wait_until(lambda: not any(alive(p) for p, _ in starts(fake_log)))
     finally:
@@ -154,9 +154,9 @@ async def test_ingest_failure_does_not_break_api(ingest_on, client, mk_user, mon
     assert r.status_code == 201
     cid = r.json()["data"]["cam"]["id"]
     r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"address": "127.0.0.2"}))
-    assert r.json()["code"] == "003"
+    assert r.json()["code"] == "002"
     r = await client.delete(f"/v1/cams/{cid}", headers=h)
-    assert r.json()["code"] == "007"
+    assert r.json()["code"] == "009"
 
 
 async def test_start_all_survives_db_error(ingest_on, monkeypatch):

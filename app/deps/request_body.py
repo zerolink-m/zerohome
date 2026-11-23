@@ -11,9 +11,10 @@
         body.valid()        # [(index, obj)] ; body.invalid() -> failed_item dicts
         body.partial_allowed
 
-Errors: 107 wrong Content-Type, 117 broken JSON, 121 empty body, 109 invalid
-envelope/data (Field objects), 146 too many bulk items, 118 bad partial_allowed query.
-Atomic mode (partial_allowed false): any invalid item -> 109 for the whole request.
+Errors: 264 unsupported body format, 063 invalid JSON, 073 empty body,
+269 validation error for invalid envelope/data (Field objects), 132 bulk limit exceeded,
+066 invalid query for bad partial_allowed.
+Atomic mode (partial_allowed false): any invalid item -> 269 validation error for the whole request.
 """
 from __future__ import annotations
 
@@ -103,11 +104,8 @@ async def read_envelope(request: Request, *, optional: bool = False) -> tuple[di
             "data": field_error("is required", required=True, type="object")})
     data = body.get("data")
     if data is None:
-        if optional:
-            data = {}
-        else:
-            raise AppError(codes.VALIDATION_ERROR, "Some fields are invalid", fields={
-                "data": field_error("is required", required=True, type="object")})
+        raise AppError(codes.VALIDATION_ERROR, "Some fields are invalid", fields={
+            "data": field_error("is required", required=True, type="object")})
     if not isinstance(data, dict):
         raise AppError(codes.VALIDATION_ERROR, "Some fields are invalid", fields={
             "data": field_error("type mismatch", type="object", actual_type=py_type_name(data))})
@@ -167,7 +165,6 @@ def single_body(key: str, schema: type[BaseModel], *, optional: bool = False):
             raise AppError(codes.VALIDATION_ERROR, "Some fields are invalid", fields=fields_from_errors(errs, (key,)))
         return SingleBody(obj=obj, options=options)
 
-    declare(_dep, "partial")
     return _dep
 
 

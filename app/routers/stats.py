@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError
+from app.core.introspection import declare
 from app.core.response import success
 from app.core.codes import FORBIDDEN_ROLE
 from app.core.rate_limit import rate_limit
@@ -41,6 +42,9 @@ async def get_all_stats(
     """Get all application statistics (admin only)"""
     stats = await stats_collector.get_all_stats(period_hours=period)
     return success(AllStats(**stats).model_dump())
+
+
+declare(get_all_stats, "x-period")
 
 
 @router.get("/system", dependencies=[Depends(rate_limit("stats", capacity=20, per_minute=20))])
@@ -90,6 +94,9 @@ async def get_motion_stats(
     """Get motion detection statistics (admin only)"""
     stats = await stats_collector.get_motion_stats(db, period_hours=period)
     return success({"motion": MotionStats(**stats).model_dump()})
+
+
+declare(get_motion_stats, "x-period")
 
 
 @router.get("/users", dependencies=[Depends(rate_limit("stats", capacity=20, per_minute=20))])

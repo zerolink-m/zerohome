@@ -4,6 +4,7 @@ import httpx
 import pytest
 from fastapi import FastAPI, Request
 
+from app.core import rate_limit as rate_limit_module
 from app.core.codes import FORBIDDEN_ROLE
 from app.core.errors import AppError, app_error_handler
 from app.db.session import get_db
@@ -82,6 +83,9 @@ class _MemoryDB:
     async def commit(self):
         return None
 
+    async def refresh(self, row):
+        return None
+
 
 @pytest.fixture
 async def runtime_client():
@@ -109,50 +113,63 @@ async def runtime_client():
 async def test_global_runtime_get_redacts_secrets_and_patch_requires_cursedapi_envelope(runtime_client):
     client, db = runtime_client
     admin = {"x-test-role": "admin"}
-    got = await client.get("/v1/config/runtime", headers=admin)
+    got = await client.get("/v1/system-settings/JWT_SECRET_SHARE", headers=admin)
     assert got.status_code == 200
-    assert got.json()["data"]["revision"] == 3
-    assert got.json()["data"]["settings"]["JWT_SECRET_SHARE"] == {"configured": True}
+    assert got.json()["metadata"]["revision"] == 3
+    assert got.json()["data"]["system_setting"] == {"key": "JWT_SECRET_SHARE", "value": {"configured": True}}
     assert "do-not-return-this" not in got.text
-    assert (await client.get("/v1/config/runtime")).json()["code"] == "050"
+    assert (await client.get("/v1/system-settings/JWT_SECRET_SHARE")).json()["code"] == "186"
 
-    raw = await client.patch("/v1/config/runtime", headers=admin,
-                             json={"MOTION_DETECTION_ENABLED": False})
-    assert raw.json()["code"] == "109"
+    path = "/v1/system-settings/MOTION_DETECTION_ENABLED"
+    raw = await client.patch(path, headers=admin, json={"MOTION_DETECTION_ENABLED": False})
+    assert raw.json()["code"] == "269"
 
     patched = await client.patch(
-        "/v1/config/runtime", headers=admin,
-        json={"data": {"runtime": {"settings": {"MOTION_DETECTION_ENABLED": False}}},
+        path, headers=admin,
+        json={"data": {"setting": {"value": False}},
               "options": {"partial_allowed": False}},
     )
     assert patched.status_code == 200
-    assert patched.json()["data"] == {"revision": 4, "restart_required": True}
+    assert patched.json()["data"]["system_setting"] == {"key": "MOTION_DETECTION_ENABLED", "value": False}
+    assert {key: patched.json()["metadata"][key] for key in ("revision", "restart_required")} == {
+        "revision": 4, "restart_required": True,
+    }
     assert db.globals["MOTION_DETECTION_ENABLED"].value is False
+    buckets = rate_limit_module._buckets
+    assert buckets["system_settings_read:127.0.0.1"].capacity == 60
+    assert buckets["system_settings_write:127.0.0.1"].capacity == 30
 
 
 @pytest.mark.asyncio
 async def test_node_runtime_get_and_patch_use_cursedapi_envelope(runtime_client):
     client, db = runtime_client
     headers = {"x-test-role": "admin"}
-    path = "/v1/config/runtime/nodes/api-test-node"
+    path = "/v1/nodes/api-test-node"
     got = await client.get(path, headers=headers)
     assert got.status_code == 200
-    assert got.json()["data"]["settings"]["CACHE_DIR"] == "/cache"
-    assert got.json()["data"]["capabilities"]["motion"]["enabled"] is True
+    assert got.json()["data"]["node"]["settings"]["CACHE_DIR"] == "/cache"
+    assert got.json()["data"]["node"]["capabilities"]["motion"]["enabled"] is True
 
     raw = await client.patch(path, headers=headers,
                              json={"capabilities": {"motion": {"enabled": False}}})
-    assert raw.json()["code"] == "109"
+    assert raw.json()["code"] == "269"
 
     patched = await client.patch(
         path, headers=headers,
-        json={"data": {"runtime": {
+        json={"data": {"node": {
             "settings": {"CACHE_DIR": "/srv/cache"},
             "capabilities": {"motion": {"enabled": False, "capacity": 0}},
         }}},
     )
     assert patched.status_code == 200
-    assert patched.json()["data"] == {"revision": 4, "restart_required": True}
+    assert patched.json()["data"]["node"]["settings"]["CACHE_DIR"] == "/srv/cache"
+    assert patched.json()["data"]["node"]["capabilities"]["motion"]["enabled"] is False
+    assert {key: patched.json()["metadata"][key] for key in ("revision", "restart_required")} == {
+        "revision": 4, "restart_required": True,
+    }
     assert db.node_settings["CACHE_DIR"].value == "/srv/cache"
     assert db.capabilities["motion"].enabled is False
     assert db.capabilities["motion"].capacity == 0
+    buckets = rate_limit_module._buckets
+    assert buckets["nodes_read:127.0.0.1"].capacity == 60
+    assert buckets["nodes_write:127.0.0.1"].capacity == 30

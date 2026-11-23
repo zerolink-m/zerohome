@@ -12,13 +12,13 @@ from app.core.response import edited, single
 from app.core.security import TokenPayload
 from app.db.session import get_db
 from app.deps.auth import AccessContext, require_access, resolve_stream_access
-from app.deps.request_body import SingleBody, single_body
+from app.deps.request_body import SingleBody
 from app.models.cams import Cam
 from app.schemas.cams import CamOnvifPatch
 from app.schemas.ptz import PTZCommandIn, PTZPositionOut
 from app.services import onvif_client, ptz_lock, snapshot, stream_manager
 
-from app.routers.cams._common import _get_cam_for_access, router
+from app.routers.cams._common import _get_cam_for_access, router, single_body_for_route
 
 
 
@@ -72,7 +72,7 @@ async def get_ptz(
 @router.post("/{id}/ptz", dependencies=[Depends(rate_limit("cams_ptz_move", capacity=15, per_minute=15))])
 async def move_ptz(
     id: int,
-    body: SingleBody[PTZCommandIn] = Depends(single_body("ptz", PTZCommandIn)),
+    body: SingleBody[PTZCommandIn] = Depends(single_body_for_route("ptz", PTZCommandIn)),
     ctx: AccessContext = Depends(resolve_stream_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -91,6 +91,7 @@ async def move_ptz(
 
 
 @router.get("/{id}/snapshot", dependencies=[Depends(rate_limit("cams_snapshot_live", capacity=600, per_minute=600))])
+@supports("x-snapshot")
 async def get_live_snapshot(
     id: int,
     ctx: AccessContext = Depends(resolve_stream_access),
@@ -109,7 +110,7 @@ async def get_live_snapshot(
 @router.patch("/{id}/onvif", dependencies=[Depends(rate_limit("cams_write", capacity=20, per_minute=20))])
 async def update_onvif_settings(
     id: int,
-    body: SingleBody[CamOnvifPatch] = Depends(single_body("onvif", CamOnvifPatch)),
+    body: SingleBody[CamOnvifPatch] = Depends(single_body_for_route("onvif", CamOnvifPatch)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):

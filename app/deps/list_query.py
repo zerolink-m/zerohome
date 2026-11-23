@@ -1,18 +1,16 @@
 """List query dependency (docs/query.md, objects/settings.md).
 
     q_dep = list_query(model=Cam, sortable=["id", "name"], searchable=["name", "addr"],
-                       expand=["owner"])        # expand=None -> endpoint has no expand (215)
+                       expand=["owner"])        # expand=None -> 351 (EXPAND_NOT_IMPLEMENTED)
 
     @router.get("")
     async def list_cams(q: ListQuery = Depends(q_dep), db=Depends(get_db)):
         rows, total = await q.paginate(db, select(Cam))
         return listing("cams", [serialize(r) for r in rows], query=q, total=total)
 
-Decisions on ambiguities in the spec (see report): search_method tokens are a
-sequence; comparison tokens (equals/exactly/include/starts/ends/exclude) consume
-the next (search, column) pair, connector tokens (and/or/and_not/or_not) consume
-none and join the previous condition with the next one. Default comparison:
-include; default connector: or. Evaluated left to right, no precedence.
+In cursedapi v1.2 simple search methods are comparisons only and all conditions
+are combined with AND. Advanced logical composition belongs to `filter`, which
+remains unsupported by this dependency.
 """
 from __future__ import annotations
 
@@ -20,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from fastapi import Query
-from sqlalchemy import String, and_, cast, func, not_, or_, select
+from sqlalchemy import String, and_, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import codes
@@ -31,13 +29,12 @@ from app.core.validation import field_error
 DEFAULT_LIMIT = 25
 MAX_LIMIT = 255
 COMPARISONS = ("equals", "exactly", "include", "starts", "ends", "exclude")
-CONNECTORS = ("and", "or", "and_not", "or_not")
-_ORDER = {"asc": "ascending", "ascending": "ascending", "desc": "descending", "descending": "descending"}
+_ORDER = {"asc": "asc", "desc": "desc"}
 
 
 def split_list(raw: str, param: str) -> list[str]:
     """Split on commas honouring '...'/"..." quoting ('' / "" escape a quote inside).
-    Empty positions -> 188; malformed quoting -> 118."""
+    Empty positions -> 297 (SEARCH_EMPTY_POSITION); malformed quoting -> 066 (INVALID_QUERY)."""
     out: list[str] = []
     i, n = 0, len(raw)
     while True:
@@ -107,7 +104,7 @@ class Condition:
 class ListQuery:
     limit: int = DEFAULT_LIMIT
     offset: int = 0
-    order: list[str] = field(default_factory=lambda: ["ascending"])
+    order: list[str] = field(default_factory=lambda: ["asc"])
     sort_by: list[str] = field(default_factory=list)
     conditions: list[Condition] = field(default_factory=list)
     expand: list[str] = field(default_factory=list)
@@ -121,6 +118,7 @@ class ListQuery:
             "order": ",".join(self.order),
             "sort_by": r.get("sort_by"), "search": r.get("search"),
             "search_method": r.get("search_method"), "search_column": r.get("search_column"),
+            "filter": r.get("filter"),
         }
 
     def _col(self, name: str):
@@ -135,12 +133,8 @@ class ListQuery:
                 expr = cond
             elif c.connector == "and":
                 expr = and_(expr, cond)
-            elif c.connector == "and_not":
-                expr = and_(expr, not_(cond))
-            elif c.connector == "or_not":
-                expr = or_(expr, not_(cond))
             else:
-                expr = or_(expr, cond)
+                expr = and_(expr, cond)
         return expr
 
     def apply(self, stmt):
@@ -151,7 +145,7 @@ class ListQuery:
         for i, name in enumerate(self.sort_by):
             col = self._col(name)
             direction = self.order[i] if len(self.order) > 1 else self.order[0]
-            stmt = stmt.order_by(col.desc() if direction == "descending" else col.asc())
+            stmt = stmt.order_by(col.desc() if direction == "desc" else col.asc())
         return stmt
 
     async def paginate(self, db: AsyncSession, stmt):
@@ -192,9 +186,17 @@ def _compare(col, method: str, value: str, name: str):
     raise AppError(codes.INVALID_QUERY, "Unknown search method")  # pragma: no cover
 
 
-def _parse_search(search, column, method, searchable: set[str]) -> list[Condition]:
+def _canonical_list(values: list[str]) -> str:
+    def quote(value: str) -> str:
+        if any(char in value for char in ",'\""):
+            return "'" + value.replace("'", "''") + "'"
+        return value
+    return ",".join(quote(value) for value in values)
+
+
+def _parse_search(search, column, method, searchable: set[str]) -> tuple[list[Condition], dict[str, str | None]]:
     if search is None and column is None and method is None:
-        return []
+        return [], {"search": None, "search_column": None, "search_method": None}
     if search is None or column is None:
         raise AppError(codes.INVALID_QUERY, "search and search_column must be passed together", query={
             ("search" if search is None else "search_column"): field_error("is required with the other", required=True)})
@@ -202,9 +204,9 @@ def _parse_search(search, column, method, searchable: set[str]) -> list[Conditio
     cols = split_list(column, "search_column")
     tokens = split_list(method, "search_method") if method is not None else []
     for t in tokens:
-        if t not in COMPARISONS and t not in CONNECTORS:
+        if t not in COMPARISONS:
             raise AppError(codes.INVALID_QUERY, "Invalid search method", query={
-                "search_method": field_error("unknown method", enum=list(COMPARISONS + CONNECTORS), value=t)})
+                "search_method": field_error("unknown method", enum=list(COMPARISONS), value=t)})
     for c in cols:
         if c not in searchable:
             raise AppError(codes.INVALID_SEARCH_COLUMN, "Invalid search column", query={
@@ -212,36 +214,21 @@ def _parse_search(search, column, method, searchable: set[str]) -> list[Conditio
     n = len(values)
     if len(cols) == 1:
         cols = cols * n
-    comps = [t for t in tokens if t in COMPARISONS]
-    if not comps:
-        comps = ["include"] * n
-    elif len(comps) == 1:
+    comps = tokens or ["include"]
+    if len(comps) == 1:
         comps = comps * n
     if len(cols) != n or len(comps) != n:
         raise AppError(codes.SEARCH_LENGTH_MISMATCH, "Search values, columns and methods have different lengths", query={
             "search": field_error(f"{n} values", actual_length=n),
             "search_column": field_error(f"{len(cols)} columns", actual_length=len(cols)),
             "search_method": field_error(f"{len(comps)} comparisons", actual_length=len(comps))})
-    # connectors: attach to the next comparison; default "or"
-    conns: list[str | None] = [None] * n
-    ci = -1
-    pending: str | None = None
-    for t in tokens:
-        if t in CONNECTORS:
-            if ci < 0 or pending is not None:
-                raise _bad("search_method", "connector must stand between two comparisons", method)
-            pending = t
-        else:
-            ci += 1
-            if pending is not None:
-                conns[ci] = pending
-                pending = None
-    if pending is not None:
-        raise _bad("search_method", "connector must stand between two comparisons", method)
-    return [
-        Condition(cols[i], comps[i], values[i], None if i == 0 else (conns[i] or "or"))
-        for i in range(n)
-    ]
+    normalized = {
+        "search": _canonical_list(values),
+        "search_column": _canonical_list(cols),
+        "search_method": _canonical_list(comps),
+    }
+    conditions = [Condition(cols[i], comps[i], values[i], None if i == 0 else "and") for i in range(n)]
+    return conditions, normalized
 
 
 def list_query(
@@ -256,8 +243,9 @@ def list_query(
 ):
     """Build the dependency. `sortable`/`searchable`: column names (resolved with
     getattr(model, name)) or a {name: column_expression} mapping. `expand=None` means
-    the endpoint has no expansion (expand param -> 215); a list = allowed relations
-    (unknown -> 184). `disabled` = functions turned off on this server (-> 182)."""
+    the endpoint has no expansion (expand param -> 351, EXPAND_NOT_IMPLEMENTED); a list = allowed relations
+    (unknown -> 160, EXPAND_NOT_SUPPORTED). `disabled` = functions turned off on this server
+    (-> 155, FUNCTION_DISABLED)."""
     def _cols(spec):
         if isinstance(spec, Mapping):
             return dict(spec)
@@ -282,8 +270,12 @@ def list_query(
         search: str | None = Query(None),
         search_column: str | None = Query(None),
         search_method: str | None = Query(None),
+        filter_q: str | None = Query(None, alias="filter"),
         expand_q: str | None = Query(None, alias="expand"),
     ) -> ListQuery:
+        if filter_q is not None:
+            raise AppError(codes.FUNCTION_NOT_SUPPORTED, "Advanced filter is not supported by this endpoint", query={
+                "filter": field_error("function is not supported")})
         if (search is not None or search_column is not None or search_method is not None) and not search_cols:
             raise AppError(codes.FUNCTION_NOT_SUPPORTED, "Search is not supported by this endpoint", query={
                 "search": field_error("function is not supported")})
@@ -311,20 +303,22 @@ def list_query(
             if c not in sort_cols:
                 raise AppError(codes.INVALID_SORT_FIELD, "Invalid sort field", query={
                     "sort_by": field_error("field is not sortable", enum=sorted(sort_cols), value=c)})
-        order_list = ["ascending"]
+        order_list = ["asc"]
         if order is not None:
             toks = split_list(order, "order")
             for t in toks:
                 if t.lower() not in _ORDER:
                     raise AppError(codes.INVALID_QUERY, "Invalid query parameters", query={
-                        "order": field_error("invalid direction", enum=["asc", "ascending", "desc", "descending"], value=t)})
+                        "order": field_error("invalid direction", enum=["asc", "desc"], value=t)})
             order_list = [_ORDER[t.lower()] for t in toks]
+            if len(order_list) == 1 and sort_list:
+                order_list = order_list * len(sort_list)
             if len(order_list) > 1 and len(order_list) != len(sort_list):
                 raise AppError(codes.INVALID_QUERY, "Invalid query parameters", query={
                     "order": field_error("must have one value or one per sort_by column",
                                          actual_length=len(order_list), value=order)})
 
-        conditions = _parse_search(search, search_column, search_method, set(search_cols))
+        conditions, normalized_search = _parse_search(search, search_column, search_method, set(search_cols))
 
         exp: list[str] = []
         if expand_q is not None:
@@ -340,7 +334,11 @@ def list_query(
         return ListQuery(
             limit=lim, offset=off_, order=order_list, sort_by=sort_list,
             conditions=conditions, expand=exp, columns=all_cols,
-            raw={"sort_by": sort_by, "search": search, "search_method": search_method, "search_column": search_column},
+            raw={
+                "sort_by": _canonical_list(sort_list) if sort_by is not None else None,
+                **normalized_search,
+                "filter": None,
+            },
         )
 
     fns = ["limit", "offset", "order", "pagination"]

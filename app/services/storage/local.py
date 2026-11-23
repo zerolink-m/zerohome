@@ -34,8 +34,10 @@ class LocalStorage:
 
     async def delete(self, key: str) -> None:
         path = self._destination(key)
-        if path.is_file():
+        try:
             await asyncio.to_thread(path.unlink)
+        except FileNotFoundError:
+            pass
 
     async def exists(self, key: str) -> bool:
         return self._destination(key).is_file()

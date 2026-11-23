@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.base import NonNullablePatch
 
@@ -22,17 +22,7 @@ class MotionEventResponse(BaseModel):
     bbox_height: int | None
     notified_user_ids: str | None
 
-    class Config:
-        from_attributes = True
-
-
-class MotionEventListResponse(BaseModel):
-    """List of motion events with pagination."""
-
-    events: list[MotionEventResponse]
-    total: int
-    limit: int
-    offset: int
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ONVIFSettingsUpdate(NonNullablePatch):

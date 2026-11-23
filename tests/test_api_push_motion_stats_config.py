@@ -39,26 +39,26 @@ async def test_push_settings_get_and_patch(client, setup):
 
     body = {"data": {"push_settings": {"notify_offline": 0}}}
     r = await client.patch(url, headers=bearer(await tok(owner)), json=body)
-    assert r.json()["code"] == "003"
+    assert r.json()["code"] == "002"
     assert r.json()["data"]["push_settings"]["notify_offline"] == 0
     # same values again: not changed
     r = await client.patch(url, headers=bearer(await tok(owner)), json=body)
-    assert r.json()["code"] == "005"
+    assert r.json()["code"] == "007"
 
 
 async def test_push_settings_validation_and_access(client, setup):
     owner, other, _, cam = setup
     url = f"/v1/cams/{cam}/push-settings"
     r = await client.patch(url, headers=bearer(await tok(owner)), json={"enabled": 0})
-    assert r.json()["code"] == "109"
+    assert r.json()["code"] == "269"
     r = await client.patch(url, headers=bearer(await tok(owner)),
                            json={"data": {"push_settings": {"enabled": 5}}})
-    assert r.json()["code"] == "109" and "enabled" in r.json()["error"]["fields"]
+    assert r.json()["code"] == "269" and "enabled" in r.json()["error"]["fields"]
     r = await client.patch(url, headers=bearer(await tok(owner)),
                            json={"data": {"push_settings": {"bogus": 1}}})
-    assert r.json()["code"] == "109"
-    assert (await client.get(url, headers=bearer(await tok(other)))).json()["code"] == "051"
-    assert (await client.get("/v1/cams/9999/push-settings", headers=bearer(await tok(owner)))).json()["code"] == "082"
+    assert r.json()["code"] == "269"
+    assert (await client.get(url, headers=bearer(await tok(other)))).json()["code"] == "189"
+    assert (await client.get("/v1/cams/9999/push-settings", headers=bearer(await tok(owner)))).json()["code"] == "215"
 
 
 # ---------------- motion ----------------
@@ -89,20 +89,20 @@ async def test_motion_events_list_get_delete(client, setup, events):
     eid = d["motion_events"][0]["id"]
     r = await client.get(f"/v1/motion/events/{eid}", headers=h)
     assert r.json()["data"]["motion_event"]["id"] == eid
-    assert (await client.get(f"/v1/motion/events/{eid}", headers=bearer(await tok(other)))).json()["code"] == "051"
+    assert (await client.get(f"/v1/motion/events/{eid}", headers=bearer(await tok(other)))).json()["code"] == "189"
 
-    assert (await client.delete(f"/v1/motion/events/{eid}", headers=bearer(await tok(other)))).json()["code"] == "051"
+    assert (await client.delete(f"/v1/motion/events/{eid}", headers=bearer(await tok(other)))).json()["code"] == "189"
     r = await client.delete(f"/v1/motion/events/{eid}", headers=h)
-    assert r.json()["code"] == "007" and r.json()["data"]["motion_event"] == {"id": eid}
-    assert (await client.get(f"/v1/motion/events/{eid}", headers=h)).json()["code"] == "082"
+    assert r.json()["code"] == "009" and r.json()["data"]["motion_event"] == {"id": eid}
+    assert (await client.get(f"/v1/motion/events/{eid}", headers=h)).json()["code"] == "215"
 
 
 async def test_motion_events_empty_and_bad_limit(client, setup):
     owner, _, _, cam = setup
     r = await client.get(f"/v1/cams/{cam}/motion/events", headers=bearer(await tok(owner)))
-    assert r.json()["code"] == "012" and r.json()["data"]["motion_events"] == []
+    assert r.json()["code"] == "019" and r.json()["data"]["motion_events"] == []
     r = await client.get(f"/v1/cams/{cam}/motion/events?limit=500", headers=bearer(await tok(owner)))
-    assert r.json()["code"] == "183"
+    assert r.json()["code"] == "158"
 
 
 async def test_motion_control(client, setup, monkeypatch, sessionmaker_):
@@ -125,7 +125,7 @@ async def test_motion_control(client, setup, monkeypatch, sessionmaker_):
     h = bearer(await tok(owner))
 
     # owner not allowed motion detection yet
-    assert (await client.post(f"/v1/cams/{cam}/motion/start", headers=h)).json()["code"] == "051"
+    assert (await client.post(f"/v1/cams/{cam}/motion/start", headers=h)).json()["code"] == "189"
     async with sessionmaker_() as s:
         (await s.get(User, owner)).motion_detection_allowed = 1
         await s.commit()
@@ -135,7 +135,7 @@ async def test_motion_control(client, setup, monkeypatch, sessionmaker_):
     assert r.json()["data"]["motion"]["is_active"] is True
     r = await client.post(f"/v1/cams/{cam}/motion/stop", headers=h)
     assert r.json()["data"]["motion"]["is_active"] is False
-    assert (await client.post(f"/v1/cams/{cam}/motion/stop", headers=bearer(await tok(other)))).json()["code"] == "051"
+    assert (await client.post(f"/v1/cams/{cam}/motion/stop", headers=bearer(await tok(other)))).json()["code"] == "189"
 
 
 # ---------------- stats ----------------
@@ -145,7 +145,7 @@ async def test_stats_admin_only_and_shape(client, setup, monkeypatch):
     monkeypatch.setattr(stats_collector, "get_stream_stats", lambda: {"active_streams": {"fmp4": 1}, "total_clients": 2})
     monkeypatch.setattr(stats_collector, "get_error_stats", lambda: {
         "errors_by_type": {}, "http_4xx": 1, "http_5xx": 0, "rtsp_failures": 0, "onvif_failures": 0})
-    assert (await client.get("/v1/stats/streams", headers=bearer(await tok(owner)))).json()["code"] == "050"
+    assert (await client.get("/v1/stats/streams", headers=bearer(await tok(owner)))).json()["code"] == "186"
     r = await client.get("/v1/stats/streams", headers=bearer(await tok(admin, "admin")))
     assert r.json()["code"] == "000"
     assert r.json()["data"] == {"streams": {"active_streams": {"fmp4": 1}, "total_clients": 2}}
@@ -293,19 +293,19 @@ async def test_config_frontend_versions(client, fv):
     assert r.json()["data"]["config"]["actual_version"] == APP_VERSION
     # update available: data is returned
     r = await client.get("/v1/config?v=v3.2.0-Beta")
-    assert r.status_code == 200 and r.json()["code"] == "020"
+    assert r.status_code == 200 and r.json()["code"] == "384"
     assert r.json()["data"]["config"]["version"] == "v3.2.0-Beta"
     # update needed: no data
     r = await client.get("/v1/config?v=v1.0.0-Release")
-    assert r.status_code == 403 and r.json()["code"] == "063" and r.json()["data"] == {}
+    assert r.status_code == 403 and r.json()["code"] == "387" and r.json()["data"] == {}
     # missing v -> needed
     r = await client.get("/v1/config")
-    assert r.status_code == 403 and r.json()["code"] == "063" and r.json()["data"] == {}
+    assert r.status_code == 403 and r.json()["code"] == "387" and r.json()["data"] == {}
     # malformed v
     r = await client.get("/v1/config?v=1.2.3")
-    assert r.status_code == 400 and r.json()["code"] == "040" and "v" in r.json()["error"]["query"]
+    assert r.status_code == 400 and r.json()["code"] == "059" and "v" in r.json()["error"]["query"]
     # no pattern matches -> needed
     fv({"v9.*.*-*": 0})
     r = await client.get("/v1/config?v=v3.5.1-Release")
-    assert r.json()["code"] == "063"
+    assert r.json()["code"] == "387"
     assert set(r.json()) == {"code", "code_detail", "error", "metadata", "data"}

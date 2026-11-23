@@ -1,4 +1,4 @@
-# Формат ответов (CursedJSON) для cursedapi v1.1
+# Формат ответов (CursedJSON) для cursedapi v1.2
 
 Любой JSON-ответ API оборачивается в единый конверт - [Envelope object](objects/envelope.md):
 
@@ -45,11 +45,12 @@ HTTP 200, код `000`
             "total": 42,
             "limit": 25,
             "offset": 0,
-            "order": "ascending",
+            "order": "asc",
             "sort_by": null,
             "search": null,
             "search_method": null,
-            "search_column": null
+            "search_column": null,
+            "filter": null
         },
         "users": [
             {
@@ -64,7 +65,7 @@ HTTP 200, код `000`
 
 ### Одинарная: получение, изменение, создание, удаление
 
-HTTP 200, коды `000`/`003`/`005`/`007`; создание - HTTP 201, код `001`
+HTTP 200, коды `000`/`002`/`007`/`009`; создание - HTTP 201, код `039`
 
 ```json
 {
@@ -86,12 +87,12 @@ HTTP 200, коды `000`/`003`/`005`/`007`; создание - HTTP 201, код 
 
 Атомарны по умолчанию. Частичное выполнение - только с флагом `partial_allowed` (см. [requests.md](requests.md)).
 
-Полный успех - коды `001`/`003`/`007`, `data` содержит массив объектов. Bulk GET успешен тем же кодом, что и обычный список (`000`).
-Частичный успех - коды `002`/`004`/`008` и [Bulk object](objects/bulk.md):
+Полный успех - коды `039`/`002`/`009`, `data` содержит массив объектов без `settings`. Bulk GET успешен тем же кодом, что и обычный список (`000`), но возвращает только массив объектов под множественным ключом, также без `settings` (см. [Data object](objects/data.md)).
+Частичный успех - коды `041`/`004`/`012` и [Bulk object](objects/bulk.md):
 
 ```json
 {
-    "code": "002",
+    "code": "041",
     "code_detail": "Partially created successfully.",
     "error": {},
     "metadata": {},
@@ -170,7 +171,7 @@ HTTP 4xx/5xx, [Error object](objects/error.md) в `error`, [Field object](object
 
 ```json
 {
-    "code": "109",
+    "code": "269",
     "code_detail": "Validation error.",
     "error": {
         "error": "Some fields are invalid",
@@ -192,13 +193,23 @@ HTTP 4xx/5xx, [Error object](objects/error.md) в `error`, [Field object](object
 }
 ```
 
+При ошибке валидации тела сервер может дополнительно указать `error.request_schema` и `error.request_example` — пример см. в [Error object](objects/error.md). Для ошибки `filter` детали помещаются в `error.query.filter` (код `066`); правила языка — в [filter.md](filter.md).
+
 ### Стриминг
 
-Для потоковых ответов (SSE, чанки) - код `011`. Каждый чанк/событие - отдельный [Envelope object](objects/envelope.md). `metadata` последнего чанка может содержать `finished: true`.
+Для потоковых ответов (SSE, чанки) - код `017`. Каждый чанк/событие - отдельный [Envelope object](objects/envelope.md). `metadata` последнего чанка может содержать `finished: true`.
 
 Спецификация не регулирует заголовок `Accept` и не диктует коды чанков:
 их определяет программист на основе логики своего приложения.
 
 ### Не-JSON ответы
 
-Файлы, бинарные данные, HTML - отдаются без конверта. Content-Type отличен от `application/json`. Служебные заголовки (`cursed-version` и т.д.) всё равно присутствуют - см. [headers.md](headers.md).
+Файлы, бинарные данные, HTML отдаются без конверта. Content-Type отличен от `application/json`; вместо `code` в JSON-теле сервер передаёт `cursed-code` в заголовке. То же правило действует, если тела нет (например, HTTP 304, `HEAD` или ответ `OPTIONS` без JSON). Код соответствует HTTP-статусу по [таблице](codes.md); `cursed-version` остаётся обязательным — см. [headers.md](headers.md).
+
+```http
+HTTP/1.1 304 Not Modified
+cursed-version: 1.2
+cursed-code: 052
+```
+
+Если ответ содержит конверт CursedJSON, `cursed-code` **не** отправляется: источником кода служит поле `code` тела ответа.

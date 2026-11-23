@@ -234,5 +234,5 @@ else
 fi
 
 printf '\nZeroHome is healthy at http://127.0.0.1:8000\n'
-printf 'Admin API: POST /v1/auth/login; Runtime configuration: GET/PATCH /v1/config/runtime\n'
+printf 'Admin API: POST /v1/auth/login; runtime configuration: GET /v1/system-settings, PATCH /v1/system-settings/{key}; nodes: GET/PATCH /v1/nodes/{node_id}; assignments: read-only GET /v1/assignments\n'
 printf '%s\n' 'The app is bound to loopback. Configure a reverse proxy and TLS before exposing it; do not expose the raw app port publicly.'

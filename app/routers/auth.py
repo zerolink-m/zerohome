@@ -9,7 +9,10 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import AUTHORIZED, BAD_CREDENTIALS, EMAIL_TAKEN, LOGGED_OUT, TOKEN_REFRESHED, TOKEN_ERROR, TOKEN_EXPIRED
+from app.core.codes import (
+    AUTHORIZED, BAD_CREDENTIALS, CREATED, EMAIL_TAKEN, LOGGED_OUT,
+    TOKEN_ERROR, TOKEN_EXPIRED, TOKEN_REFRESHED,
+)
 from app.core.errors import AppError
 from app.core.response import success
 from app.core.ip import resolve_ip
@@ -25,6 +28,16 @@ from app.schemas.auth import LoginRequest, RegisterRequest, TokenOut
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
 log = logging.getLogger(__name__)
 _cleanup_task: asyncio.Task | None = None
+
+
+def _request_body(key, schema):
+    """Auth is a virtual/custom API: its body is an envelope, not CRUD partial."""
+    parse = single_body(key, schema)
+
+    async def dependency(request: Request):
+        return await parse(request)
+
+    return dependency
 
 
 async def _cleanup_sessions() -> None:
@@ -67,7 +80,7 @@ def _new_session(user: User, request: Request, now: int, token: str) -> SessionM
 
 @router.post("/register", dependencies=[Depends(rate_limit("auth_register", capacity=3, per_minute=0.3))])
 async def register(request: Request,
-                   req: SingleBody[RegisterRequest] = Depends(single_body("user", RegisterRequest)),
+                   req: SingleBody[RegisterRequest] = Depends(_request_body("user", RegisterRequest)),
                    db: AsyncSession = Depends(get_db)):
     body = req.obj
     if await db.scalar(select(User.id).where(User.email == body.email)) is not None:
@@ -84,12 +97,12 @@ async def register(request: Request,
     except IntegrityError:
         await db.rollback()
         raise AppError(EMAIL_TAKEN, "Email уже занят")
-    return success({"user": {"id": user.id}, "token": token}, code="001")
+    return success({"user": {"id": user.id}, "token": token}, code=CREATED)
 
 
 @router.post("/login", dependencies=[Depends(rate_limit("auth_login", capacity=5, per_minute=1))])
 async def login(request: Request,
-                req: SingleBody[LoginRequest] = Depends(single_body("credentials", LoginRequest)),
+                req: SingleBody[LoginRequest] = Depends(_request_body("credentials", LoginRequest)),
                 db: AsyncSession = Depends(get_db)):
     body = req.obj
     user = await db.scalar(select(User).where(User.email == body.email))
@@ -101,7 +114,7 @@ async def login(request: Request,
     return success(TokenOut(token=token).model_dump(), code=AUTHORIZED)
 
 
-@router.post("/new-refresh", dependencies=[Depends(rate_limit("auth_access", capacity=20, per_minute=20))])
+@router.post("/new-refresh", dependencies=[Depends(rate_limit("auth_new_refresh", capacity=20, per_minute=20))])
 async def new_refresh(request: Request, token: str = Depends(get_bearer_token),
                       db: AsyncSession = Depends(get_db)):
     """One-time exchange of a still-valid legacy session JWT; no access JWT is accepted."""

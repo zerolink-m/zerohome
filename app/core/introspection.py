@@ -15,11 +15,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Iterable
 
-from starlette.routing import Match
+from starlette.routing import Match, WebSocketRoute
 
 CANONICAL_FUNCTIONS = (
     "limit", "offset", "sort_by", "order", "search", "search_method", "search_column",
-    "expand", "bulk", "multi_search", "partial", "streaming", "pagination",
+    "filter", "expand", "bulk", "multi_search", "partial", "streaming", "pagination",
 )
 
 
@@ -97,37 +97,53 @@ def match_routes(scope) -> list:
 
 
 def options_info(scope) -> dict[str, Any] | None:
-    routes = match_routes(scope)
+    # WebSocket routes are not HTTP resources and must not make OPTIONS appear
+    # successful on paths that have no matching HTTP route.
+    routes = [r for r in match_routes(scope) if not isinstance(r, WebSocketRoute)]
     if not routes:
         return None
     methods: set[str] = set()
-    functions: set[str] = set()
+    method_functions: dict[str, set[str]] = {}
     meta: dict[str, Any] = {}
     auth = "off"
     for r in routes:
         methods |= set(getattr(r, "methods", None) or ())
         info = route_info(r)
-        functions |= info["functions"]
+        for method in getattr(r, "methods", None) or ():
+            method_functions.setdefault(method, set()).update(info["functions"])
         meta.update(info["meta"])
         if info["auth"] != "off":
             auth = info["auth"]
     methods.add("OPTIONS")
-    return {"methods": sorted(methods), "functions": sorted(functions), "meta": meta, "auth": auth}
+    order = {name: index for index, name in enumerate(CANONICAL_FUNCTIONS)}
+    advertised = [
+        f"{method}.{name}"
+        for method in sorted(method_functions)
+        for name in sorted(method_functions[method], key=lambda item: (order.get(item, len(order)), item))
+    ]
+    return {
+        "methods": sorted(methods),
+        "method_functions": method_functions,
+        "functions": advertised,
+        "meta": meta,
+        "auth": auth,
+    }
 
 
 def options_headers(info: dict[str, Any]) -> dict[str, str]:
-    fn = set(info["functions"])
+    method_functions = info.get("method_functions", {})
+    fn = set().union(*method_functions.values()) if method_functions else set()
     meta = info["meta"]
+    functions = ",".join(info["functions"]) or "none"
     h = {
-        "Allow": ",".join(info["methods"]),
-        "cursed-supported-functions": ",".join(info["functions"]),
-        "cursed-version": "1.1",
+        "Allow": ", ".join(info["methods"]),
+        "cursed-supported-functions": functions,
+        "cursed-version": "1.2",
         "cursed-bulk": "on" if "bulk" in fn else "off",
         "cursed-paging": "on" if ("pagination" in fn or "offset" in fn) else "off",
         "cursed-streaming": "on" if "streaming" in fn else "off",
         "cursed-search": "on" if "search" in fn else "off",
         "cursed-auth": info["auth"],
-        "cursed-accept": "application/json",
         "cursed-cache": "on" if meta.get("cache") else "off",
     }
     if "bulk" in fn and meta.get("max_bulk"):

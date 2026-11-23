@@ -1,24 +1,24 @@
 import time
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import BAD_REQUEST, EMAIL_TAKEN, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND
+from app.core.codes import EMAIL_TAKEN, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR
 from app.core.errors import AppError
 from app.core.introspection import supports
 from app.core.response import (
     add_warning, bulk, bulk_listing, created, deleted, edited, failed_item, listing, single,
 )
 from app.core.validation import field_error
-from app.deps.ids import parse_ids, partial_query
+from app.deps.ids import parse_ids
 from app.core.rate_limit import rate_limit
 from app.core.security import hash_password, TokenPayload
 from app.db.session import get_db
 from app.deps.auth import require_access, require_access_admin
 from app.deps.list_query import ListQuery, list_query
-from app.deps.request_body import BulkBody, SingleBody, bulk_body, single_body
+from app.deps.request_body import BulkBody, SingleBody, bulk_body, read_envelope, single_body
 from app.models.cams import Cam
 from app.models.connection import Connection
 from app.models.invitation import Invitation
@@ -35,6 +35,27 @@ USERS_COLUMNS = ["id", "name", "surname", "email", "role", "added_at", "updated_
 users_query = list_query(model=User, sortable=USERS_COLUMNS, searchable=USERS_COLUMNS)
 MAX_BULK = 100
 ADMIN_ONLY_FIELDS = ("role", "allow_record", "allow_tuya_local", "motion_detection_allowed")
+
+
+def _crud_body(key, schema):
+    """Parse a CRUD request object without advertising bulk-only partial support."""
+    parse = single_body(key, schema)
+
+    async def dependency(request: Request):
+        return await parse(request)
+
+    return dependency
+
+
+async def _partial_request(request: Request) -> bool:
+    """DELETE bulk accepts no body, or a Request object; options override query."""
+    _, options = await read_envelope(request, optional=True)
+    return options.partial_allowed
+
+
+async def _optional_request_body(request: Request) -> None:
+    """CRUD DELETE may omit its body; a supplied body must still be a Request object."""
+    await read_envelope(request, optional=True)
 
 
 def _to_out(user: User) -> dict:
@@ -189,7 +210,7 @@ async def list_users(
 @router.post("", dependencies=[Depends(rate_limit("users_write", capacity=20, per_minute=20))])
 async def create_user(
     payload: TokenPayload = Depends(require_access_admin),
-    req: SingleBody[UserCreate] = Depends(single_body("user", UserCreate)),
+    req: SingleBody[UserCreate] = Depends(_crud_body("user", UserCreate)),
     db: AsyncSession = Depends(get_db),
 ):
     b = req.obj
@@ -248,18 +269,27 @@ async def get_users_bulk(
 async def patch_users_bulk(
     ids: str,
     payload: TokenPayload = Depends(require_access),
-    req: SingleBody[UserPatch] = Depends(single_body("user", UserPatch)),
+    req: BulkBody[UserPatch] = Depends(bulk_body("users", UserPatch, max_items=MAX_BULK)),
     db: AsyncSession = Depends(get_db),
 ):
     id_list = parse_ids(ids, MAX_BULK)
     partial = req.partial_allowed
+    if len(req.items) != len(id_list):
+        raise AppError(VALIDATION_ERROR, "Количество объектов users должно совпадать с количеством ids", path={
+            "ids": field_error("length mismatch", expected_length=len(id_list), actual_length=len(req.items)),
+            "users": field_error("length mismatch", expected_length=len(id_list), actual_length=len(req.items)),
+        })
+
     succeeded: list[dict] = []
     failed: list[dict] = []
-    for i in id_list:
+    for i, item in zip(id_list, req.items):
+        if item.error is not None:
+            failed.append(failed_item(i, item.error))
+            continue
         try:
             _check_user_access(payload, i)
             user = await _get_user(db, i)
-            await _apply_patch(db, user, req.obj, payload)
+            await _apply_patch(db, user, item.obj, payload)
             succeeded.append(_to_out(user))
             if partial:
                 await db.commit()
@@ -277,7 +307,7 @@ async def patch_users_bulk(
 @supports("bulk", "partial", max_bulk=MAX_BULK)
 async def delete_users_bulk(
     ids: str,
-    partial_allowed: bool = Depends(partial_query),
+    partial_allowed: bool = Depends(_partial_request),
     payload: TokenPayload = Depends(require_access_admin),
     db: AsyncSession = Depends(get_db),
 ):
@@ -316,7 +346,7 @@ async def get_user(id: int, payload: TokenPayload = Depends(require_access), db:
 async def patch_user(
     id: int,
     payload: TokenPayload = Depends(require_access),
-    req: SingleBody[UserPatch] = Depends(single_body("user", UserPatch)),
+    req: SingleBody[UserPatch] = Depends(_crud_body("user", UserPatch)),
     db: AsyncSession = Depends(get_db),
 ):
     _check_user_access(payload, id)
@@ -328,7 +358,12 @@ async def patch_user(
 
 
 @router.delete("/{id}", dependencies=[Depends(rate_limit("users_write", capacity=20, per_minute=20))])
-async def delete_user(id: int, payload: TokenPayload = Depends(require_access_admin), db: AsyncSession = Depends(get_db)):
+async def delete_user(
+    id: int,
+    _body: None = Depends(_optional_request_body),
+    payload: TokenPayload = Depends(require_access_admin),
+    db: AsyncSession = Depends(get_db),
+):
     user = await _get_user(db, id)
     await _delete_user_cascade(db, id, user)
     await db.commit()

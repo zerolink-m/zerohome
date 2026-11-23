@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel
+from app.schemas.base import StrictModel
 
 
-class SystemStats(BaseModel):
+class SystemStats(StrictModel):
     cpu_percent: float
     memory: Dict[str, float]
     disk: Dict[str, float]
@@ -13,12 +13,12 @@ class SystemStats(BaseModel):
     uptime_seconds: int
 
 
-class StreamStats(BaseModel):
+class StreamStats(StrictModel):
     active_streams: Dict[str, int]
     total_clients: int
 
 
-class IngestCamStats(BaseModel):
+class IngestCamStats(StrictModel):
     running: bool
     state: str
     last_error: Optional[str] = None
@@ -30,7 +30,7 @@ class IngestCamStats(BaseModel):
     has_gop: bool
 
 
-class CameraStats(BaseModel):
+class CameraStats(StrictModel):
     total: int
     enabled: int
     disabled: int
@@ -41,13 +41,13 @@ class CameraStats(BaseModel):
     ingest: Optional[Dict[str, IngestCamStats]] = None
 
 
-class RecordingStats(BaseModel):
+class RecordingStats(StrictModel):
     total_recordings: int
     total_size_gb: float
     total_size_bytes: int
 
 
-class MotionStats(BaseModel):
+class MotionStats(StrictModel):
     period_hours: int
     total_events: int
     events_by_object: Dict[str, int]
@@ -56,13 +56,13 @@ class MotionStats(BaseModel):
     top_cameras: List[Dict[str, int]]
 
 
-class UserStats(BaseModel):
+class UserStats(StrictModel):
     total_users: int
     active_sessions: int
     active_shares: int
 
 
-class ErrorStats(BaseModel):
+class ErrorStats(StrictModel):
     errors_by_type: Dict[str, int]
     http_4xx: int
     http_5xx: int
@@ -70,12 +70,12 @@ class ErrorStats(BaseModel):
     onvif_failures: int
 
 
-class PerformanceStats(BaseModel):
+class PerformanceStats(StrictModel):
     endpoints: Dict[str, Dict[str, float]]
     snapshots: Dict[str, Dict[str, float]]
 
 
-class AllStats(BaseModel):
+class AllStats(StrictModel):
     system: SystemStats
     streams: StreamStats
     cameras: CameraStats

@@ -12,10 +12,10 @@ async def test_list_default_settings(c, users):
     r = await c.get("/t/users")
     b = r.json()
     assert r.status_code == 200 and b["code"] == "000"
-    assert b["data"]["settings"] == {"total": 5, "limit": 25, "offset": 0, "order": "ascending", "sort_by": None,
-                                     "search": None, "search_method": None, "search_column": None}
+    assert b["data"]["settings"] == {"total": 5, "limit": 25, "offset": 0, "order": "asc", "sort_by": None,
+                                     "search": None, "search_method": None, "search_column": None, "filter": None}
     assert len(b["data"]["users"]) == 5
-    assert b["metadata"]["page"] == {"current": 1, "pages": 1}
+    assert "page" not in b["metadata"]
 
 
 async def test_paging_sorting(c, users):
@@ -24,24 +24,24 @@ async def test_paging_sorting(c, users):
     names = [u["name"] for u in b["data"]["users"]]
     assert names == sorted(["john", "jane", "bob", "alice", "100%"], reverse=True)[2:4]
     s = b["data"]["settings"]
-    assert s["total"] == 5 and s["order"] == "descending" and s["sort_by"] == "name"
-    assert b["metadata"]["page"] == {"current": 2, "pages": 3}
+    assert s["total"] == 5 and s["order"] == "desc" and s["sort_by"] == "name"
+    assert "page" not in b["metadata"]
 
 
 async def test_multi_order(c, users):
     r = await c.get("/t/users?sort_by=surname,name&order=asc,desc")
-    assert r.status_code == 200 and r.json()["data"]["settings"]["order"] == "ascending,descending"
-    assert err(await c.get("/t/users?sort_by=surname,name&order=asc,desc,asc")) == "118"
-    assert err(await c.get("/t/users?order=sideways")) == "118"
+    assert r.status_code == 200 and r.json()["data"]["settings"]["order"] == "asc,desc"
+    assert err(await c.get("/t/users?sort_by=surname,name&order=asc,desc,asc")) == "066"
+    assert err(await c.get("/t/users?order=sideways")) == "066"
 
 
 @pytest.mark.parametrize("qs,code", [
-    ("limit=abc", "145"), ("limit=0", "145"), ("limit=256", "183"), ("offset=-1", "145"), ("offset=x", "145"),
-    ("sort_by=email", "143"), ("search=a&search_column=password", "144"), ("search=a", "118"),
-    ("search=a,,b&search_column=name", "188"), ("search=a,b&search_column=name,,surname", "188"),
-    ("search=a,b,c&search_column=name,surname", "189"), ("search=a&search_column=name&search_method=bogus", "118"),
-    ("search=a&search_column=name&search_method=or", "118"), ("search=a,b&search_column=name&search_method=include,or", "118"),
-    ("expand=zzz", "184"),
+    ("limit=abc", "129"), ("limit=0", "129"), ("limit=256", "158"), ("offset=-1", "129"), ("offset=x", "129"),
+    ("sort_by=email", "125"), ("search=a&search_column=password", "127"), ("search=a", "066"),
+    ("search=a,,b&search_column=name", "297"), ("search=a,b&search_column=name,,surname", "297"),
+    ("search=a,b,c&search_column=name,surname", "300"), ("search=a&search_column=name&search_method=bogus", "066"),
+    ("search=a&search_column=name&search_method=or", "066"), ("search=a,b&search_column=name&search_method=include,or", "066"),
+    ("expand=zzz", "160"),
 ])
 async def test_query_errors(c, users, qs, code):
     r = await c.get(f"/t/users?{qs}")
@@ -64,22 +64,20 @@ async def test_search_methods(c, users):
     assert await names("search=1&search_column=id&search_method=equals") == ["john"]
 
 
-async def test_multisearch_connectors(c, users):
+async def test_multisearch_conditions_are_and_only(c, users):
     async def names(qs):
         r = await c.get(f"/t/users?{qs}&sort_by=id")
         assert r.status_code == 200, r.text
         return [u["name"] for u in r.json()["data"]["users"]]
 
-    # default connector is OR (README example): equals + or + include
-    r = await c.get("/t/users?search=john,doe&search_column=name,surname&search_method=exactly,or,include&sort_by=id")
-    assert [u["name"] for u in r.json()["data"]["users"]] == ["john", "bob"]
-    assert r.json()["data"]["settings"]["search_method"] == "exactly,or,include"
-    assert await names("search=john,doe&search_column=name,surname&search_method=equals,include") == ["john", "bob"]
-    assert await names("search=doe,b&search_column=surname,name&search_method=include,and,include") == ["bob"]
-    assert await names("search=doe,john&search_column=surname,name&search_method=equals,and_not,equals") == ["bob"]
-    assert await names("search=john,doe&search_column=name,surname&search_method=equals,or_not,equals") == ["john", "jane", "alice", "100%"] or True
-    # single column / single method broadcast
-    assert await names("search=john,jane&search_column=name&search_method=equals") == ["john", "jane"]
+    r = await c.get("/t/users?search=john,doe&search_column=name,surname&search_method=exactly,include&sort_by=id")
+    assert [u["name"] for u in r.json()["data"]["users"]] == ["john"]
+    assert r.json()["data"]["settings"]["search_method"] == "exactly,include"
+    assert await names("search=john,doe&search_column=name,surname&search_method=equals,include") == ["john"]
+    assert await names("search=doe,b&search_column=surname,name&search_method=include,include") == ["bob"]
+    assert err(await c.get("/t/users?search=john,doe&search_column=name,surname&search_method=equals,or")) == "066"
+    # A single column/method broadcasts; the AND semantics still apply.
+    assert await names("search=john,jane&search_column=name&search_method=equals") == []
 
 
 async def test_escaping(c, users):
@@ -98,15 +96,15 @@ def test_split_list():
     assert split_list('"1,2"', "p") == ["1,2"]
     assert split_list("'it''s'", "p") == ["it's"]
     assert split_list("\"'test'\"", "p") == ["'test'"]
-    for bad, code in (("a,,b", "188"), (",a", "188"), ("a,", "188"), ("it's", "118"), ("'open", "118"), ("'a'b", "118")):
+    for bad, code in (("a,,b", "297"), (",a", "297"), ("a,", "297"), ("it's", "066"), ("'open", "066"), ("'a'b", "066")):
         with pytest.raises(AppError) as e:
             split_list(bad, "p")
         assert e.value.code == code, bad
 
 
-async def test_empty_result_code_012(c, users):
+async def test_empty_result_code_019(c, users):
     r = await c.get("/t/users?search=zzz&search_column=name")
-    assert r.json()["code"] == "012" and r.json()["data"]["users"] == []
+    assert r.json()["code"] == "019" and r.json()["data"]["users"] == []
     assert r.json()["data"]["settings"]["total"] == 0
 
 

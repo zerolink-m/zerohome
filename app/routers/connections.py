@@ -65,6 +65,19 @@ connections_query = list_query(model=Connection, sortable=CONNECTIONS_COLUMNS, s
 MAX_BULK = 50
 
 
+def _single_body(key, schema):
+    """Single-object requests do not implement bulk partial execution.
+
+    The shared body factory currently carries the ``partial`` declaration for
+    bulk callers too, so clear it for this router's ordinary single-object
+    methods before FastAPI introspects the dependency.
+    """
+    dependency = single_body(key, schema)
+    dependency.cursed_functions = frozenset()
+    dependency.cursed_meta = {}
+    return dependency
+
+
 def _visibility_where(payload: TokenPayload):
     """Admins see every connection; regular users only their own. Kept as a
     helper (mirrors the pattern in cams/switches routers) so future roles
@@ -299,7 +312,7 @@ async def get_connection(
 
 @router.post("", dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))])
 async def create_connection(
-    body: SingleBody[ConnectionCreate] = Depends(single_body("connection", ConnectionCreate)),
+    body: SingleBody[ConnectionCreate] = Depends(_single_body("connection", ConnectionCreate)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -390,7 +403,7 @@ async def patch_connections_bulk(
 )
 async def patch_connection(
     connection_id: int,
-    body: SingleBody[ConnectionPatch] = Depends(single_body("connection", ConnectionPatch)),
+    body: SingleBody[ConnectionPatch] = Depends(_single_body("connection", ConnectionPatch)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
