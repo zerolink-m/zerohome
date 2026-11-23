@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,9 +16,10 @@ from app.core.security import TokenPayload
 from app.db.session import get_db
 from app.deps.auth import IDLE_SECONDS, require_access
 from app.deps.list_query import ListQuery, list_query
+from app.deps.request_body import read_envelope
 from app.models.session import Session as SessionModel
 from app.models.user import User
-from app.deps.ids import parse_ids, partial_query
+from app.deps.ids import parse_ids
 from app.routers.users import MAX_BULK
 from app.schemas.session import SessionOut
 
@@ -61,6 +62,17 @@ def _not_found(id) -> AppError:
         "id": field_error("object not found", type="int", value=id)})
 
 
+async def _partial_request(request: Request) -> bool:
+    """DELETE bulk accepts no body, or a Request object; options override query."""
+    _, options = await read_envelope(request, optional=True)
+    return options.partial_allowed
+
+
+async def _optional_request_body(request: Request) -> None:
+    """CRUD DELETE may omit its body; a supplied body must still be a Request object."""
+    await read_envelope(request, optional=True)
+
+
 @router.get("/{user_id}/sessions", dependencies=[Depends(rate_limit("users_read", capacity=60, per_minute=60))])
 async def list_sessions(
     user_id: int,
@@ -98,7 +110,7 @@ async def get_sessions_bulk(
 async def delete_sessions_bulk(
     user_id: int,
     ids: str,
-    partial_allowed: bool = Depends(partial_query),
+    partial_allowed: bool = Depends(_partial_request),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -139,6 +151,7 @@ async def get_session(
 async def delete_session(
     user_id: int,
     id: int,
+    _body: None = Depends(_optional_request_body),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):

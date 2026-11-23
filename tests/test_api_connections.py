@@ -59,12 +59,12 @@ async def test_create_redacts_and_syncs(client, users, _mock_ext):
     o, _, _ = users
     r = await client.post("/v1/connections", headers=bearer(await tok(o)), json=body(**conn()))
     j = r.json()
-    assert r.status_code == 201 and j["code"] == "001"
+    assert r.status_code == 201 and j["code"] == "039"
     c = j["data"]["connection"]
     assert "access_secret" not in c["meta"] and c["meta"]["access_id"] == "aid"
     assert _mock_ext["sync"] == [c["id"]]
     r = await client.post("/v1/connections", headers=bearer(await tok(o)), json=body(**conn(enabled=0)))
-    assert r.json()["code"] == "001" and _mock_ext["sync"] == [c["id"]]
+    assert r.json()["code"] == "039" and _mock_ext["sync"] == [c["id"]]
 
 
 async def test_create_validation(client, users):
@@ -86,7 +86,7 @@ async def test_list_get_visibility(client, users):
     d = r.json()["data"]
     assert r.json()["code"] == "000" and d["settings"]["total"] == 1 and d["connections"][0]["id"] == cid
     r = await client.get("/v1/connections", headers=bearer(await tok(t)))
-    assert r.json()["code"] == "012"
+    assert r.json()["code"] == "019"
     r = await client.get(f"/v1/connections/{cid}", headers=bearer(await tok(t)))
     assert r.status_code == 404 and r.json()["code"] == OBJECT_NOT_FOUND
     r = await client.get(f"/v1/connections/{cid}", headers=bearer(await tok(a, "admin")))
@@ -99,13 +99,13 @@ async def test_patch(client, users, _mock_ext):
     h = bearer(await tok(o))
     _mock_ext["sync"].clear()
     r = await client.patch(f"/v1/connections/{cid}", headers=h, json=body(name="new"))
-    assert r.json()["code"] == "003" and r.json()["data"]["connection"]["name"] == "new"
+    assert r.json()["code"] == "002" and r.json()["data"]["connection"]["name"] == "new"
     assert _mock_ext["sync"] == []
     r = await client.patch(f"/v1/connections/{cid}", headers=h, json=body(name="new"))
-    assert r.json()["code"] == "005"
+    assert r.json()["code"] == "007"
     new_meta = {**META, "access_secret": "other"}
     r = await client.patch(f"/v1/connections/{cid}", headers=h, json=body(meta=new_meta))
-    assert r.json()["code"] == "003" and _mock_ext["sync"] == [cid]
+    assert r.json()["code"] == "002" and _mock_ext["sync"] == [cid]
     assert ("aid", "openapi.tuyaeu.com") in _mock_ext["inval"]
     r = await client.patch(f"/v1/connections/{cid}", headers=h, json=body(meta={"access_id": "a"}))
     assert r.json()["code"] == CONNECTION_INVALID and r.status_code == 400
@@ -119,7 +119,7 @@ async def test_delete(client, users, _mock_ext):
     r = await client.delete(f"/v1/connections/{cid}", headers=bearer(await tok(t)))
     assert r.json()["code"] == OBJECT_NOT_FOUND
     r = await client.delete(f"/v1/connections/{cid}", headers=bearer(await tok(o)))
-    assert r.json()["code"] == "007" and r.json()["data"]["connection"] == {"id": cid}
+    assert r.json()["code"] == "009" and r.json()["data"]["connection"] == {"id": cid}
     assert ("aid", "openapi.tuyaeu.com") in _mock_ext["inval"]
     r = await client.get(f"/v1/connections/{cid}", headers=bearer(await tok(o)))
     assert r.json()["code"] == OBJECT_NOT_FOUND
@@ -142,7 +142,7 @@ async def test_bulk_create_get(client, users):
     h = bearer(await tok(o))
     r = await client.post("/v1/connections/bulk", headers=h, json=bbody([conn("a"), conn("b")]))
     j = r.json()
-    assert r.status_code == 201 and j["code"] == "001"
+    assert r.status_code == 201 and j["code"] == "039"
     ids = ",".join(str(c["id"]) for c in j["data"]["connections"])
     r = await client.get(f"/v1/connections/bulk/{ids}", headers=h)
     assert [c["name"] for c in r.json()["data"]["connections"]] == ["a", "b"]
@@ -151,7 +151,7 @@ async def test_bulk_create_get(client, users):
     assert r.status_code == 422 and r.json()["code"] == VALIDATION_ERROR
     r = await client.post("/v1/connections/bulk", headers=h, json=bbody([conn("ok"), bad], partial_allowed=True))
     j = r.json()
-    assert j["code"] == "002" and j["data"]["connections"]["failed"][0]["id"] == 1
+    assert j["code"] == "041" and j["data"]["connections"]["failed"][0]["id"] == 1
     r = await client.post("/v1/connections/bulk", headers=h, json=bbody([conn()] * 51))
     assert r.json()["code"] == BULK_LIMIT_EXCEEDED
 
@@ -162,7 +162,7 @@ async def test_bulk_patch_delete(client, users):
     foreign = await create(client, t)
     h = bearer(await tok(o))
     r = await client.patch(f"/v1/connections/bulk/{a},{b}", headers=h, json=bbody([{"name": "A"}, {"name": "B"}]))
-    assert r.json()["code"] == "003"
+    assert r.json()["code"] == "002"
     r = await client.patch(f"/v1/connections/bulk/{a},{foreign}", headers=h, json=bbody([{"name": "Q"}, {"name": "Q"}]))
     assert r.json()["code"] == OBJECT_NOT_FOUND
     assert (await client.get(f"/v1/connections/{a}", headers=h)).json()["data"]["connection"]["name"] == "A"
@@ -172,9 +172,9 @@ async def test_bulk_patch_delete(client, users):
     r = await client.delete(f"/v1/connections/bulk/{a},{foreign}", headers=h)
     assert r.json()["code"] == OBJECT_NOT_FOUND
     r = await client.delete(f"/v1/connections/bulk/{a},{foreign}?partial_allowed=true", headers=h)
-    assert r.json()["code"] == "008"
+    assert r.json()["code"] == "012"
     r = await client.delete(f"/v1/connections/bulk/{b}", headers=h)
-    assert r.json()["code"] == "007" and r.json()["data"]["connections"] == [{"id": b}]
+    assert r.json()["code"] == "009" and r.json()["data"]["connections"] == [{"id": b}]
 
 
 async def test_bulk_ids_validation(client, users):
@@ -194,4 +194,4 @@ async def test_bulk_patch_length_mismatch_and_admin(client, users):
     r = await client.patch(f"/v1/connections/bulk/{cid}", headers=bearer(await tok(o)), json=bbody([{"name": "a"}, {"name": "b"}]))
     assert r.json()["code"] == VALIDATION_ERROR
     r = await client.patch(f"/v1/connections/{cid}", headers=bearer(await tok(a, "admin")), json=body(name="adm"))
-    assert r.json()["code"] == "003"
+    assert r.json()["code"] == "002"

@@ -97,7 +97,9 @@ class CamRecordingMeta(StrictModel):
     local: CamRecordingLocalMeta | None = None
 
 
-class CamRecordingPatch(StrictModel):
+class CamRecordingPatch(NonNullablePatch, StrictModel):
+    non_nullable = ("record",)
+
     record: Literal[0, 1] | None = None
     record_type: Literal["local"] | None = None
     record_metadata: CamRecordingMeta | None = None

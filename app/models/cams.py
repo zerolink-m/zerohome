@@ -31,7 +31,9 @@ class Cam(Base):
     control_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     control_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     control_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    record: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    record: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=0, server_default="0"
+    )
     record_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     record_meta: Mapped[dict | None] = mapped_column("record_metadata", JSON, nullable=True)
     onvif_enabled: Mapped[int] = mapped_column(

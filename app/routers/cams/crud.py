@@ -4,18 +4,19 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND
+from app.core.codes import FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR
 from app.core.config import settings
 from app.core.errors import AppError
+from app.core.introspection import supports
 from app.core.rate_limit import rate_limit
 from app.core.response import bulk, bulk_listing, created, deleted, edited, failed_item, listing, single
 from app.core.security import TokenPayload
 from app.core.validation import field_error
 from app.db.session import get_db
 from app.deps.auth import require_access
-from app.deps.ids import parse_ids, partial_query
+from app.deps.ids import parse_ids
 from app.deps.list_query import ListQuery, list_query
-from app.deps.request_body import BulkBody, SingleBody, bulk_body, single_body
+from app.deps.request_body import BulkBody, SingleBody, bulk_body
 from app.models.cams import Cam
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
@@ -31,6 +32,8 @@ from app.routers.cams._common import (
     _get_visible_cam,
     _serialize,
     _visibility_where,
+    optional_bulk_options,
+    single_body_for_route,
     router,
 )
 
@@ -171,6 +174,7 @@ async def create_cams(
 
 
 @router.get("/bulk/{ids}", dependencies=[_READ])
+@supports("bulk", max_bulk=BULK_MAX)
 async def get_cams_bulk(
     ids: str,
     payload: TokenPayload = Depends(require_access),
@@ -195,7 +199,7 @@ async def patch_cams_bulk(
     """data.cams[i] is applied to ids[i] (same length and order)."""
     id_list = parse_ids(ids, BULK_MAX)
     if len(body.items) != len(id_list):
-        raise AppError("109", "Some fields are invalid", fields={
+        raise AppError(VALIDATION_ERROR, "Some fields are invalid", fields={
             "cams": field_error("length must match the number of ids", type="array",
                                 max_length=len(id_list), actual_length=len(body.items))})
     found = await _visible_by_ids(id_list, payload, db)
@@ -205,7 +209,7 @@ async def patch_cams_bulk(
     for cam_id, item in zip(id_list, body.items):
         cam = found.get(cam_id)
         if item.error is not None:
-            failures.append((cam_id, "109", item.error))
+            failures.append((cam_id, VALIDATION_ERROR, item.error))
         elif cam is None:
             failures.append((cam_id, OBJECT_NOT_FOUND, "Camera not found"))
         elif not _can_manage(cam, payload):
@@ -230,13 +234,14 @@ async def patch_cams_bulk(
         _after_patch(cam, control_touched)
         await ingest.on_cam_saved(cam, touched)
     return bulk("cams", [_serialize(c, payload) for c in results], _failed(failures), op="edit",
-                partial=body.partial_allowed, all_failed_code=failures[0][1] if failures else "109")
+                partial=body.partial_allowed, all_failed_code=failures[0][1] if failures else VALIDATION_ERROR)
 
 
 @router.delete("/bulk/{ids}", dependencies=[_WRITE])
+@supports("bulk", "partial", max_bulk=BULK_MAX)
 async def delete_cams_bulk(
     ids: str,
-    partial_allowed: bool = Depends(partial_query),
+    partial_allowed: bool = Depends(optional_bulk_options),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -262,7 +267,7 @@ async def delete_cams_bulk(
     for cam in work:
         await ingest.on_cam_deleted(cam.id)
     return bulk("cams", [{"id": c.id} for c in work], _failed(failures), op="delete", partial=partial_allowed,
-                all_failed_code=failures[0][1] if failures else "109")
+                all_failed_code=failures[0][1] if failures else VALIDATION_ERROR)
 
 
 # --- single (by id) ---------------------------------------------------------------
@@ -275,7 +280,7 @@ async def get_cam(id: int, payload: TokenPayload = Depends(require_access), db: 
 
 @router.post("", dependencies=[_WRITE])
 async def create_cam(
-    body: SingleBody[CamCreate] = Depends(single_body("cam", CamCreate)),
+    body: SingleBody[CamCreate] = Depends(single_body_for_route("cam", CamCreate)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -290,7 +295,7 @@ async def create_cam(
 @router.patch("/{id}", dependencies=[_WRITE])
 async def patch_cam(
     id: int,
-    body: SingleBody[CamPatch] = Depends(single_body("cam", CamPatch)),
+    body: SingleBody[CamPatch] = Depends(single_body_for_route("cam", CamPatch)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):

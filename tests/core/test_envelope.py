@@ -21,7 +21,9 @@ async def test_success_envelope_and_headers(c):
     b = check(r, "000", 200)
     assert b["error"] == {} and b["data"] == {"status": "ok"}
     assert b["metadata"]["request_id"] == r.headers["cursed-request-id"]
-    assert r.headers["cursed-version"] == "1.1"
+    assert r.headers["cursed-version"] == "1.2"
+    assert b["metadata"]["cursed_version"] == "1.2"
+    assert "cursed-code" not in r.headers
     assert float(r.headers["cursed-duration"]) >= 0
 
 
@@ -32,29 +34,31 @@ async def test_version(c):
 
 async def test_apperror_status_from_table(c):
     r = await c.get("/t/err")
-    b = check(r, "110", 423)
+    b = check(r, "302", 423)
     assert b["error"] == {"error": "locked", "hint": "wait"}
 
 
-async def test_unhandled_is_201_and_hides_internals(c):
+async def test_unhandled_is_332_and_hides_internals(c):
     r = await c.get("/t/boom")
-    b = check(r, "201", 500)
+    b = check(r, "332", 500)
     assert "secret" not in r.text
     assert r.headers["cursed-request-id"]
 
 
 async def test_404_405(c):
-    check(await c.get("/v1/nope"), "083", 404)
-    check(await c.post("/v1/health"), "096", 405)
+    check(await c.get("/v1/nope"), "217", 404)
+    r = await c.post("/v1/health")
+    check(r, "226", 405)
+    assert "OPTIONS" in r.headers["allow"]
 
 
 async def test_validation_query_missing_is_160(c):
-    b = check(await c.get("/t/need/1"), "160", 422)
+    b = check(await c.get("/t/need/1"), "271", 422)
     assert b["error"]["query"]["flag"]["required"] is True
 
 
 async def test_validation_path_is_109(c):
-    b = check(await c.get("/t/need/abc?flag=1"), "109", 422)
+    b = check(await c.get("/t/need/abc?flag=1"), "269", 422)
     assert b["error"]["path"]["n"]["type"] == "int"
     assert b["error"]["path"]["n"]["actual_type"] == "string"
 

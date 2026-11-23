@@ -12,7 +12,7 @@ def test_bearer_parsing():
     for value in (None, "", "Bearer "):
         with pytest.raises(AppError) as exc:
             deps.get_bearer_token(value)
-        assert exc.value.code == "046"
+        assert exc.value.code == "177"
     with pytest.raises(AppError) as exc:
         deps.get_bearer_token("Basic abc")
     assert exc.value.code == TOKEN_ERROR

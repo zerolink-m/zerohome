@@ -54,6 +54,14 @@ switches_query = list_query(model=Switch, sortable=SWITCHES_COLUMNS, searchable=
 MAX_BULK = 100
 
 
+def _single_body(key, schema):
+    """Single-object requests do not implement bulk partial execution."""
+    dependency = single_body(key, schema)
+    dependency.cursed_functions = frozenset()
+    dependency.cursed_meta = {}
+    return dependency
+
+
 def _invitation_exists_clause(payload: TokenPayload):
     return exists(
         select(Invitation.id)
@@ -303,7 +311,7 @@ async def get_switch(switch_id: int, payload: TokenPayload = Depends(require_acc
 
 @router.post("", dependencies=[Depends(rate_limit("switches_write", capacity=20, per_minute=20))])
 async def create_switch(
-    body: SingleBody[SwitchCreate] = Depends(single_body("switch", SwitchCreate)),
+    body: SingleBody[SwitchCreate] = Depends(_single_body("switch", SwitchCreate)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -331,7 +339,7 @@ async def create_switches_bulk(
         except AppError as exc:
             if not body.partial_allowed:
                 raise
-            failed.append(failed_item(index, _err(exc)))
+            failed.append(failed_item(index, _err(exc), exc.code))
             continue
         row = _new_switch(obj, payload, now)
         db.add(row)
@@ -396,7 +404,7 @@ async def patch_switches_bulk(
 @router.patch("/{switch_id}", dependencies=[Depends(rate_limit("switches_write", capacity=20, per_minute=20))])
 async def patch_switch(
     switch_id: int,
-    body: SingleBody[SwitchPatch] = Depends(single_body("switch", SwitchPatch)),
+    body: SingleBody[SwitchPatch] = Depends(_single_body("switch", SwitchPatch)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -479,7 +487,7 @@ async def get_switch_state(
 )
 async def set_switch_state(
     id: int,  # name fixed by resolve_device_use_access (path param `id`)
-    body: SingleBody[SwitchStateIn] = Depends(single_body("state", SwitchStateIn)),
+    body: SingleBody[SwitchStateIn] = Depends(_single_body("state", SwitchStateIn)),
     ctx: AccessContext = Depends(resolve_device_use_access),
     db: AsyncSession = Depends(get_db),
 ):

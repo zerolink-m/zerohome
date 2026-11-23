@@ -328,7 +328,7 @@ async def test_untrusted_proxy_header_is_ignored_loopback_is_local(
         f"/v1/cams/{cid}/hls/playlist.m3u8", headers={**await _token(stranger), **forged},
     )
     assert denied.status_code != 200
-    assert denied.json()["code"] == "082"
+    assert denied.json()["code"] == "215"
     assert seen == [] and hls_fake == []
 
     proxied = await client.get(
@@ -364,7 +364,7 @@ async def test_unreachable_owner_is_503_not_a_hang(
     refused = await client.get(f"/v1/cams/{cid}/hls/playlist.m3u8", headers=headers)
     assert refused.status_code == 503
     body = refused.json()
-    assert body["code"] == "225"
+    assert body["code"] == "373"
     assert body["error"]["hint"] == "Повторите запрос"
 
     class _Hang(httpx.AsyncBaseTransport):
@@ -378,7 +378,7 @@ async def test_unreachable_owner_is_503_not_a_hang(
     started = time.monotonic()
     hung = await client.get(f"/v1/cams/{cid}/hls/playlist.m3u8", headers=headers)
     assert time.monotonic() - started < 2
-    assert hung.status_code == 503 and hung.json()["code"] == "225"
+    assert hung.status_code == 503 and hung.json()["code"] == "373"
 
 
 async def test_unsigned_non_loopback_owner_is_not_dialed(
@@ -394,7 +394,7 @@ async def test_unsigned_non_loopback_owner_is_not_dialed(
 
     monkeypatch.setattr(view_proxy, "http_transport_factory", boom)
     r = await client.get(f"/v1/cams/{cid}/hls/playlist.m3u8", headers=await _token(owner_uid))
-    assert r.status_code == 503 and r.json()["code"] == "225"
+    assert r.status_code == 503 and r.json()["code"] == "373"
 
 
 async def test_cluster_disabled_does_not_proxy(

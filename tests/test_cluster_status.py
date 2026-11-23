@@ -43,7 +43,7 @@ async def seed(sm, now):
 async def test_cluster_requires_admin(client, mk_user):
     assert (await client.get("/v1/cluster")).json()["code"] != "000"
     r = await client.get("/v1/cluster", headers=bearer(await tok(mk_user, "u@x.io", "user")))
-    assert r.json()["code"] == "050"
+    assert r.json()["code"] == "186"
 
 
 async def test_disabled_cluster_returns_empty_lists(client, mk_user, monkeypatch):

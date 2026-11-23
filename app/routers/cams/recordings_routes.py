@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.codes import FORBIDDEN_RESOURCE, INVALID_QUERY, RECORDING_NOT_ALLOWED, SERVER_ERROR, VALIDATION_ERROR
 from app.core.errors import AppError
-from app.core.introspection import declare
+from app.core.introspection import declare, supports
 from app.core.rate_limit import PointBudget, rate_limit
 from app.core.response import edited, listing, single
 from app.core.security import TokenPayload
@@ -15,7 +15,7 @@ from app.core.validation import field_error
 from app.db.session import get_db
 from app.deps.auth import AccessContext, require_access, resolve_record_access
 from app.deps.list_query import ListQuery, list_query
-from app.deps.request_body import SingleBody, single_body
+from app.deps.request_body import SingleBody
 from app.models.user import User
 from app.schemas.cams import CamRecordingOut, CamRecordingPatch
 from app.schemas.recording import RecordingOut
@@ -27,6 +27,7 @@ from app.routers.cams._common import (
     _can_manage,
     _get_cam_for_access,
     _get_visible_cam,
+    single_body_for_route,
     router,
 )
 
@@ -40,7 +41,7 @@ _REC_COLUMNS = {
 }
 _recordings_query = list_query(
     sortable=_REC_COLUMNS, searchable=_REC_COLUMNS,
-    default_limit=10, max_limit=100,
+    default_limit=25, max_limit=255,
 )
 
 
@@ -53,7 +54,7 @@ def _match(item: dict, cond) -> bool:
             except ValueError:
                 raise AppError(INVALID_QUERY, "Invalid query parameters", query={
                     "search": field_error("must be an integer for this column", type="int", value=cond.value)})
-        return str(raw) == cond.value if cond.method == "exactly" else str(raw).casefold() == cond.value.casefold()
+        return str(raw).casefold() == cond.value.casefold()
     s, v = str(raw).casefold(), cond.value.casefold()
     if cond.method == "include":
         return v in s
@@ -65,38 +66,25 @@ def _match(item: dict, cond) -> bool:
 
 
 def _filter(items: list[dict], q: ListQuery) -> list[dict]:
-    """Same semantics as ListQuery.where_clause (left to right, no precedence), in memory."""
+    """Apply v1.2 simple-search conditions, which are always combined with AND."""
     if not q.conditions:
         return items
     out = []
     for it in items:
-        res = None
-        for c in q.conditions:
-            m = _match(it, c)
-            if res is None:
-                res = m
-            elif c.connector == "and":
-                res = res and m
-            elif c.connector == "and_not":
-                res = res and not m
-            elif c.connector == "or_not":
-                res = res or not m
-            else:
-                res = res or m
-        if res:
+        if all(_match(it, condition) for condition in q.conditions):
             out.append(it)
     return out
 
 
-def _sort(items: list[dict], q: ListQuery) -> list[dict]:
+def _sort(items: list[dict], q: ListQuery, default_direction: str = "desc") -> list[dict]:
     if not q.sort_by:  # default: newest first (historical behaviour)
-        return sorted(items, key=lambda i: i["started_at"], reverse=True)
+        return sorted(items, key=lambda i: i["started_at"], reverse=default_direction == "desc")
     items = list(items)
     # stable multi-key sort: apply the least significant key first
     for idx in range(len(q.sort_by) - 1, -1, -1):
         name = q.sort_by[idx]
         direction = q.order[idx] if len(q.order) > 1 else q.order[0]
-        items.sort(key=lambda i, n=name: i[n], reverse=direction == "descending")
+        items.sort(key=lambda i, n=name: i[n], reverse=direction == "desc")
     return items
 
 
@@ -133,7 +121,7 @@ async def get_cam_recording(
 @router.patch("/{id}/recording", dependencies=[Depends(rate_limit("cams_write", capacity=20, per_minute=20))])
 async def patch_cam_recording(
     id: int,
-    body: SingleBody[CamRecordingPatch] = Depends(single_body("recording_config", CamRecordingPatch)),
+    body: SingleBody[CamRecordingPatch] = Depends(single_body_for_route("recording_config", CamRecordingPatch)),
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
@@ -183,6 +171,7 @@ async def patch_cam_recording(
 @router.get("/{id}/recordings", dependencies=[Depends(rate_limit("cams_read", capacity=60, per_minute=60))])
 async def list_cam_recordings(
     id: int,
+    request: Request,
     from_: str | None = Query(default=None, alias="from"),
     to: str | None = Query(default=None),
     q: ListQuery = Depends(_recordings_query),
@@ -195,10 +184,15 @@ async def list_cam_recordings(
     from_ts, to_ts = _int_query("from", from_), _int_query("to", to)
 
     all_items, _ = recordings.list_recordings(cam, 0, 10**9, from_ts, to_ts)
-    matched = _sort(_filter(all_items, q), q)
+    default_direction = q.order[0] if request.query_params.get("order") else "desc"
+    matched = _sort(_filter(all_items, q), q, default_direction)
     page = matched[q.offset: q.offset + q.limit]
+    settings = q.settings(len(matched))
+    if not q.sort_by:
+        settings["order"] = default_direction
     return listing(
-        "recordings", [RecordingOut(**item).model_dump() for item in page], query=q, total=len(matched),
+        "recordings", [RecordingOut(**item).model_dump() for item in page],
+        settings=settings, total=len(matched),
     )
 
 
@@ -224,6 +218,7 @@ async def get_cam_recording_meta(
     "/{id}/recordings/{recording_id}/file",
     dependencies=[Depends(rate_limit("cams_recording_file", capacity=20, per_minute=20))],
 )
+@supports("x-file")
 async def get_cam_recording_file(
     id: int,
     recording_id: str,
@@ -243,6 +238,7 @@ SNAPSHOT_GENERATE_COST = 3
 
 
 @router.get("/{id}/recordings/{recording_id}/snapshot")
+@supports("x-snapshot")
 async def get_cam_recording_snapshot(
     id: int,
     recording_id: str,

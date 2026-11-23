@@ -7,8 +7,9 @@ from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND
+from app.core.codes import FILE_STORAGE_ERROR, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND
 from app.core.errors import AppError
+from app.core.introspection import supports
 from app.core.response import deleted, listing, single
 from app.core.rate_limit import rate_limit
 from app.core.security import TokenPayload
@@ -74,7 +75,7 @@ async def get_motion_events(
 
     stmt = select(MotionEvent).where(MotionEvent.cam_id == cam_id)
     if not q.sort_by:  # default: newest first
-        q.sort_by, q.order = ["detected_at"], ["descending"]
+        q.sort_by, q.order = ["detected_at"], ["desc"]
     events, total = await q.paginate(db, stmt)
 
     return listing("motion_events", [_event_out(e) for e in events], query=q, total=total)
@@ -163,15 +164,16 @@ async def delete_motion_event(
     if event.photo_key:
         try:
             await storage_layer.get_storage().delete(event.photo_key)
-        except Exception:
-            pass  # Ignore errors, delete from DB anyway
+        except Exception as exc:
+            raise AppError(FILE_STORAGE_ERROR, "Не удалось удалить фото события") from exc
     elif event.photo_filename:
         photo_path = storage_layer.legacy_motion_path(event.cam_id, event.photo_filename)
-        if os.path.isfile(photo_path):
-            try:
-                os.remove(photo_path)
-            except Exception:
-                pass  # Ignore errors, delete from DB anyway
+        try:
+            os.remove(photo_path)
+        except FileNotFoundError:
+            pass  # Missing photo is already deleted; keep deletion idempotent.
+        except OSError as exc:
+            raise AppError(FILE_STORAGE_ERROR, "Не удалось удалить фото события") from exc
 
     # Delete from database
     await db.delete(event)
@@ -204,6 +206,7 @@ async def get_motion_detection_status(
     "/cams/{cam_id}/motion/start",
     dependencies=[Depends(rate_limit("motion_control", capacity=10, per_minute=10))],
 )
+@supports("x-start")
 async def start_motion_detection_endpoint(
     cam_id: int,
     payload: TokenPayload = Depends(require_access),
@@ -235,6 +238,7 @@ async def start_motion_detection_endpoint(
     "/cams/{cam_id}/motion/stop",
     dependencies=[Depends(rate_limit("motion_control", capacity=10, per_minute=10))],
 )
+@supports("x-stop")
 async def stop_motion_detection_endpoint(
     cam_id: int,
     payload: TokenPayload = Depends(require_access),

@@ -1,15 +1,20 @@
 """Motion photo state, legacy files, and a notification that waits for the upload."""
 import time
+from types import SimpleNamespace
 
 import httpx
+import pytest
 
 from app.core.config import settings
 from app.models.motion_event import MotionEvent
+from app.models.cams import Cam
 from app.models.notification import NotificationJob
 from app.models.user import User
 from app.services import motion_cleanup, notify_worker
 from app.services.motion_photos import save_motion_event_and_photo
 from app.services.storage.local import LocalStorage
+from app.routers.motion import delete_motion_event
+from app.core.errors import AppError
 from sqlalchemy import select
 
 from tests.conftest import bearer, mint_test_token
@@ -145,8 +150,62 @@ async def test_photo_key_roundtrip_hides_key_from_api(
     body = (await client.get(f"/v1/motion/events/{event_id}", headers=headers)).text
     assert "photo_key" not in body and "photo_state" not in body
     deleted = await client.delete(f"/v1/motion/events/{event_id}", headers=headers)
-    assert deleted.json()["code"] == "007"
+    assert deleted.json()["code"] == "009"
     assert await storage.get(f"motion/{cam}/p.jpg") is None
+
+
+class _DeleteDB:
+    def __init__(self, event, cam):
+        self.event = event
+        self.cam = cam
+        self.committed = False
+
+    async def get(self, model, key):
+        if model is MotionEvent and self.event.id == key:
+            return self.event
+        if model is Cam and self.cam.id == key:
+            return self.cam
+        return None
+
+    async def delete(self, event):
+        assert event is self.event
+        self.event = None
+
+    async def commit(self):
+        self.committed = True
+
+
+def _delete_fixture(photo_key=None, photo_filename=None):
+    event = MotionEvent(id=71, cam_id=9, detected_at=1, object_type="person",
+                        confidence=0.9, object_size=0.1,
+                        photo_key=photo_key, photo_filename=photo_filename)
+    cam = Cam(id=9, ownuser=11)
+    return event, cam, _DeleteDB(event, cam)
+
+
+async def test_delete_motion_event_keeps_row_when_storage_delete_fails(monkeypatch):
+    event, cam, db = _delete_fixture(photo_key="motion/9/p.jpg")
+
+    class BrokenStorage:
+        async def delete(self, key):
+            raise OSError("storage unavailable")
+
+    monkeypatch.setattr("app.routers.motion.storage_layer.get_storage", lambda: BrokenStorage())
+    with pytest.raises(AppError) as exc:
+        await delete_motion_event(71, SimpleNamespace(uid=11, role="user"), db)
+
+    assert exc.value.code == "336"
+    assert db.event is event and not db.committed
+
+
+async def test_delete_motion_event_is_idempotent_when_photo_is_missing(monkeypatch, tmp_path):
+    event, cam, db = _delete_fixture(photo_filename="already-gone.jpg")
+    monkeypatch.setattr(settings, "MOTION_FILES_DIR", str(tmp_path))
+
+    response = await delete_motion_event(71, SimpleNamespace(uid=11, role="user"), db)
+
+    assert response.status_code == 200
+    assert db.event is None and db.committed
 
 
 def _http(monkeypatch, recorder):

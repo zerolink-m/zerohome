@@ -4,10 +4,10 @@ Every JSON response is the Envelope {code, code_detail, error, metadata, data}.
 Router cheat-sheet:
 
     return single("cam", cam_dict)                       # 000, data={"cam": {...}}
-    return created("cam", cam_dict)                      # 001 / HTTP 201
-    return edited("cam", cam_dict)                       # 003  (changed=False -> 005)
-    return deleted("cam", {"id": 1})                     # 007
-    return listing("cams", items, query=q, total=total)  # 000 / 012 if empty, data.settings
+    return created("cam", cam_dict)                      # 039 (CREATED) / HTTP 201
+    return edited("cam", cam_dict)                       # 002 (EDITED; changed=False -> 007 NOT_CHANGED)
+    return deleted("cam", {"id": 1})                     # 009 (DELETED)
+    return listing("cams", items, query=q, total=total)  # 000 / 019 if empty, data.settings
     return bulk("cams", ok_items, failed, op="create", partial=body.partial_allowed)
     return success({"token": "..."}, code=AUTHORIZED)    # virtual endpoints
     return empty()                                       # data={}
@@ -15,7 +15,6 @@ Router cheat-sheet:
 """
 from __future__ import annotations
 
-import math
 import time
 from typing import Any, Iterable, Mapping
 
@@ -26,13 +25,14 @@ from app.core import codes
 from app.core.context import add_warning as add_warning  # noqa: F401  (re-export)
 from app.core.context import elapsed, get_request_id, warnings_var
 
-CURSED_VERSION = "1.1"
+CURSED_VERSION = "1.2"
+# Internal handoff marker: the middleware removes it before sending the response.
+CURSED_ENVELOPE_MARKER = "x-zerocams-internal-cursed-envelope"
 
 
 def build_metadata(
     extra: Mapping[str, Any] | None = None,
     *,
-    page: dict | None = None,
     expand: list[str] | None = None,
     deprecated: bool | None = None,
 ) -> dict[str, Any]:
@@ -43,11 +43,8 @@ def build_metadata(
     dur = elapsed()
     if dur is not None:
         meta["duration"] = round(dur, 6)
-    meta["cursed_version"] = CURSED_VERSION
     if deprecated:
         meta["deprecated"] = True
-    if page is not None:
-        meta["page"] = page
     if expand:
         meta["expand"] = list(expand)
     warns = warnings_var.get()
@@ -55,6 +52,8 @@ def build_metadata(
         meta["warnings"] = list(warns)
     if extra:
         meta.update(extra)
+    meta.pop("page", None)
+    meta["cursed_version"] = CURSED_VERSION
     return meta
 
 
@@ -67,11 +66,14 @@ def envelope(
     detail: str | None = None,
 ) -> dict[str, Any]:
     """The five-field Envelope. All keys are always present."""
+    meta = dict(metadata) if metadata is not None else build_metadata()
+    meta.pop("page", None)
+    meta["cursed_version"] = CURSED_VERSION
     return {
         "code": code,
         "code_detail": detail if detail is not None else codes.code_detail(code),
         "error": dict(error) if error else {},
-        "metadata": metadata if metadata is not None else build_metadata(),
+        "metadata": meta,
         "data": {} if data is None else data,
     }
 
@@ -86,10 +88,12 @@ def respond(
     headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
     body = envelope(code, data=data, error=error, metadata=metadata)
+    response_headers = dict(headers) if headers else {}
+    response_headers[CURSED_ENVELOPE_MARKER] = "1"
     return JSONResponse(
         content=jsonable_encoder(body),
         status_code=status_code if status_code is not None else codes.http_status(code),
-        headers=dict(headers) if headers else None,
+        headers=response_headers,
     )
 
 
@@ -127,7 +131,7 @@ def edited(key: str, obj: Any, *, changed: bool = True, **kw) -> JSONResponse:
 
 
 def deleted(key: str | None = None, obj: Any = None, **kw) -> JSONResponse:
-    """007; data = {key: obj} when an object is given, else {}."""
+    """009 (DELETED); data = {key: obj} when an object is given, else {}."""
     return success({key: obj} if key and obj is not None else {}, code=codes.DELETED, **kw)
 
 
@@ -139,14 +143,10 @@ def accepted(data: Any = None, **kw) -> JSONResponse:
 
 def default_settings(total: int, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
     return {
-        "total": total, "limit": limit, "offset": offset, "order": "ascending",
+        "total": total, "limit": limit, "offset": offset, "order": "asc",
         "sort_by": None, "search": None, "search_method": None, "search_column": None,
+        "filter": None,
     }
-
-
-def page_info(total: int, limit: int, offset: int) -> dict[str, int]:
-    pages = max(1, math.ceil(total / limit)) if limit > 0 else 1
-    return {"current": offset // limit + 1 if limit > 0 else 1, "pages": pages}
 
 
 def listing(
@@ -159,7 +159,7 @@ def listing(
     expand: list[str] | None = None,
     **kw,
 ) -> JSONResponse:
-    """List response: data = {settings: {...}, <key plural>: [...]}. Code 000, or 012
+    """List response: data = {settings: {...}, <key plural>: [...]}. Code 000, or 019
     when the list is empty. `query` is an app.deps.list_query.ListQuery (gives the
     settings echo + expand); otherwise pass `settings` or just `total`."""
     items = list(items)
@@ -170,7 +170,6 @@ def listing(
         expand = list(getattr(query, "expand", []) or [])
     meta = build_metadata(
         kw.pop("metadata", None),
-        page=page_info(total, settings["limit"], settings["offset"]),
         expand=expand,
     )
     code = codes.SUCCESS if items else codes.EMPTY_RESULT
@@ -178,11 +177,10 @@ def listing(
 
 
 def bulk_listing(key: str, items: Iterable[Any], *, requested: int | None = None, **kw) -> JSONResponse:
-    """Bulk GET (/bulk/{ids}): settings.total = number of requested ids; no limit/offset."""
+    """Bulk GET (/bulk/{ids}) returns only the requested objects, without list settings."""
     items = list(items)
-    total = len(items) if requested is None else requested
-    s = default_settings(total, limit=max(total, 1), offset=0)
-    return listing(key, items, settings=s, total=total, **kw)
+    code = codes.SUCCESS if items else codes.EMPTY_RESULT
+    return respond(code, data={key: items}, metadata=build_metadata(kw.pop("metadata", None)), **kw)
 
 
 # --- bulk ----------------------------------------------------------------------
@@ -227,13 +225,14 @@ def bulk(
 ) -> JSONResponse:
     """Result of a bulk write.
 
-    * no failures -> full success (001/003/007), data = {key: [objects]}
-    * failures + partial=True + some succeeded -> 002/004/008, Bulk object
+    * no failures -> full success (039 CREATED / 002 EDITED / 009 DELETED), data = {key: [objects]}
+    * failures + partial=True + some succeeded -> 041 PARTIALLY_CREATED /
+      004 PARTIALLY_EDITED / 012 PARTIALLY_DELETED, Bulk object
       data = {key: {"succeeded": [...], "failed": [...]}}
     * failures + nothing succeeded -> error carrying the Bulk object in data.
       Code: explicit `all_failed_code`; else the common code of all failures (see
-      failed_item(code=/AppError)) when they agree; else 109 (the spec lets the
-      server pick this code)
+      failed_item(code=/AppError)) when they agree; else 269 (VALIDATION_ERROR, the
+      spec lets the server pick this code)
     * failures + partial=False -> caller must have rejected atomically before
       applying anything; this helper treats it as all_failed.
     """

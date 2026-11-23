@@ -134,8 +134,16 @@ def code_for_http_status(status_code: int, detail: Any = None) -> str:
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     code = code_for_http_status(exc.status_code, exc.detail)
     message = exc.detail if isinstance(exc.detail, str) and exc.detail else codes.code_detail(code)
+    headers = dict(exc.headers) if exc.headers else {}
+    if exc.status_code == 405:
+        allow_key = next((key for key in headers if key.lower() == "allow"), None)
+        allowed = {method.strip().upper() for method in headers.get(allow_key, "").split(",")} if allow_key else set()
+        allowed.add("OPTIONS")
+        if allow_key:
+            del headers[allow_key]
+        headers["Allow"] = ", ".join(sorted(allowed))
     return error_response(AppError(
-        code, message, dict(exc.headers) if exc.headers else None, status_code=exc.status_code,
+        code, message, headers or None, status_code=exc.status_code,
     ))
 
 

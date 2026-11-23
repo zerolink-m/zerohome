@@ -14,6 +14,7 @@ from tests.conftest import bearer
 NON_NULLABLE = {
     CamPatch: ["name", "enabled", "notify", "protocol", "address", "port", "path", "username", "password"],
     CamOnvifPatch: ["onvif_enabled", "onvif_snapshot_enabled", "onvif_ptz_enabled"],
+    CamRecordingPatch: ["record"],
     ConnectionPatch: ["name", "enabled", "meta"],
     UserPatch: ["name", "surname", "email", "password", "role", "motion_detection_allowed"],
     SwitchPatch: ["name", "enabled", "notify"],
@@ -22,7 +23,7 @@ NON_NULLABLE = {
 }
 NULLABLE = {
     CamPatch: ["control_protocol", "control_address", "control_port", "control_username", "control_password"],
-    CamRecordingPatch: ["record", "record_type", "record_metadata"],
+    CamRecordingPatch: ["record_type", "record_metadata"],
     UserPatch: ["allow_record", "allow_tuya_local"],
     SwitchPatch: ["control_protocol", "control_metadata"],
 }
@@ -57,16 +58,16 @@ async def test_http_patch_null_gives_109_not_500(client, mk_user, mk_cam):
     h = bearer(await mint_test_token(owner, "user"))
     for field in ("name", "port", "username", "password", "address", "protocol", "path", "enabled"):
         r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {field: None}))
-        assert r.status_code == 422 and r.json()["code"] == "109", (field, r.text)
+        assert r.status_code == 422 and r.json()["code"] == "269", (field, r.text)
         assert field in r.json()["error"]["fields"]
     r = await client.patch(f"/v1/cams/{cid}/onvif", headers=h, json=req("onvif", {"onvif_enabled": None}))
-    assert r.json()["code"] == "109"
+    assert r.json()["code"] == "269"
     # nullable control_* may be cleared
     r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"control_address": None}))
-    assert r.json()["code"] in ("003", "005"), r.text
+    assert r.json()["code"] in ("002", "007"), r.text
     # bulk item-level
     r = await client.patch(f"/v1/cams/bulk/{cid}", headers=h, json={"data": {"cams": [{"name": None}]}})
-    assert r.status_code != 500 and r.json()["code"] != "201"
+    assert r.status_code != 500 and r.json()["code"] != "332"
 
 
 async def test_http_user_and_switch_null(client, mk_user):
@@ -74,4 +75,4 @@ async def test_http_user_and_switch_null(client, mk_user):
     h = bearer(await mint_test_token(uid, "user"))
     for field in ("name", "surname", "email"):
         r = await client.patch(f"/v1/users/{uid}", headers=h, json=req("user", {field: None}))
-        assert r.json()["code"] == "109", (field, r.text)
+        assert r.json()["code"] == "269", (field, r.text)

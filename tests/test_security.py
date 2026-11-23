@@ -35,7 +35,7 @@ def test_legacy_refresh_validation():
                          settings.JWT_SECRET_SESSION, algorithm="HS256")
     with pytest.raises(AppError) as exc:
         sec.decode_legacy_refresh(expired)
-    assert exc.value.code == "043"
+    assert exc.value.code == "170"
     with pytest.raises(AppError):
         sec.decode_legacy_refresh(jwt.encode({"uid": 1, "sid": 1, "exp": now + 100},
                                               "test-legacy-access-secret-for-rejection-only", algorithm="HS256"))
@@ -54,6 +54,6 @@ def test_share_token_roundtrip_and_expiry():
     assert payload.exp - payload.iat == 120
     with pytest.raises(AppError) as exc:
         sec.decode_share_token(sec.create_share_token(1, 1, "stream", "cams", 1, None, -5))
-    assert exc.value.code == "043"
+    assert exc.value.code == "170"
     with pytest.raises(AppError):
         sec.decode_share_token(sec.create_session_token(1, 1))

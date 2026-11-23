@@ -209,8 +209,9 @@ def prefixed_errors(errors: list[dict], path: tuple) -> list[dict]:
 def split_request_validation(errors: list[dict]) -> dict[str, Any]:
     """FastAPI RequestValidationError.errors() -> {code, error, fields/query/path/headers}.
 
-    Rules: invalid JSON -> 117; whole body missing -> 121; only query problems ->
-    160 (all missing) or 118; everything else -> 109.
+    Rules: invalid JSON -> 063 (INVALID_JSON); whole body missing -> 073 (EMPTY_BODY);
+    only query problems -> 271 (QUERY_REQUIRED, all missing) or 066 (INVALID_QUERY);
+    everything else -> 269 (VALIDATION_ERROR).
     """
     body, query, path, headers = [], [], [], []
     for e in errors:

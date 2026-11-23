@@ -38,7 +38,7 @@ async def two_users(mk_user):
 
 
 async def test_cams_require_auth(client):
-    for h, code in (({}, "046"), (bearer("junk"), "042")):
+    for h, code in (({}, "177"), (bearer("junk"), "167")):
         r = await client.get("/v1/cams", headers=h)
         assert r.json()["code"] == code
     r = await client.get("/v1/cams", headers=bearer(create_session_token(1, 1)))
@@ -48,7 +48,7 @@ async def test_cams_require_auth(client):
 async def test_create_cam_and_owner_sees_full(client, mk_user):
     owner = await mk_user("o@x.io")
     r = await client.post("/v1/cams", json=req("cam", NEW), headers=bearer(await tok(owner)))
-    assert r.status_code == 201 and r.json()["code"] == "001"
+    assert r.status_code == 201 and r.json()["code"] == "039"
     cam = r.json()["data"]["cam"]
     assert cam["password"] == "secret" and cam["owner"] == owner and "id" in cam
     r = await client.get(f"/v1/cams/{cam['id']}", headers=bearer(await tok(owner)))
@@ -59,26 +59,26 @@ async def test_create_cam_and_owner_sees_full(client, mk_user):
 async def test_create_cam_validation_and_envelope_errors(client, mk_user):
     h = bearer(await tok(await mk_user("o@x.io")))
     r = await client.post("/v1/cams", json=NEW, headers=h)  # not a Request object
-    assert r.status_code == 422 and r.json()["code"] == "109"
+    assert r.status_code == 422 and r.json()["code"] == "269"
     r = await client.post("/v1/cams", json=req("cam", {"protocol": "rtsp"}), headers=h)
-    assert r.json()["code"] == "109" and "address" in r.json()["error"]["fields"]
+    assert r.json()["code"] == "269" and "address" in r.json()["error"]["fields"]
     r = await client.post("/v1/cams", content=b"{", headers={**h, "content-type": "application/json"})
-    assert r.json()["code"] == "117"
+    assert r.json()["code"] == "063"
     r = await client.post("/v1/cams", content=b"x", headers={**h, "content-type": "text/plain"})
-    assert r.json()["code"] == "107"
+    assert r.json()["code"] == "264"
     r = await client.post("/v1/cams", headers=h)
-    assert r.json()["code"] == "121"
+    assert r.json()["code"] == "073"
     r = await client.post("/v1/cams/5", json=req("cam", NEW), headers=h)  # POST with id is not routed
-    assert r.status_code == 405 and r.json()["code"] == "096"
+    assert r.status_code == 405 and r.json()["code"] == "226"
 
 
 async def test_other_user_cannot_see_cam(client, mk_user, mk_cam):
     owner, other = await two_users(mk_user)
     cid = await mk_cam(owner)
     r = await client.get(f"/v1/cams/{cid}", headers=bearer(await tok(other)))
-    assert r.status_code == 404 and r.json()["code"] == NOT_FOUND == "082"
+    assert r.status_code == 404 and r.json()["code"] == NOT_FOUND == "215"
     r = await client.get("/v1/cams", headers=bearer(await tok(other)))
-    assert r.json()["data"]["settings"]["total"] == 0 and r.json()["code"] == "012"
+    assert r.json()["data"]["settings"]["total"] == 0 and r.json()["code"] == "019"
     assert r.json()["data"]["cams"] == []
 
 
@@ -137,13 +137,13 @@ async def test_owner_patch_and_delete(client, mk_user, mk_cam):
     h = bearer(await tok(owner))
     cid = await mk_cam(owner)
     r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"name": "new"}))
-    assert r.json()["code"] == "003" and r.json()["data"]["cam"]["name"] == "new"
+    assert r.json()["code"] == "002" and r.json()["data"]["cam"]["name"] == "new"
     r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"name": "new"}))
-    assert r.json()["code"] == "005"  # nothing changed
+    assert r.json()["code"] == "007"  # nothing changed
     r = await client.patch(f"/v1/cams/{cid}", headers=h, json=req("cam", {"bogus": 1}))
-    assert r.json()["code"] == "109"
+    assert r.json()["code"] == "269"
     r = await client.delete(f"/v1/cams/{cid}", headers=h)
-    assert r.json()["code"] == "007" and r.json()["data"] == {"cam": {"id": cid}}
+    assert r.json()["code"] == "009" and r.json()["data"] == {"cam": {"id": cid}}
     assert (await client.get(f"/v1/cams/{cid}", headers=h)).json()["code"] == NOT_FOUND
 
 
@@ -156,33 +156,46 @@ async def test_list_settings_search_sort_limits(client, mk_user, mk_cam):
     j = r.json()
     assert j["code"] == "000" and [c["name"] for c in j["data"]["cams"]] == ["gamma", "beta"]
     st = j["data"]["settings"]
-    assert st["total"] == 3 and st["limit"] == 2 and st["offset"] == 0 and st["order"] == "descending"
-    assert j["metadata"]["page"] == {"current": 1, "pages": 2}
-    # multi search: name include "al" OR name include "ga"
-    r = await client.get("/v1/cams", headers=h, params={"search": "al,ga", "search_column": "name,name"})
-    assert sorted(c["name"] for c in r.json()["data"]["cams"]) == ["alpha", "gamma"]
+    assert st["total"] == 3 and st["limit"] == 2 and st["offset"] == 0 and st["order"] == "desc"
+    assert "page" not in j["metadata"]
+    # v1.2 multi-search combines positional conditions with AND.
+    r = await client.get("/v1/cams", headers=h, params={
+        "search": "alpha,lan", "search_column": "name,address",
+        "search_method": "equals,include",
+    })
+    assert [c["name"] for c in r.json()["data"]["cams"]] == ["alpha"]
+    # Logical connectors belong to `filter`; search_method only accepts comparisons.
+    r = await client.get("/v1/cams", headers=h, params={
+        "search": "alpha,gamma", "search_column": "name,name",
+        "search_method": "equals,or",
+    })
+    assert r.json()["code"] == "066"
     r = await client.get("/v1/cams", headers=h, params={"search": "beta.lan", "search_column": "address",
                                                         "search_method": "exactly"})
     assert [c["name"] for c in r.json()["data"]["cams"]] == ["beta"]
     assert r.json()["data"]["settings"]["search_method"] == "exactly"
     # errors
-    assert (await client.get("/v1/cams", headers=h, params={"limit": 999})).json()["code"] == "183"
-    assert (await client.get("/v1/cams", headers=h, params={"limit": "x"})).json()["code"] == "145"
-    assert (await client.get("/v1/cams", headers=h, params={"sort_by": "password"})).json()["code"] == "143"
+    assert (await client.get("/v1/cams", headers=h, params={"limit": 999})).json()["code"] == "158"
+    assert (await client.get("/v1/cams", headers=h, params={"limit": "x"})).json()["code"] == "129"
+    assert (await client.get("/v1/cams", headers=h, params={"sort_by": "password"})).json()["code"] == "125"
     assert (await client.get("/v1/cams", headers=h, params={"search": "a", "search_column": "password"})
-            ).json()["code"] == "144"
+            ).json()["code"] == "127"
 
 
 async def test_options_supported_functions(client):
     r = await client.options("/v1/cams")
     fns = r.headers["cursed-supported-functions"].split(",")
-    for f in ("limit", "offset", "sort_by", "order", "search", "multi_search", "pagination"):
+    for f in ("GET.limit", "GET.offset", "GET.sort_by", "GET.order", "GET.search",
+              "GET.search_method", "GET.search_column", "GET.multi_search"):
         assert f in fns
     r = await client.options("/v1/cams/bulk")
     fns = r.headers["cursed-supported-functions"].split(",")
-    assert "bulk" in fns and "partial" in fns
+    assert {"POST.bulk", "POST.partial"} <= set(fns)
+    r = await client.options("/v1/cams/bulk/1,2")
+    fns = r.headers["cursed-supported-functions"].split(",")
+    assert {"GET.bulk", "PATCH.bulk", "PATCH.partial", "DELETE.bulk", "DELETE.partial"} <= set(fns)
     r = await client.options("/v1/cams/1/recordings")
-    assert "x-time_range" in r.headers["cursed-supported-functions"].split(",")
+    assert "GET.x-time_range" in r.headers["cursed-supported-functions"].split(",")
 
 
 # --- bulk ---------------------------------------------------------------------
@@ -191,20 +204,20 @@ async def test_bulk_create_atomic_and_partial(client, mk_user):
     good = {**NEW, "name": "a"}
     bad = {"protocol": "rtsp"}
     r = await client.post("/v1/cams/bulk", headers=h, json={"data": {"cams": [good, bad]}})
-    assert r.status_code == 422 and r.json()["code"] == "109"
+    assert r.status_code == 422 and r.json()["code"] == "269"
     assert (await client.get("/v1/cams", headers=h)).json()["data"]["settings"]["total"] == 0  # nothing applied
     r = await client.post("/v1/cams/bulk", headers=h, json={"data": {"cams": [good, {**good, "name": "b"}]}})
-    assert r.status_code == 201 and r.json()["code"] == "001" and len(r.json()["data"]["cams"]) == 2
+    assert r.status_code == 201 and r.json()["code"] == "039" and len(r.json()["data"]["cams"]) == 2
     r = await client.post("/v1/cams/bulk", headers=h, json={"data": {"cams": [good, bad]},
                                                             "options": {"partial_allowed": True}})
     j = r.json()
-    assert j["code"] == "002"
+    assert j["code"] == "041"
     assert len(j["data"]["cams"]["succeeded"]) == 1 and j["data"]["cams"]["failed"][0]["id"] == 1
     assert "address" in j["data"]["cams"]["failed"][0]["error"]["fields"]
     r = await client.post("/v1/cams/bulk?partial_allowed=true", headers=h, json={"data": {"cams": [bad]}})
-    assert r.json()["code"] == "109" and r.json()["data"]["cams"]["succeeded"] == []  # all failed
+    assert r.json()["code"] == "269" and r.json()["data"]["cams"]["succeeded"] == []  # all failed
     assert (await client.post("/v1/cams/bulk", headers=h, json={"data": {"cams": [good] * 101}})
-            ).json()["code"] == "146"
+            ).json()["code"] == "132"
 
 
 async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
@@ -215,11 +228,11 @@ async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
     r = await client.get(f"/v1/cams/bulk/{c1},{c2}", headers=h)
     j = r.json()
     assert j["code"] == "000" and [c["id"] for c in j["data"]["cams"]] == [c1, c2]
-    assert j["data"]["settings"]["total"] == 2
+    assert "settings" not in j["data"]  # v1.2 bulk GET returns only requested objects
     # a foreign id and a non-existent id are indistinguishable: atomic 082, nothing returned
     for ids in (f"{c1},{c2},{foreign}", f"{c1},{c2},99999", f"{foreign}"):
         r = await client.get(f"/v1/cams/bulk/{ids}", headers=h)
-        assert r.status_code == 404 and r.json()["code"] == "082", ids
+        assert r.status_code == 404 and r.json()["code"] == "215", ids
         assert "cams" not in (r.json().get("data") or {})
     # partial_allowed is not a thing for GET: still 082
     r = await client.get(f"/v1/cams/bulk/{c1},{foreign}?partial_allowed=true", headers=h)
@@ -228,16 +241,16 @@ async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
     admin = await mk_user("admin@x.io", role="admin")
     ra = await client.get(f"/v1/cams/bulk/{c1},{foreign}", headers=bearer(await tok(admin, "admin")))
     assert ra.json()["code"] == "000" and len(ra.json()["data"]["cams"]) == 2
-    assert (await client.get("/v1/cams/bulk/1,x", headers=h)).json()["code"] == "109"
+    assert (await client.get("/v1/cams/bulk/1,x", headers=h)).json()["code"] == "269"
 
     patch = {"data": {"cams": [{"name": "n1"}, {"name": "n2"}]}}
     r = await client.patch(f"/v1/cams/bulk/{c1},{c2}", headers=h, json=patch)
-    assert r.json()["code"] == "003" and [c["name"] for c in r.json()["data"]["cams"]] == ["n1", "n2"]
+    assert r.json()["code"] == "002" and [c["name"] for c in r.json()["data"]["cams"]] == ["n1", "n2"]
     # length mismatch
-    assert (await client.patch(f"/v1/cams/bulk/{c1}", headers=h, json=patch)).json()["code"] == "109"
+    assert (await client.patch(f"/v1/cams/bulk/{c1}", headers=h, json=patch)).json()["code"] == "269"
     # atomic: foreign id rejects everything
     r = await client.patch(f"/v1/cams/bulk/{c1},{foreign}", headers=h, json={"data": {"cams": [{"name": "z"}] * 2}})
-    assert r.status_code == 404 and r.json()["code"] == "082"
+    assert r.status_code == 404 and r.json()["code"] == "215"
     assert (await client.get(f"/v1/cams/{c1}", headers=h)).json()["data"]["cam"]["name"] == "n1"
     # partial
     r = await client.patch(f"/v1/cams/bulk/{c1},{foreign}", headers=h,
@@ -247,13 +260,13 @@ async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
     assert j["data"]["cams"]["succeeded"][0]["name"] == "z"
 
     r = await client.delete(f"/v1/cams/bulk/{c1},{foreign}", headers=h)
-    assert r.json()["code"] == "082"
+    assert r.json()["code"] == "215"
     assert (await client.get(f"/v1/cams/{c1}", headers=h)).json()["code"] == "000"
     r = await client.delete(f"/v1/cams/bulk/{c1},{foreign}?partial_allowed=true", headers=h)
-    assert r.json()["code"] == "008" and r.json()["data"]["cams"]["succeeded"] == [{"id": c1}]
+    assert r.json()["code"] == "012" and r.json()["data"]["cams"]["succeeded"] == [{"id": c1}]
     r = await client.delete(f"/v1/cams/bulk/{c2}", headers=h)
-    assert r.json()["code"] == "007"
-    assert (await client.get(f"/v1/cams/{c2}", headers=h)).json()["code"] == "082"
+    assert r.json()["code"] == "009"
+    assert (await client.get(f"/v1/cams/{c2}", headers=h)).json()["code"] == "215"
 
 
 # --- PTZ / onvif / recordings -------------------------------------------------
@@ -273,19 +286,19 @@ async def test_ptz_request_object_and_lock(client, mk_user, mk_cam, monkeypatch)
     monkeypatch.setattr("app.routers.cams.stream_ptz.onvif_client.get_status", fake_status)
     r = await client.get(f"/v1/cams/{cid}/ptz", headers=h)
     assert r.json()["data"]["ptz"] == {"pan": 0.1, "tilt": 0.2, "zoom": 0.3}
-    assert (await client.post(f"/v1/cams/{cid}/ptz", headers=h, json={"pan": 1})).json()["code"] == "109"
-    assert (await client.post(f"/v1/cams/{cid}/ptz", headers=h, json=req("ptz", {}))).json()["code"] == "109"
+    assert (await client.post(f"/v1/cams/{cid}/ptz", headers=h, json={"pan": 1})).json()["code"] == "269"
+    assert (await client.post(f"/v1/cams/{cid}/ptz", headers=h, json=req("ptz", {}))).json()["code"] == "269"
     r = await client.post(f"/v1/cams/{cid}/ptz", headers=h, json=req("ptz", {"pan": 0.5}))
     assert r.json()["code"] == "000" and r.json()["data"]["ptz"]["id"] == cid and moved == [(0.5, None, None)]
     r = await client.post(f"/v1/cams/{cid}/ptz", headers=h, json=req("ptz", {"pan": 0.6}))
-    assert r.status_code == 423 and r.json()["code"] == LOCKED == "110"
+    assert r.status_code == 423 and r.json()["code"] == LOCKED == "302"
 
 
 async def test_ptz_not_configured_code(client, mk_user, mk_cam):
     owner = await mk_user("o@x.io")
     cid = await mk_cam(owner)
     r = await client.post(f"/v1/cams/{cid}/ptz", headers=bearer(await tok(owner)), json=req("ptz", {"pan": 1}))
-    assert r.status_code == 409 and r.json()["code"] == PTZ_NOT_CONFIGURED == "176"
+    assert r.status_code == 409 and r.json()["code"] == PTZ_NOT_CONFIGURED == "388"
 
 
 async def test_onvif_patch(client, mk_user, mk_cam):
@@ -293,13 +306,13 @@ async def test_onvif_patch(client, mk_user, mk_cam):
     cid = await mk_cam(owner)
     r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(await tok(owner)),
                            json=req("onvif", {"onvif_enabled": 1}))
-    assert r.json()["code"] == "003" and r.json()["data"]["onvif"]["onvif_enabled"] == 1
+    assert r.json()["code"] == "002" and r.json()["data"]["onvif"]["onvif_enabled"] == 1
     r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(await tok(other)),
                            json=req("onvif", {"onvif_enabled": 0}))
     assert r.json()["code"] == FORBIDDEN_RESOURCE
     r = await client.patch(f"/v1/cams/{cid}/onvif", headers=bearer(await tok(owner)),
                            json=req("onvif", {"onvif_enabled": 5}))
-    assert r.json()["code"] == "109"
+    assert r.json()["code"] == "269"
 
 
 async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
@@ -310,14 +323,14 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
     cid = await mk_cam(owner)
     assert (await client.get(f"/v1/cams/{cid}/recording", headers=h)).json()["data"]["recording_config"]["record"] == 0
     cfg = req("recording_config", {"record": 1, "record_type": "local", "record_metadata": {"local": {"path": str(tmp_path)}}})
-    assert (await client.patch(f"/v1/cams/{cid}/recording", headers=h, json=cfg)).json()["code"] == "062"
+    assert (await client.patch(f"/v1/cams/{cid}/recording", headers=h, json=cfg)).json()["code"] == "386"
     async with db() as s:
         await s.execute(update(User).where(User.id == owner).values(allowrecord=1))
         await s.commit()
     r = await client.patch(f"/v1/cams/{cid}/recording", headers=h, json=req("recording_config", {"record": 1}))
-    assert r.json()["code"] == "109" and "record_type" in r.json()["error"]["fields"]
+    assert r.json()["code"] == "269" and "record_type" in r.json()["error"]["fields"]
     r = await client.patch(f"/v1/cams/{cid}/recording", headers=h, json=cfg)
-    assert r.json()["code"] == "003" and r.json()["data"]["recording_config"]["record_type"] == "local"
+    assert r.json()["code"] == "002" and r.json()["data"]["recording_config"]["record_type"] == "local"
 
     import os
     for i, name in enumerate(("a.mp4", "b.mp4", "c.mp4")):
@@ -328,7 +341,7 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
     r = await client.get(f"/v1/cams/{cid}/recordings", headers=h)
     j = r.json()
     assert j["code"] == "000" and [x["id"] for x in j["data"]["recordings"]] == ["c.mp4", "b.mp4", "a.mp4"]
-    assert j["data"]["settings"]["total"] == 3 and j["data"]["settings"]["limit"] == 10
+    assert j["data"]["settings"]["total"] == 3 and j["data"]["settings"]["limit"] == 25
     r = await client.get(f"/v1/cams/{cid}/recordings", headers=h,
                          params={"sort_by": "size_bytes", "order": "asc", "limit": 2, "offset": 1})
     assert [x["id"] for x in r.json()["data"]["recordings"]] == ["b.mp4", "c.mp4"]
@@ -336,12 +349,12 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
     assert [x["id"] for x in r.json()["data"]["recordings"]] == ["b.mp4"]
     r = await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"from": 1010, "to": 1015})
     assert [x["id"] for x in r.json()["data"]["recordings"]] == ["b.mp4"]
-    assert (await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"from": "x"})).json()["code"] == "118"
-    assert (await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"limit": 101})).json()["code"] == "183"
+    assert (await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"from": "x"})).json()["code"] == "066"
+    assert (await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"limit": 256})).json()["code"] == "158"
     r = await client.get(f"/v1/cams/{cid}/recordings/a.mp4", headers=h)
     assert r.json()["data"]["recording"]["size_bytes"] == 1
     r = await client.get(f"/v1/cams/{cid}/recordings/nope.mp4", headers=h)
-    assert r.status_code == 404 and r.json()["code"] == "082"
+    assert r.status_code == 404 and r.json()["code"] == "215"
     r = await client.get(f"/v1/cams/{cid}/recordings/a.mp4/file", headers=h)
     assert r.status_code == 200 and r.content == b"x"  # binary untouched
 
@@ -434,7 +447,7 @@ async def test_expired_share_rejected(client, mk_user, mk_cam, db):
         sid = sh.id
     expired = create_share_token(sid, owner, "stream", "cams", cid, None, -10)
     r = await client.get(f"/v1/cams/{cid}/ptz", headers=bearer(expired))
-    assert r.json()["code"] == "043"
+    assert r.json()["code"] == "170"
     valid = create_share_token(sid, owner, "stream", "cams", cid, None, 100)
     r = await client.get(f"/v1/cams/{cid}/ptz", headers=bearer(valid))
     assert r.json()["code"] == PTZ_NOT_CONFIGURED
@@ -449,4 +462,4 @@ async def test_share_token_signed_with_foreign_secret_rejected(client, mk_user, 
                          "device_id": cid, "filename": None, "iat": now, "exp": now + 99},
                         "attacker-secret-attacker-secret-1234", algorithm="HS256")
     r = await client.get(f"/v1/cams/{cid}/ptz", headers=bearer(forged))
-    assert r.json()["code"] == "042"
+    assert r.json()["code"] == "167"

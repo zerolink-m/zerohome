@@ -14,7 +14,7 @@ class StrictModel(BaseModel):
 class NonNullablePatch(BaseModel):
     """Mixin for PATCH schemas: fields listed in `non_nullable` (columns declared
     nullable=False in app/models) accept a value or omission, but never an explicit
-    null — that gives a validation error (109) instead of a DB error."""
+    null — that gives a validation error (269, VALIDATION_ERROR) instead of a DB error."""
 
     non_nullable: ClassVar[tuple[str, ...]] = ()
 

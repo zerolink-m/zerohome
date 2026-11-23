@@ -57,7 +57,7 @@ async def test_create_get_list(client, users):
     o, t, _ = users
     r = await client.post("/v1/switches", headers=bearer(await tok(o)), json=body(**sw("a")))
     j = r.json()
-    assert r.status_code == 201 and j["code"] == "001"
+    assert r.status_code == 201 and j["code"] == "039"
     sid = j["data"]["switch"]["id"]
     assert j["data"]["switch"]["owner"] == o and j["data"]["switch"]["control_protocol"] == "custom"
 
@@ -69,7 +69,7 @@ async def test_create_get_list(client, users):
     assert r.json()["code"] == "000" and d["settings"]["total"] == 1 and len(d["switches"]) == 1
 
     r = await client.get("/v1/switches", headers=bearer(await tok(t)))
-    assert r.json()["code"] == "012" and r.json()["data"]["switches"] == []
+    assert r.json()["code"] == "019" and r.json()["data"]["switches"] == []
 
 
 async def test_list_search_sort_limit(client, users):
@@ -83,9 +83,9 @@ async def test_list_search_sort_limit(client, users):
     d = r.json()["data"]
     assert [s["name"] for s in d["switches"]] == ["gamma", "beta"] and d["settings"]["total"] == 3
     r = await client.get("/v1/switches?limit=1000", headers=h)
-    assert r.status_code == 400 and r.json()["code"] == "183"
+    assert r.status_code == 400 and r.json()["code"] == "158"
     r = await client.get("/v1/switches?sort_by=bogus", headers=h)
-    assert r.json()["code"] == "143"
+    assert r.json()["code"] == "125"
 
 
 async def test_create_validation_errors(client, users):
@@ -125,9 +125,9 @@ async def test_patch_and_not_changed(client, users):
     sid = await create(client, o, name="a")
     h = bearer(await tok(o))
     r = await client.patch(f"/v1/switches/{sid}", headers=h, json=body(name="b", enabled=1))
-    assert r.json()["code"] == "003" and r.json()["data"]["switch"]["name"] == "b"
+    assert r.json()["code"] == "002" and r.json()["data"]["switch"]["name"] == "b"
     r = await client.patch(f"/v1/switches/{sid}", headers=h, json=body(name="b"))
-    assert r.json()["code"] == "005"
+    assert r.json()["code"] == "007"
     r = await client.patch(f"/v1/switches/{sid}", headers=h, json=body(bogus=1))
     assert r.json()["code"] == VALIDATION_ERROR
 
@@ -138,7 +138,7 @@ async def test_delete(client, users, sessionmaker_):
     r = await client.delete(f"/v1/switches/{sid}", headers=bearer(await tok(t)))
     assert r.json()["code"] == OBJECT_NOT_FOUND
     r = await client.delete(f"/v1/switches/{sid}", headers=bearer(await tok(o)))
-    assert r.json()["code"] == "007" and r.json()["data"]["switch"] == {"id": sid}
+    assert r.json()["code"] == "009" and r.json()["data"]["switch"] == {"id": sid}
     r = await client.get(f"/v1/switches/{sid}", headers=bearer(await tok(o)))
     assert r.json()["code"] == OBJECT_NOT_FOUND
 
@@ -175,7 +175,7 @@ async def test_patch_auto_restricted_fields(client, users, sessionmaker_):
     r = await client.patch(f"/v1/switches/{sid}", headers=h, json=body(control_protocol="custom"))
     assert r.status_code == 403 and r.json()["code"] == FORBIDDEN_RESOURCE
     r = await client.patch(f"/v1/switches/{sid}", headers=h, json=body(name="renamed"))
-    assert r.json()["code"] == "003"
+    assert r.json()["code"] == "002"
 
 
 async def test_bulk_delete_auto_partial(client, users, sessionmaker_):
@@ -186,7 +186,7 @@ async def test_bulk_delete_auto_partial(client, users, sessionmaker_):
     assert r.json()["code"] == FORBIDDEN_RESOURCE
     r = await client.delete(f"/v1/switches/bulk/{auto},{plain}?partial_allowed=true", headers=h)
     j = r.json()
-    assert j["code"] == "008" and j["data"]["switches"]["succeeded"] == [{"id": plain}]
+    assert j["code"] == "012" and j["data"]["switches"]["succeeded"] == [{"id": plain}]
     assert j["data"]["switches"]["failed"][0]["id"] == auto
 
 
@@ -211,7 +211,7 @@ async def test_bulk_create_tuya_local_partial(client, users):
     assert r.json()["code"] == TUYA_LOCAL_NOT_ALLOWED
     r = await client.post("/v1/switches/bulk", headers=h, json=bbody(items, partial_allowed=True))
     j = r.json()
-    assert j["code"] == "002" and len(j["data"]["switches"]["succeeded"]) == 1
+    assert j["code"] == "041" and len(j["data"]["switches"]["succeeded"]) == 1
     assert j["data"]["switches"]["failed"][0]["id"] == 1
 
 
@@ -236,7 +236,7 @@ async def test_bulk_create_and_get(client, users):
     h = bearer(await tok(o))
     r = await client.post("/v1/switches/bulk", headers=h, json=bbody([sw("a"), sw("b")]))
     j = r.json()
-    assert r.status_code == 201 and j["code"] == "001" and len(j["data"]["switches"]) == 2
+    assert r.status_code == 201 and j["code"] == "039" and len(j["data"]["switches"]) == 2
     ids = ",".join(str(s["id"]) for s in j["data"]["switches"])
     r = await client.get(f"/v1/switches/bulk/{ids}", headers=h)
     assert r.json()["code"] == "000" and [s["name"] for s in r.json()["data"]["switches"]] == ["a", "b"]
@@ -255,7 +255,7 @@ async def test_bulk_create_atomic_and_partial(client, users):
     assert (await client.get("/v1/switches", headers=h)).json()["data"]["settings"]["total"] == 0
     r = await client.post("/v1/switches/bulk", headers=h, json=bbody(items, partial_allowed=True))
     j = r.json()
-    assert j["code"] == "002"
+    assert j["code"] == "041"
     assert len(j["data"]["switches"]["succeeded"]) == 1 and j["data"]["switches"]["failed"][0]["id"] == 1
     r = await client.post("/v1/switches/bulk", headers=h, json=bbody([{"control_protocol": "bad"}], partial_allowed=True))
     assert r.json()["code"] == VALIDATION_ERROR
@@ -271,7 +271,7 @@ async def test_bulk_patch(client, users):
     other = await create(client, t, name="x")
     h = bearer(await tok(o))
     r = await client.patch(f"/v1/switches/bulk/{a},{b}", headers=h, json=bbody([{"name": "A"}, {"name": "B"}]))
-    assert r.json()["code"] == "003" and [s["name"] for s in r.json()["data"]["switches"]] == ["A", "B"]
+    assert r.json()["code"] == "002" and [s["name"] for s in r.json()["data"]["switches"]] == ["A", "B"]
     r = await client.patch(f"/v1/switches/bulk/{a},{b}", headers=h, json=bbody([{"name": "A"}]))
     assert r.json()["code"] == VALIDATION_ERROR
     # atomic: foreign id rejects everything
@@ -292,6 +292,6 @@ async def test_bulk_delete(client, users):
     assert r.json()["code"] == OBJECT_NOT_FOUND
     assert (await client.get(f"/v1/switches/{a}", headers=h)).json()["code"] == "000"
     r = await client.delete(f"/v1/switches/bulk/{a},999?partial_allowed=true", headers=h)
-    assert r.json()["code"] == "008" and r.json()["data"]["switches"]["succeeded"] == [{"id": a}]
+    assert r.json()["code"] == "012" and r.json()["data"]["switches"]["succeeded"] == [{"id": a}]
     r = await client.delete(f"/v1/switches/bulk/{b}", headers=h)
-    assert r.json()["code"] == "007" and r.json()["data"]["switches"] == [{"id": b}]
+    assert r.json()["code"] == "009" and r.json()["data"]["switches"] == [{"id": b}]

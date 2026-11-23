@@ -3,14 +3,12 @@
 
 parse_ids(raw, max_items=100) -> list[int]
     * order kept, duplicates silently dropped (the list is a set of objects)
-    * empty / non-integer position -> 109 with error.path.ids (a malformed path
-      parameter is a validation error of the path; 118 is reserved for the query
-      string, 040 is a generic fallback)
-    * more than max_items distinct ids -> 146 with error.path.ids
+    * empty / non-integer position -> 269 (VALIDATION_ERROR) with error.path.ids
+    * more than max_items distinct ids -> 132 (BULK_LIMIT_EXCEEDED) with error.path.ids
 
 partial_query() -> bool   (FastAPI dependency)
-    reads `?partial_allowed=`; absent -> False; not a boolean -> 118 (same as
-    request_body options).
+    reads `?partial_allowed=`; absent -> False; not a boolean -> 066 (INVALID_QUERY,
+    same as request_body options).
 """
 from __future__ import annotations
 

@@ -12,9 +12,9 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.core import codes
 from app.core.context import new_request_id, request_id_var, started_var, warnings_var
 from app.core.errors import AppError, error_response
-from app.core.introspection import options_headers, options_info
+from app.core.introspection import options_headers, options_info, route_info
 from app.core.rate_limit import check_global
-from app.core.response import CURSED_VERSION, respond, success
+from app.core.response import CURSED_ENVELOPE_MARKER, CURSED_VERSION, respond, success
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +43,22 @@ class CursedMiddleware:
                 headers["cursed-version"] = CURSED_VERSION
                 headers["cursed-duration"] = f"{time.perf_counter() - started:.3f}"
                 headers["cursed-request-id"] = rid
+                status = message["status"]
+                no_body = scope["method"] == "HEAD" or status in (204, 304)
+                is_cursed_envelope = headers.get(CURSED_ENVELOPE_MARKER) == "1"
+                if CURSED_ENVELOPE_MARKER in headers:
+                    del headers[CURSED_ENVELOPE_MARKER]
+                if is_cursed_envelope and not no_body:
+                    # The marker is set only by the shared CursedJSON response builder.
+                    if "cursed-code" in headers:
+                        del headers["cursed-code"]
+                else:
+                    route = scope.get("route")
+                    if route is not None and "streaming" in route_info(route)["functions"]:
+                        code = codes.STREAMING
+                    else:
+                        code = codes.code_for_http_status(status)
+                    headers["cursed-code"] = code
                 for k, v in extra.items():
                     if k not in headers:
                         headers[k] = v

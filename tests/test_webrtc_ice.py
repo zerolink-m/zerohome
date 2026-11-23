@@ -37,7 +37,7 @@ def turn_cfg(monkeypatch):
 
 async def test_ice_requires_auth(client, turn_cfg):
     r = await client.get("/v1/webrtc/ice")
-    assert r.json()["code"] == "046" and r.status_code >= 400
+    assert r.json()["code"] == "177" and r.status_code >= 400
     r = await client.get("/v1/webrtc/ice", headers=hdr("junk"))
     assert r.status_code >= 400 and r.json()["code"] != "000"
 

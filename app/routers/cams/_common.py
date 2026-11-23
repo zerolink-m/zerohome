@@ -20,10 +20,12 @@ from app.core.codes import (
 )
 from app.core.config import settings
 from app.core.errors import AppError
+from app.core.introspection import declare
 from app.core.rate_limit import PointBudget, rate_limit
 from app.core.security import TokenPayload
 from app.db.session import get_db
 from app.deps.auth import AccessContext, require_access, require_access_qs, resolve_record_access, resolve_stream_access
+from app.deps.request_body import read_envelope, single_body
 from app.models.cams import Cam
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
@@ -42,6 +44,23 @@ from app.schemas.recording import RecordingOut
 from app.services import onvif_client, ptz_lock, push, recordings, snapshot, stream_manager, hls_manager, webrtc_manager
 
 router = APIRouter(prefix="/v1/cams", tags=["cams"])
+
+
+def single_body_for_route(key, schema):
+    """Build a single-object body dependency without advertising bulk-only partial mode."""
+    dependency = single_body(key, schema)
+    dependency.cursed_functions = frozenset()
+    dependency.cursed_meta = {}
+    return dependency
+
+
+async def optional_bulk_options(request: Request) -> bool:
+    """Read optional DELETE Request object; body options override query options."""
+    _, options = await read_envelope(request, optional=True)
+    return options.partial_allowed
+
+
+declare(optional_bulk_options, "partial")
 
 # name -> column; public (API) field names, used for sort_by / search_column
 CAM_LIST_COLUMNS = {

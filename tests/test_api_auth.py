@@ -23,7 +23,7 @@ def cred(email, password):
 async def test_register_returns_token_and_persists_only_hash(client, db):
     p = {"name": "A", "surname": "B", "email": "A@Example.com", "password": "pw"}
     r = await client.post("/v1/auth/register", json=reg(p))
-    assert r.status_code == 201 and r.json()["code"] == "001"
+    assert r.status_code == 201 and r.json()["code"] == "039"
     token = r.json()["data"]["token"]
     assert len(token) == 43 and isinstance(r.json()["data"]["user"]["id"], int)
     async with db() as s:
@@ -43,7 +43,7 @@ async def test_login_token_logout_and_revoke(client, mk_user, db):
         assert row.token_hash == bearer_hash(token)
         sid = row.id
     r = await client.post("/v1/auth/logout", headers=bearer(token))
-    assert r.json()["code"] == "018" and r.json()["data"]["session"]["id"] == sid
+    assert r.json()["code"] == "034" and r.json()["data"]["session"]["id"] == sid
     assert (await client.get("/v1/cams", headers=bearer(token))).status_code == 401
     async with db() as s:
         assert await s.get(Session, sid) is None
@@ -64,7 +64,7 @@ async def test_login_rate_limit(client, mk_user):
 async def test_register_rate_limit(client):
     codes = [(await client.post("/v1/auth/register", json=reg({
         "name": "A", "surname": "B", "email": f"u{i}@x.io", "password": "pw"}))).json()["code"] for i in range(4)]
-    assert codes == ["001"] * 3 + [ENDPOINT_RATE_LIMITED]
+    assert codes == ["039"] * 3 + [ENDPOINT_RATE_LIMITED]
 
 
 async def test_legacy_refresh_one_time_conversion(client, mk_user, db):
@@ -78,7 +78,7 @@ async def test_legacy_refresh_one_time_conversion(client, mk_user, db):
         legacy = create_session_token(uid, row.id)
     assert (await client.get("/v1/cams", headers=bearer(legacy))).status_code == 401
     converted = await client.post("/v1/auth/new-refresh", headers=bearer(legacy))
-    assert converted.json()["code"] == "019"
+    assert converted.json()["code"] == "036"
     token = converted.json()["data"]["token"]
     assert (await client.get("/v1/cams", headers=bearer(token))).status_code == 200
     assert (await client.post("/v1/auth/new-refresh", headers=bearer(legacy))).status_code == 401
@@ -98,7 +98,7 @@ async def test_expired_or_revoked_legacy_refresh_never_converts(client, mk_user,
         sid = row.id
     expired = jwt.encode({"uid": uid, "sid": sid, "iat": now - 86400, "exp": now - 1},
                          settings.JWT_SECRET_SESSION, algorithm="HS256")
-    assert (await client.post("/v1/auth/new-refresh", headers=bearer(expired))).json()["code"] == "043"
+    assert (await client.post("/v1/auth/new-refresh", headers=bearer(expired))).json()["code"] == "170"
     async with db() as s:
         assert (await s.get(Session, sid)).token_hash is None
         await s.delete(await s.get(Session, sid))

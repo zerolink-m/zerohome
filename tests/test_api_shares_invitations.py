@@ -33,7 +33,7 @@ def _raw(device_type, device_id, type_):
 async def test_create_share_default_ttl_and_token_contents(client, setup):
     owner, _, _, cam = setup
     r = await client.post("/v1/shares", headers=bearer(await tok(owner)), json=share_body(cam))
-    assert r.status_code == 201 and r.json()["code"] == "001"
+    assert r.status_code == 201 and r.json()["code"] == "039"
     d = r.json()["data"]["share"]
     p = decode_share_token(d["token"])
     assert (p.sha_id, p.user_id, p.type, p.device_type, p.device_id) == (d["id"], owner, "stream", "cams", cam)
@@ -52,7 +52,7 @@ async def test_share_ttl_out_of_range(client, setup, ttl):
 async def test_share_ttl_boundaries_ok(client, setup, ttl):
     owner, _, _, cam = setup
     r = await client.post("/v1/shares", headers=bearer(await tok(owner)), json=share_body(cam, ttl_seconds=ttl))
-    assert r.json()["code"] == "001"
+    assert r.json()["code"] == "039"
 
 
 async def test_share_invalid_type_for_device(client, setup):
@@ -68,9 +68,9 @@ async def test_share_invalid_type_for_device(client, setup):
 async def test_share_validation_filename_rules(client, setup):
     owner, _, _, cam = setup
     r = await client.post("/v1/shares", headers=bearer(await tok(owner)), json=share_body(cam, filename="x.mp4"))
-    assert r.json()["code"] == "109"
+    assert r.json()["code"] == "269"
     r = await client.post("/v1/shares", headers=bearer(await tok(owner)), json=share_body(cam, type="record"))
-    assert r.json()["code"] == "109"
+    assert r.json()["code"] == "269"
 
 
 async def test_share_only_owner_or_admin(client, setup):
@@ -78,7 +78,7 @@ async def test_share_only_owner_or_admin(client, setup):
     r = await client.post("/v1/shares", headers=bearer(await tok(other)), json=share_body(cam))
     assert r.json()["code"] == FORBIDDEN_RESOURCE
     r = await client.post("/v1/shares", headers=bearer(await tok(admin, "admin")), json=share_body(cam))
-    assert r.json()["code"] == "001"
+    assert r.json()["code"] == "039"
 
 
 async def test_share_unknown_device(client, setup):
@@ -90,7 +90,7 @@ async def test_share_unknown_device(client, setup):
 async def test_share_requires_auth(client, setup):
     _, _, _, cam = setup
     r = await client.post("/v1/shares", json=share_body(cam))
-    assert r.json()["code"] == "046"
+    assert r.json()["code"] == "177"
 
 
 async def test_share_list_get_delete_scoping(client, setup):
@@ -101,14 +101,14 @@ async def test_share_list_get_delete_scoping(client, setup):
     assert (await client.get("/v1/shares", headers=bearer(await tok(admin, "admin")))).json()["data"]["settings"]["total"] == 1
     assert (await client.get(f"/v1/shares/{sid}", headers=bearer(await tok(other)))).json()["code"] == NOT_FOUND
     assert (await client.delete(f"/v1/shares/{sid}", headers=bearer(await tok(other)))).json()["code"] == NOT_FOUND
-    assert (await client.delete(f"/v1/shares/{sid}", headers=bearer(await tok(owner)))).json()["code"] == "007"
+    assert (await client.delete(f"/v1/shares/{sid}", headers=bearer(await tok(owner)))).json()["code"] == "009"
     assert (await client.get(f"/v1/shares/{sid}", headers=bearer(await tok(owner)))).json()["code"] == NOT_FOUND
 
 
 async def test_share_token_itself_cannot_call_shares_api(client, setup):
     owner, _, _, cam = setup
     t = (await client.post("/v1/shares", headers=bearer(await tok(owner)), json=share_body(cam))).json()["data"]["share"]["token"]
-    assert (await client.get("/v1/shares", headers=bearer(t))).json()["code"] == "042"
+    assert (await client.get("/v1/shares", headers=bearer(t))).json()["code"] == "167"
 
 
 # ---------------- invitations ----------------
@@ -119,7 +119,7 @@ def inv_body(cam, email="other@x.io"):
 async def test_invitation_create_rules(client, setup):
     owner, other, admin, cam = setup
     r = await client.post("/v1/invitations", headers=bearer(await tok(owner)), json=inv_body(cam))
-    assert r.status_code == 201 and r.json()["code"] == "001"
+    assert r.status_code == 201 and r.json()["code"] == "039"
     # duplicate (case-insensitive)
     r = await client.post("/v1/invitations", headers=bearer(await tok(owner)), json=inv_body(cam, "OTHER@x.io"))
     assert r.json()["code"] == INVITATION_INVALID
@@ -148,11 +148,11 @@ async def test_invitation_visibility_and_patch_rights(client, setup, mk_user):
     r = await client.post(f"/v1/invitations/{iid}/accept", headers=bearer(await tok(owner)))
     assert r.json()["code"] == FORBIDDEN_RESOURCE
     r = await client.post(f"/v1/invitations/{iid}/accept", headers=bearer(await tok(other)))
-    assert r.json()["code"] == "003"
+    assert r.json()["code"] == "002"
     assert r.json()["data"]["invitation"]["status"] == "accepted"
     # repeated accept: not changed
     r = await client.post(f"/v1/invitations/{iid}/accept", headers=bearer(await tok(other)))
-    assert r.json()["code"] == "005"
+    assert r.json()["code"] == "007"
     got = (await client.get(f"/v1/invitations/{iid}", headers=bearer(await tok(other)))).json()["data"]["invitation"]
     assert got["status"] == "accepted" and got["updated_at"] is not None
     # PATCH on an invitation no longer exists
@@ -165,17 +165,17 @@ async def test_invitation_decline(client, setup):
     iid = (await client.post("/v1/invitations", headers=bearer(await tok(owner)), json=inv_body(cam))).json()["data"]["invitation"]["id"]
     assert (await client.post(f"/v1/invitations/{iid}/decline", headers=bearer(await tok(owner)))).json()["code"] == FORBIDDEN_RESOURCE
     r = await client.post(f"/v1/invitations/{iid}/decline", headers=bearer(await tok(other)))
-    assert r.json()["code"] == "007"
+    assert r.json()["code"] == "009"
     assert (await client.get(f"/v1/invitations/{iid}", headers=bearer(await tok(owner)))).json()["code"] == NOT_FOUND
 
 
 async def test_invitation_body_validation(client, setup):
     owner, _, _, cam = setup
     r = await client.post("/v1/invitations", headers=bearer(await tok(owner)), json={"device_type": "cams"})
-    assert r.json()["code"] == "109"
+    assert r.json()["code"] == "269"
     r = await client.post("/v1/invitations", headers=bearer(await tok(owner)),
                           json={"data": {"invitation": {"device_type": "cams", "device_id": cam, "email": "nope"}}})
-    assert r.json()["code"] == "109" and "email" in r.json()["error"]["fields"]
+    assert r.json()["code"] == "269" and "email" in r.json()["error"]["fields"]
 
 
 async def test_invitation_delete_rights(client, setup, mk_user):
@@ -183,11 +183,11 @@ async def test_invitation_delete_rights(client, setup, mk_user):
     third = await mk_user("third@x.io")
     iid = (await client.post("/v1/invitations", headers=bearer(await tok(owner)), json=inv_body(cam))).json()["data"]["invitation"]["id"]
     assert (await client.delete(f"/v1/invitations/{iid}", headers=bearer(await tok(third)))).json()["code"] == NOT_FOUND
-    assert (await client.delete(f"/v1/invitations/{iid}", headers=bearer(await tok(other)))).json()["code"] == "007"
+    assert (await client.delete(f"/v1/invitations/{iid}", headers=bearer(await tok(other)))).json()["code"] == "009"
     assert (await client.get(f"/v1/invitations/{iid}", headers=bearer(await tok(owner)))).json()["code"] == NOT_FOUND
 
 
 async def test_invitation_requires_access_token(client, setup):
     _, _, _, cam = setup
-    assert (await client.get("/v1/invitations")).json()["code"] == "046"
-    assert (await client.post("/v1/invitations", json=inv_body(cam))).json()["code"] == "046"
+    assert (await client.get("/v1/invitations")).json()["code"] == "177"
+    assert (await client.post("/v1/invitations", json=inv_body(cam))).json()["code"] == "177"
