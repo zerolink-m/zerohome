@@ -50,7 +50,8 @@ class CursedMiddleware:
                     del headers[CURSED_ENVELOPE_MARKER]
                 if is_cursed_envelope and not no_body:
                     # The marker is set only by the shared CursedJSON response builder.
-                    headers.pop("cursed-code", None)
+                    if "cursed-code" in headers:
+                        del headers["cursed-code"]
                 else:
                     route = scope.get("route")
                     if route is not None and "streaming" in route_info(route)["functions"]:

@@ -39,7 +39,7 @@ def test_runtime_environment_is_limited_to_database_bootstrap(monkeypatch):
     monkeypatch.setenv("BOOTSTRAP_JWT_SECRET_SESSION", "explicit-import-secret")
     assert Settings(_env_file=None).JWT_SECRET_SESSION == "explicit-import-secret"
     assert "VERSION" not in Settings.model_fields
-    assert APP_VERSION == "4.8.1"
+    assert APP_VERSION == "4.8.2"
 
 
 def test_local_capability_and_global_switch_both_gate_workers():
@@ -92,31 +92,28 @@ def test_every_secret_like_setting_is_redacted():
 
 @pytest.mark.asyncio
 async def test_runtime_configuration_api_redacts_all_secret_settings():
-    from app.routers.config import get_runtime_configuration
+    from app.core.security import TokenPayload
+    from app.routers.config import get_system_setting
 
-    values = {name: f"redaction-test-{index}" for index, name in enumerate(runtime.secret_fields())}
-    rows = [GlobalSetting(key=name, value=value) for name, value in values.items()]
-
-    class _Scalars:
-        def all(self):
-            return rows
-
-    class _Result:
-        def scalars(self):
-            return _Scalars()
+    exposed_secrets = runtime.secret_fields() & runtime.global_fields()
+    assert exposed_secrets
+    values = {name: f"redaction-test-{index}" for index, name in enumerate(exposed_secrets)}
+    rows = {name: GlobalSetting(key=name, value=value) for name, value in values.items()}
 
     class _Database:
         async def get(self, model, key):
+            if model is GlobalSetting:
+                return rows.get(key)
             return SystemSettings(id=1, revision=1, updated_at=1)
 
-        async def execute(self, _query):
-            return _Result()
-
-    response = await get_runtime_configuration(None, _Database())
-    public = json.loads(response.body)["data"]["settings"]
-    for name in values:
-        assert public[name] == {"configured": True}
-    assert not any(value in response.body.decode() for value in values.values())
+    admin = TokenPayload(kind="bearer", uid=1, sid=1, role="admin", iat=1, exp=2)
+    db = _Database()
+    for name, secret in values.items():
+        response = await get_system_setting(name, admin, db)
+        body = response.body.decode()
+        public = json.loads(body)["data"]["system_setting"]
+        assert public["value"] == {"configured": True}
+        assert secret not in body
 
 
 @pytest.mark.asyncio

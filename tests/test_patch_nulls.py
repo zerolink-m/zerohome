@@ -14,6 +14,7 @@ from tests.conftest import bearer
 NON_NULLABLE = {
     CamPatch: ["name", "enabled", "notify", "protocol", "address", "port", "path", "username", "password"],
     CamOnvifPatch: ["onvif_enabled", "onvif_snapshot_enabled", "onvif_ptz_enabled"],
+    CamRecordingPatch: ["record"],
     ConnectionPatch: ["name", "enabled", "meta"],
     UserPatch: ["name", "surname", "email", "password", "role", "motion_detection_allowed"],
     SwitchPatch: ["name", "enabled", "notify"],
@@ -22,7 +23,7 @@ NON_NULLABLE = {
 }
 NULLABLE = {
     CamPatch: ["control_protocol", "control_address", "control_port", "control_username", "control_password"],
-    CamRecordingPatch: ["record", "record_type", "record_metadata"],
+    CamRecordingPatch: ["record_type", "record_metadata"],
     UserPatch: ["allow_record", "allow_tuya_local"],
     SwitchPatch: ["control_protocol", "control_metadata"],
 }
