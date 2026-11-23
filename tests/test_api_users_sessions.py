@@ -140,13 +140,28 @@ async def test_users_bulk_get_patch_delete(client, admin, mk_user):
     r = await client.get("/v1/users/bulk/a,b", headers=h)
     assert r.status_code == 422
     assert "ids" in ok_env(r, "269")["error"]["path"]
-    r = await client.patch(f"/v1/users/bulk/{a},{b_}", json=body({"name": "Bulk"}), headers=h)
+    r = await client.patch(
+        f"/v1/users/bulk/{a},{b_}",
+        json={"data": {"users": [{"name": "Bulk"}, {"name": "Bulk"}]}},
+        headers=h,
+    )
     assert [u["name"] for u in ok_env(r, "002")["data"]["users"]] == ["Bulk", "Bulk"]
-    r = await client.patch(f"/v1/users/bulk/{a},9999", json=body({"name": "X"}), headers=h)
+    r = await client.patch(
+        f"/v1/users/bulk/{a},9999",
+        json={"data": {"users": [{"name": "X"}, {"name": "X"}]}},
+        headers=h,
+    )
     ok_env(r, "215")
     r = await client.get(f"/v1/users/{a}", headers=h)
     assert r.json()["data"]["user"]["name"] == "Bulk"  # atomic: unchanged by failed request
-    r = await client.patch(f"/v1/users/bulk/{a},9999", json=body({"name": "X"}, partial_allowed=True), headers=h)
+    r = await client.patch(
+        f"/v1/users/bulk/{a},9999",
+        json={
+            "data": {"users": [{"name": "X"}, {"name": "X"}]},
+            "options": {"partial_allowed": True},
+        },
+        headers=h,
+    )
     b = ok_env(r, "004")
     assert b["data"]["users"]["failed"][0]["id"] == 9999
     r = await client.delete(f"/v1/users/bulk/{a},9999", headers=h)
