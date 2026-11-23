@@ -158,9 +158,18 @@ async def test_list_settings_search_sort_limits(client, mk_user, mk_cam):
     st = j["data"]["settings"]
     assert st["total"] == 3 and st["limit"] == 2 and st["offset"] == 0 and st["order"] == "desc"
     assert "page" not in j["metadata"]
-    # multi search: name include "al" OR name include "ga"
-    r = await client.get("/v1/cams", headers=h, params={"search": "al,ga", "search_column": "name,name"})
-    assert sorted(c["name"] for c in r.json()["data"]["cams"]) == ["alpha", "gamma"]
+    # v1.2 multi-search combines positional conditions with AND.
+    r = await client.get("/v1/cams", headers=h, params={
+        "search": "alpha,lan", "search_column": "name,address",
+        "search_method": "equals,include",
+    })
+    assert [c["name"] for c in r.json()["data"]["cams"]] == ["alpha"]
+    # Logical connectors belong to `filter`; search_method only accepts comparisons.
+    r = await client.get("/v1/cams", headers=h, params={
+        "search": "alpha,gamma", "search_column": "name,name",
+        "search_method": "equals,or",
+    })
+    assert r.json()["code"] == "066"
     r = await client.get("/v1/cams", headers=h, params={"search": "beta.lan", "search_column": "address",
                                                         "search_method": "exactly"})
     assert [c["name"] for c in r.json()["data"]["cams"]] == ["beta"]
@@ -176,13 +185,17 @@ async def test_list_settings_search_sort_limits(client, mk_user, mk_cam):
 async def test_options_supported_functions(client):
     r = await client.options("/v1/cams")
     fns = r.headers["cursed-supported-functions"].split(",")
-    for f in ("limit", "offset", "sort_by", "order", "search", "multi_search", "pagination"):
+    for f in ("GET.limit", "GET.offset", "GET.sort_by", "GET.order", "GET.search",
+              "GET.search_method", "GET.search_column", "GET.multi_search"):
         assert f in fns
     r = await client.options("/v1/cams/bulk")
     fns = r.headers["cursed-supported-functions"].split(",")
-    assert "bulk" in fns and "partial" in fns
+    assert {"POST.bulk", "POST.partial"} <= set(fns)
+    r = await client.options("/v1/cams/bulk/1,2")
+    fns = r.headers["cursed-supported-functions"].split(",")
+    assert {"GET.bulk", "PATCH.bulk", "PATCH.partial", "DELETE.bulk", "DELETE.partial"} <= set(fns)
     r = await client.options("/v1/cams/1/recordings")
-    assert "x-time_range" in r.headers["cursed-supported-functions"].split(",")
+    assert "GET.x-time_range" in r.headers["cursed-supported-functions"].split(",")
 
 
 # --- bulk ---------------------------------------------------------------------
@@ -215,7 +228,7 @@ async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
     r = await client.get(f"/v1/cams/bulk/{c1},{c2}", headers=h)
     j = r.json()
     assert j["code"] == "000" and [c["id"] for c in j["data"]["cams"]] == [c1, c2]
-    assert j["data"]["settings"]["total"] == 2
+    assert "settings" not in j["data"]  # v1.2 bulk GET returns only requested objects
     # a foreign id and a non-existent id are indistinguishable: atomic 082, nothing returned
     for ids in (f"{c1},{c2},{foreign}", f"{c1},{c2},99999", f"{foreign}"):
         r = await client.get(f"/v1/cams/bulk/{ids}", headers=h)
@@ -328,7 +341,7 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
     r = await client.get(f"/v1/cams/{cid}/recordings", headers=h)
     j = r.json()
     assert j["code"] == "000" and [x["id"] for x in j["data"]["recordings"]] == ["c.mp4", "b.mp4", "a.mp4"]
-    assert j["data"]["settings"]["total"] == 3 and j["data"]["settings"]["limit"] == 10
+    assert j["data"]["settings"]["total"] == 3 and j["data"]["settings"]["limit"] == 25
     r = await client.get(f"/v1/cams/{cid}/recordings", headers=h,
                          params={"sort_by": "size_bytes", "order": "asc", "limit": 2, "offset": 1})
     assert [x["id"] for x in r.json()["data"]["recordings"]] == ["b.mp4", "c.mp4"]
@@ -337,7 +350,7 @@ async def test_recording_config_and_list(client, mk_user, mk_cam, db, tmp_path):
     r = await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"from": 1010, "to": 1015})
     assert [x["id"] for x in r.json()["data"]["recordings"]] == ["b.mp4"]
     assert (await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"from": "x"})).json()["code"] == "066"
-    assert (await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"limit": 101})).json()["code"] == "158"
+    assert (await client.get(f"/v1/cams/{cid}/recordings", headers=h, params={"limit": 256})).json()["code"] == "158"
     r = await client.get(f"/v1/cams/{cid}/recordings/a.mp4", headers=h)
     assert r.json()["data"]["recording"]["size_bytes"] == 1
     r = await client.get(f"/v1/cams/{cid}/recordings/nope.mp4", headers=h)

@@ -80,7 +80,7 @@ async def test_options_lists(client):
         r = await client.options(path)
         assert "GET" in r.headers["allow"], path
         fns = r.headers["cursed-supported-functions"].split(",")
-        assert {"limit", "offset", "sort_by", "search"} <= set(fns), path
+        assert {"GET.limit", "GET.offset", "GET.sort_by", "GET.search"} <= set(fns), path
 
 
 # ---------------- push settings on switches ----------------

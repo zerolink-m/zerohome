@@ -81,8 +81,16 @@ async def test_users_list_settings_and_multisearch(client, admin, mk_user):
     assert len(b["data"]["users"]) == 2
     s = b["data"]["settings"]
     assert s["total"] == 4 and s["limit"] == 2 and s["order"] == "desc" and s["sort_by"] == "id"
-    r = await client.get("/v1/users?search=n0,n1&search_column=name,name&search_method=exactly,or,exactly", headers=admin[1])
-    assert {u["name"] for u in ok_env(r, "000")["data"]["users"]} == {"n0", "n1"}
+    r = await client.get(
+        "/v1/users?search=n0,p0%40x.io&search_column=name,email&search_method=equals,equals",
+        headers=admin[1],
+    )
+    assert [u["name"] for u in ok_env(r, "000")["data"]["users"]] == ["n0"]
+    # v1.2 search_method accepts comparisons only; logical connectors use `filter`.
+    r = await client.get(
+        "/v1/users?search=n0,n1&search_column=name,name&search_method=equals,or", headers=admin[1]
+    )
+    ok_env(r, "066")
     r = await client.get("/v1/users?search=zzz&search_column=name", headers=admin[1])
     ok_env(r, "019")
     r = await client.get("/v1/users?search=x&search_column=password", headers=admin[1])
@@ -125,7 +133,8 @@ async def test_users_bulk_get_patch_delete(client, admin, mk_user):
     a, b_ = await mk_user("a@x.io"), await mk_user("b@x.io")
     r = await client.get(f"/v1/users/bulk/{a},{b_}", headers=h)
     b = ok_env(r, "000")
-    assert [u["id"] for u in b["data"]["users"]] == [a, b_] and b["data"]["settings"]["total"] == 2
+    assert [u["id"] for u in b["data"]["users"]] == [a, b_]
+    assert "settings" not in b["data"]  # bulk GET is not a paginated collection list
     r = await client.get(f"/v1/users/bulk/{a},9999", headers=h)
     ok_env(r, "215")
     r = await client.get("/v1/users/bulk/a,b", headers=h)
@@ -153,11 +162,14 @@ async def test_options_users(client):
     r = await client.options("/v1/users")
     assert "GET" in r.headers["allow"] and "POST" in r.headers["allow"]
     fns = r.headers["cursed-supported-functions"].split(",")
-    assert {"limit", "offset", "sort_by", "search", "multi_search"} <= set(fns)
+    assert {"GET.limit", "GET.offset", "GET.sort_by", "GET.search", "GET.search_method",
+            "GET.search_column", "GET.multi_search"} <= set(fns)
     r = await client.options("/v1/users/bulk")
     assert r.headers["cursed-bulk"] == "on" and r.headers["cursed-max-bulk"] == "100"
+    assert "POST.bulk" in r.headers["cursed-supported-functions"].split(",")
     r = await client.options("/v1/users/bulk/1,2")
     assert r.headers["cursed-bulk"] == "on"
+    assert "GET.bulk" in r.headers["cursed-supported-functions"].split(",")
 
 
 async def test_sessions(client, admin, user, mk_user, db):
@@ -179,7 +191,9 @@ async def test_sessions(client, admin, user, mk_user, db):
     ok_env(r, "215")
     # bulk
     r = await client.get(f"/v1/users/{uid}/sessions/bulk/{sid}", headers=h)
-    assert ok_env(r, "000")["data"]["settings"]["total"] == 1
+    b = ok_env(r, "000")
+    assert [session["id"] for session in b["data"]["sessions"]] == [sid]
+    assert "settings" not in b["data"]
     r = await client.delete(f"/v1/users/{uid}/sessions/bulk/{sid},999", headers=h)
     ok_env(r, "215")
     r = await client.delete(f"/v1/users/{uid}/sessions/bulk/{sid},999?partial_allowed=true", headers=h)
