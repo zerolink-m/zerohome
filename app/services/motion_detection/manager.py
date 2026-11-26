@@ -62,6 +62,9 @@ async def start_motion_detection(cam_id: int) -> bool:
             if cam.enabled != 1:
                 logger.warning(f"[Cam {cam_id}] Camera is disabled (enabled={cam.enabled})")
                 return False
+            if cam.connection_resource_id is not None:
+                logger.info(f"[Cam {cam_id}] Cloud camera is not supported by local motion detection")
+                return False
 
             logger.debug(f"[Cam {cam_id}] Camera found: {cam.name} at {cam.addr}:{cam.port}")
 

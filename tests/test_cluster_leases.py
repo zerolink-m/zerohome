@@ -139,7 +139,7 @@ def test_migration_chain():
     nullable = script.get_revision("48000_user_nullable_settings")
     assert nullable.down_revision == "47900_runtime_configuration"
     assert len(nullable.revision) <= 32
-    assert script.get_heads() == ["48000_user_nullable_settings"]
+    assert script.get_heads() == ["48300_connection_revision"]
 
 
 def _settings(**kw):

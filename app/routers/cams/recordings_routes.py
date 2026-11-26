@@ -31,6 +31,11 @@ from app.routers.cams._common import (
     router,
 )
 
+
+def _require_local_recordings(cam) -> None:
+    if cam.connection_resource_id is not None:
+        raise AppError(VALIDATION_ERROR, "Локальная запись недоступна для облачной камеры")
+
 # recordings live on the filesystem, so the columns are virtual (typed for the query parser only)
 _REC_COLUMNS = {
     "id": column("id", String),
@@ -107,6 +112,7 @@ async def get_cam_recording(
     cam = await _get_visible_cam(id, payload, db)
     if not _can_manage(cam, payload):
         raise AppError(FORBIDDEN_RESOURCE, "Настройки записи доступны только владельцу или admin")
+    _require_local_recordings(cam)
 
     return single(
         "recording_config",
@@ -128,6 +134,7 @@ async def patch_cam_recording(
     cam = await _get_visible_cam(id, payload, db)
     if not _can_manage(cam, payload):
         raise AppError(FORBIDDEN_RESOURCE, "Настройки записи доступны только владельцу или admin")
+    _require_local_recordings(cam)
 
     user = await db.get(User, payload.uid)
     if user is None or user.allowrecord != 1:
@@ -181,6 +188,7 @@ async def list_cam_recordings(
     """Standard list query (limit<=100, default 10; offset; sort_by; order; multi-search over
     id/filename/format/started_at/size_bytes) + custom time filters `from`/`to` (unix seconds)."""
     cam = await _get_visible_cam(id, payload, db)
+    _require_local_recordings(cam)
     from_ts, to_ts = _int_query("from", from_), _int_query("to", to)
 
     all_items, _ = recordings.list_recordings(cam, 0, 10**9, from_ts, to_ts)
@@ -210,6 +218,7 @@ async def get_cam_recording_meta(
     db: AsyncSession = Depends(get_db),
 ):
     cam = await _get_visible_cam(id, payload, db)
+    _require_local_recordings(cam)
     meta = recordings.get_recording(cam, recording_id)
     return single("recording", RecordingOut(**meta).model_dump())
 
@@ -226,6 +235,7 @@ async def get_cam_recording_file(
     db: AsyncSession = Depends(get_db),
 ):
     cam = await _get_cam_for_access(id, ctx, db)
+    _require_local_recordings(cam)
     full_path, media_type = recordings.resolve_file(cam, recording_id)
 
     headers = _LONG_CACHE_HEADERS if await snapshot.is_valid_video(full_path) else None
@@ -248,6 +258,7 @@ async def get_cam_recording_snapshot(
     db: AsyncSession = Depends(get_db),
 ):
     cam = await _get_cam_for_access(id, ctx, db)
+    _require_local_recordings(cam)
     full_path, _ = recordings.resolve_file(cam, recording_id)
 
     cost = SNAPSHOT_CACHED_COST if snapshot.is_cached(cam.id, recording_id) else SNAPSHOT_GENERATE_COST

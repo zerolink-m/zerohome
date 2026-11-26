@@ -51,11 +51,21 @@ def redact_meta(provider: str, meta: dict) -> dict:
             "endpoint": meta.get("endpoint"),
             "tuya_uid": meta.get("tuya_uid"),
         }
+    if provider == "ufanet-smart-home":
+        return {"contract": meta.get("contract")}
     return {}
 
 
+def _validate_ufanet_meta(meta: dict) -> None:
+    if set(meta) != {"contract", "password"}:
+        raise ValueError("meta должен содержать contract и password")
+    for key in ("contract", "password"):
+        if not isinstance(meta[key], str) or not meta[key].strip():
+            raise ValueError(f"meta.{key} обязательно и должно быть непустой строкой")
+
+
 class ConnectionCreate(StrictModel):
-    provider: Literal["tuya_cloud"]
+    provider: Literal["tuya_cloud", "ufanet-smart-home"]
     name: str = Field(min_length=1, max_length=255)
     meta: dict[str, Any]
     enabled: Literal[0, 1] = 1
@@ -64,6 +74,8 @@ class ConnectionCreate(StrictModel):
     def _validate_meta(self):
         if self.provider == "tuya_cloud":
             _validate_tuya_meta(self.meta)
+        elif self.provider == "ufanet-smart-home":
+            _validate_ufanet_meta(self.meta)
         return self
 
 
@@ -82,6 +94,8 @@ class ConnectionOut(StrictModel):
     name: str
     meta: dict[str, Any]
     enabled: int
+    status: str
+    last_checked_at: int | None
     last_synced_at: int | None
     last_sync_error: str | None
     added_at: int

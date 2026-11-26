@@ -44,7 +44,7 @@ async def _check_once() -> None:
         # Check all enabled cameras (not just notify=1, as push_settings handles it now)
         cams = (
             await db.execute(
-                select(Cam).where(Cam.enabled == 1)
+                select(Cam).where(Cam.enabled == 1, Cam.connection_resource_id.is_(None))
             )
         ).scalars().all()
         observed: dict[int, bool] = {}

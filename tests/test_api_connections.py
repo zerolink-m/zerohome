@@ -67,6 +67,120 @@ async def test_create_redacts_and_syncs(client, users, _mock_ext):
     assert r.json()["code"] == "039" and _mock_ext["sync"] == [c["id"]]
 
 
+async def test_ufanet_credentials_create_patch_and_delete(client, users, sessionmaker_, _mock_ext):
+    from app.models.connection import Connection, ConnectionCredentials
+
+    owner, _, _ = users
+    headers = bearer(await tok(owner))
+    meta = {"contract": "00123", "password": "first-secret"}
+    response = await client.post("/v1/connections", headers=headers, json=body(provider="ufanet-smart-home", name="home", meta=meta))
+    assert response.status_code == 201, response.text
+    assert "first-secret" not in response.text
+    cid = response.json()["data"]["connection"]["id"]
+    assert _mock_ext["sync"] == [cid]
+    async with sessionmaker_() as db:
+        row = await db.get(Connection, cid)
+        credentials = await db.get(ConnectionCredentials, cid)
+        assert row.meta == {"contract": "00123"}
+        assert credentials.credentials == meta
+    response = await client.patch(f"/v1/connections/{cid}", headers=headers, json=body(meta={"contract": "00123", "password": "second-secret"}))
+    assert response.status_code == 200, response.text
+    assert "second-secret" not in response.text
+    async with sessionmaker_() as db:
+        assert (await db.get(ConnectionCredentials, cid)).credentials["password"] == "second-secret"
+    response = await client.post(f"/v1/connections/{cid}/sync", headers=headers)
+    assert response.status_code == 200, response.text
+    assert _mock_ext["sync"] == [cid, cid, cid]
+    response = await client.delete(f"/v1/connections/{cid}", headers=headers)
+    assert response.status_code == 200
+    async with sessionmaker_() as db:
+        assert await db.get(ConnectionCredentials, cid) is None
+
+
+async def test_ufanet_invalid_input_hides_password(client, users):
+    owner, _, _ = users
+    headers = bearer(await tok(owner))
+    response = await client.post("/v1/connections", headers=headers, json=body(provider="ufanet-smart-home", name="home", meta={"password": "hidden-secret"}))
+    assert response.status_code == 422
+    assert "hidden-secret" not in response.text
+
+
+async def test_ufanet_edit_replaces_devices_and_revokes_access(client, users, sessionmaker_, monkeypatch):
+    from sqlalchemy import select
+    from app.models.cams import Cam
+    from app.models.connection import ConnectionResource
+    from app.models.invitation import Invitation
+    from app.models.sharing import Sharing
+    from app.models.switch import Switch
+    from app.services.connection_sync.ufanet_cameras import materialize_ufanet_cameras
+    from app.services.connection_sync.ufanet_skuds import materialize_ufanet_skuds
+
+    owner, other, _ = users
+    headers = bearer(await tok(owner))
+    meta = {"contract": "old", "password": "old-password"}
+    result = await client.post('/v1/connections', headers=headers, json=body(provider='ufanet-smart-home', name='home', meta=meta))
+    cid = result.json()['data']['connection']['id']
+
+    async def import_devices(connection_id):
+        async with sessionmaker_() as db:
+            assert not (await db.execute(select(ConnectionResource).where(ConnectionResource.connection_id == connection_id))).scalars().all()
+            for kind in ('camera', 'skud'):
+                db.add(ConnectionResource(connection_id=cid, external_id='same', resource_type=kind,
+                    name=kind, capabilities={'open': True} if kind == 'skud' else {}, attributes={},
+                    available=1, first_seen_at=1, last_seen_at=1))
+            await db.flush()
+            cam = (await materialize_ufanet_cameras(db, cid))[0]
+            switch = (await materialize_ufanet_skuds(db, cid))[0]
+            ids = (cam.id, switch.id)
+            await db.commit()
+            return ids
+
+    camera_id, switch_id = await import_devices(cid)
+    async with sessionmaker_() as db:
+        (await db.get(Cam, camera_id)).enabled = 1
+        (await db.get(Switch, switch_id)).enabled = 1
+        await db.commit()
+    for kind, device_id in [('cams', camera_id), ('switches', switch_id)]:
+        inv = await client.post('/v1/invitations', headers=headers, json={'data': {'invitation': {
+            'device_type': kind, 'device_id': device_id, 'email': 't@x.io'}}})
+        assert inv.status_code == 201, inv.text
+        share = await client.post('/v1/shares', headers=headers, json={'data': {'share': {
+            'device_type': kind, 'device_id': device_id, 'type': 'stream' if kind == 'cams' else 'device_use'}}})
+        assert share.status_code == 201, share.text
+
+    imported = []
+    async def sync(connection_id):
+        imported.append(await import_devices(connection_id))
+    monkeypatch.setattr('app.routers.connections.connection_sync.sync_connection_now', sync)
+
+    # No-op patches preserve devices; an actual credential change removes all
+    # old grants before synchronously importing the new account's catalog.
+    no_op = await client.patch(f'/v1/connections/{cid}', headers=headers, json=body(meta=meta))
+    assert no_op.status_code == 200 and not imported
+    changed = await client.patch(f'/v1/connections/{cid}', headers=headers,
+        json=body(meta={'contract': 'new', 'password': 'new-password'}))
+    assert changed.status_code == 200, changed.text
+    assert len(imported) == 1
+    async with sessionmaker_() as db:
+        assert not (await db.execute(select(Invitation))).scalars().all()
+        assert not (await db.execute(select(Sharing))).scalars().all()
+        new_cam, new_switch = imported[0]
+        assert (await db.get(Cam, new_cam)).enabled == 0
+        assert (await db.get(Switch, new_switch)).enabled == 0
+
+    # Bulk changes follow the same lifecycle. Disabling does not import until
+    # the connection is enabled again.
+    changed = await client.patch(f'/v1/connections/bulk/{cid}', headers=headers,
+        json=bbody([{'enabled': 0}]))
+    assert changed.status_code == 200, changed.text
+    assert len(imported) == 1
+    async with sessionmaker_() as db:
+        assert not (await db.execute(select(ConnectionResource).where(ConnectionResource.connection_id == cid))).scalars().all()
+    changed = await client.patch(f'/v1/connections/{cid}', headers=headers, json=body(enabled=1))
+    assert changed.status_code == 200, changed.text
+    assert len(imported) == 2
+
+
 async def test_create_validation(client, users):
     o, _, _ = users
     h = bearer(await tok(o))

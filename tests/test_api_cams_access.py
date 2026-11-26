@@ -3,7 +3,7 @@ import pytest
 
 import time
 
-from app.core.codes import (FORBIDDEN_RESOURCE, LOCKED, OBJECT_NOT_FOUND, PTZ_NOT_CONFIGURED, TOKEN_ERROR)
+from app.core.codes import (FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, PTZ_NOT_CONFIGURED, TOKEN_ERROR)
 from app.core.security import create_session_token, create_share_token
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
@@ -270,7 +270,7 @@ async def test_bulk_get_patch_delete(client, mk_user, mk_cam):
 
 
 # --- PTZ / onvif / recordings -------------------------------------------------
-async def test_ptz_request_object_and_lock(client, mk_user, mk_cam, monkeypatch):
+async def test_ptz_request_object_and_consecutive_commands(client, mk_user, mk_cam, monkeypatch):
     owner = await mk_user("o@x.io")
     h = bearer(await tok(owner))
     cid = await mk_cam(owner, control_proto="onvif")
@@ -291,7 +291,7 @@ async def test_ptz_request_object_and_lock(client, mk_user, mk_cam, monkeypatch)
     r = await client.post(f"/v1/cams/{cid}/ptz", headers=h, json=req("ptz", {"pan": 0.5}))
     assert r.json()["code"] == "000" and r.json()["data"]["ptz"]["id"] == cid and moved == [(0.5, None, None)]
     r = await client.post(f"/v1/cams/{cid}/ptz", headers=h, json=req("ptz", {"pan": 0.6}))
-    assert r.status_code == 423 and r.json()["code"] == LOCKED == "302"
+    assert r.status_code == 200 and moved == [(0.5, None, None), (0.6, None, None)]
 
 
 async def test_ptz_not_configured_code(client, mk_user, mk_cam):

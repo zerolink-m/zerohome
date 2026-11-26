@@ -27,7 +27,7 @@ def test_revision_follows_runtime_configuration_and_is_the_head():
     revision = script.get_revision("48000_user_nullable_settings")
 
     assert revision.down_revision == "47900_runtime_configuration"
-    assert script.get_heads() == ["48000_user_nullable_settings"]
+    assert script.get_heads() == ["48300_connection_revision"]
 
 
 def _load_migration():

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR
+from app.core.codes import CONNECTION_INVALID, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR
 from app.core.config import settings
 from app.core.errors import AppError
 from app.core.introspection import supports
@@ -48,6 +48,28 @@ _FIELD_MAPPING = {
 
 _READ = Depends(rate_limit("cams_read", capacity=60, per_minute=60))
 _WRITE = Depends(rate_limit("cams_write", capacity=20, per_minute=20))
+
+_IMPORTED_CAM_MUTABLE_FIELDS = frozenset({"name", "enabled", "notify"})
+
+
+def _ensure_imported_cam_fields(cam: Cam, fields: set[str]) -> None:
+    """Imported cameras retain user-facing state, while their source stays owned by the connection."""
+    if cam.connection_resource_id is None:
+        return
+    forbidden = fields - _IMPORTED_CAM_MUTABLE_FIELDS
+    if forbidden:
+        raise AppError(
+            CONNECTION_INVALID,
+            "Параметры источника импортированной камеры управляются соединением",
+        )
+
+
+def _ensure_imported_cam_not_deleted(cam: Cam) -> None:
+    if cam.connection_resource_id is not None:
+        raise AppError(
+            CONNECTION_INVALID,
+            "Импортированную камеру можно удалить только вместе с соединением",
+        )
 
 
 def _new_cam(body: CamCreate, uid: int, now: int) -> Cam:
@@ -215,7 +237,12 @@ async def patch_cams_bulk(
         elif not _can_manage(cam, payload):
             failures.append((cam_id, FORBIDDEN_RESOURCE, "Изменение камеры доступно только владельцу или admin"))
         else:
-            work.append((cam, item.obj))
+            try:
+                _ensure_imported_cam_fields(cam, set(item.obj.model_fields_set))
+            except AppError as exc:
+                failures.append((cam_id, exc.code, exc.message))
+            else:
+                work.append((cam, item.obj))
     _bulk_reject(failures, body.partial_allowed)
 
     effects = []
@@ -258,7 +285,12 @@ async def delete_cams_bulk(
         elif not _can_manage(cam, payload):
             failures.append((cam_id, FORBIDDEN_RESOURCE, "Удаление камеры доступно только владельцу или admin"))
         else:
-            work.append(cam)
+            try:
+                _ensure_imported_cam_not_deleted(cam)
+            except AppError as exc:
+                failures.append((cam_id, exc.code, exc.message))
+            else:
+                work.append(cam)
     _bulk_reject(failures, partial_allowed)
 
     for cam in work:
@@ -302,6 +334,7 @@ async def patch_cam(
     cam = await _get_visible_cam(id, payload, db)
     if not _can_manage(cam, payload):
         raise AppError(FORBIDDEN_RESOURCE, "Изменение камеры доступно только владельцу или admin")
+    _ensure_imported_cam_fields(cam, set(body.obj.model_fields_set))
 
     changed, control_touched, notify_enabled = _apply_patch(cam, body.obj)
     if notify_enabled:
@@ -324,6 +357,7 @@ async def delete_cam(
     cam = await _get_visible_cam(id, payload, db)
     if not _can_manage(cam, payload):
         raise AppError(FORBIDDEN_RESOURCE, "Удаление камеры доступно только владельцу или admin")
+    _ensure_imported_cam_not_deleted(cam)
 
     await _delete_cam(cam, db)
     await db.commit()

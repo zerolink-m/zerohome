@@ -43,7 +43,7 @@ def reset_supervisor() -> None:
 
 
 def _target_for(cam: Cam) -> IngestTarget | None:
-    if cam.enabled != 1 or not cam.addr:
+    if getattr(cam, "connection_resource_id", None) is not None or cam.enabled != 1 or not cam.addr:
         return None
     return IngestTarget(cam_id=cam.id, url=build_rtsp_url(cam), name=cam.name or "")
 

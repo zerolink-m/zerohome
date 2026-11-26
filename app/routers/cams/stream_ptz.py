@@ -4,7 +4,7 @@ from fastapi import Depends, Request
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import FORBIDDEN_RESOURCE, LOCKED, OBJECT_NOT_FOUND, PTZ_NOT_CONFIGURED, SERVER_ERROR
+from app.core.codes import BAD_REQUEST, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, PTZ_NOT_CONFIGURED, SERVER_ERROR
 from app.core.errors import AppError
 from app.core.introspection import supports
 from app.core.rate_limit import PointBudget, rate_limit
@@ -16,7 +16,7 @@ from app.deps.request_body import SingleBody
 from app.models.cams import Cam
 from app.schemas.cams import CamOnvifPatch
 from app.schemas.ptz import PTZCommandIn, PTZPositionOut
-from app.services import onvif_client, ptz_lock, snapshot, stream_manager
+from app.services import onvif_client, snapshot, stream_manager, ufanet_media
 
 from app.routers.cams._common import _get_cam_for_access, router, single_body_for_route
 
@@ -36,6 +36,9 @@ async def stream_cam(
     db: AsyncSession = Depends(get_db),
 ):
     cam = await _get_cam_for_access(id, ctx, db)
+
+    if cam.connection_resource_id is not None:
+        raise AppError(BAD_REQUEST, "Для облачной камеры доступен HLS")
 
     cost = STREAM_ATTACH_COST if await stream_manager.has_active_session(cam.id) else STREAM_OPEN_COST
     await STREAM_BUDGET.charge(request, cost)
@@ -80,12 +83,8 @@ async def move_ptz(
     if cam.control_proto is None:
         raise AppError(PTZ_NOT_CONFIGURED, "У камеры не задан control_proto — PTZ недоступен")
 
-    if ptz_lock.is_locked(cam.id):
-        raise AppError(LOCKED, "Камера сейчас заблокирована другой PTZ-командой")
-
     cmd = body.obj
     await onvif_client.absolute_move(cam, cmd.pan, cmd.tilt, cmd.zoom)
-    ptz_lock.acquire(cam.id)
 
     return single("ptz", {"id": id, "pan": cmd.pan, "tilt": cmd.tilt, "zoom": cmd.zoom})
 
@@ -101,6 +100,9 @@ async def get_live_snapshot(
     cam = await _get_cam_for_access(id, ctx, db)
 
     try:
+        if cam.connection_resource_id is not None:
+            jpeg_data = await ufanet_media.screenshot(db, cam)
+            return Response(content=jpeg_data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
         jpeg_data = await snapshot.get_live_snapshot(cam)
         return Response(content=jpeg_data, media_type="image/jpeg")
     except snapshot.SnapshotError as exc:
@@ -120,6 +122,9 @@ async def update_onvif_settings(
     cam = await db.get(Cam, id)
     if cam is None:
         raise AppError(OBJECT_NOT_FOUND, "Camera not found")
+
+    if cam.connection_resource_id is not None:
+        raise AppError(BAD_REQUEST, "Настройки ONVIF недоступны для облачной камеры")
 
     if payload.role != "admin" and payload.uid != cam.ownuser:
         raise AppError(FORBIDDEN_RESOURCE, "Нет доступа к этой камере")

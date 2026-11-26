@@ -27,6 +27,7 @@ from app.db.session import get_db
 from app.deps.auth import AccessContext, require_access, require_access_qs, resolve_record_access, resolve_stream_access
 from app.deps.request_body import read_envelope, single_body
 from app.models.cams import Cam
+from app.models.connection import Connection, ConnectionResource
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
 from app.models.user import User
@@ -41,7 +42,7 @@ from app.schemas.cams import (
 )
 from app.schemas.ptz import PTZCommandIn, PTZPositionOut
 from app.schemas.recording import RecordingOut
-from app.services import onvif_client, ptz_lock, push, recordings, snapshot, stream_manager, hls_manager, webrtc_manager
+from app.services import onvif_client, push, recordings, snapshot, stream_manager, hls_manager, webrtc_manager
 
 router = APIRouter(prefix="/v1/cams", tags=["cams"])
 
@@ -97,12 +98,18 @@ def _invitation_exists_clause(payload: TokenPayload):
 
 
 def _visibility_where(payload: TokenPayload):
+    available = or_(Cam.connection_resource_id.is_(None), exists(
+        select(ConnectionResource.id).join(Connection, Connection.id == ConnectionResource.connection_id).where(
+            ConnectionResource.id == Cam.connection_resource_id,
+            ConnectionResource.available == 1, Connection.enabled == 1,
+        )
+    ))
     if payload.role == "admin":
-        return None
-    return or_(
+        return available
+    return and_(available, or_(
         Cam.ownuser == payload.uid,
         and_(Cam.enabled == 1, _invitation_exists_clause(payload)),
-    )
+    ))
 
 
 def _can_manage(cam: Cam, payload: TokenPayload) -> bool:
@@ -173,7 +180,14 @@ async def _get_cam_for_access(id: int, ctx: AccessContext, db: AsyncSession) -> 
     a share token already proves scoped access to this exact cam, so it skips that check."""
     if ctx.payload is not None:
         return await _get_visible_cam(id, ctx.payload, db)
-    cam = await db.get(Cam, id)
+    cam = (await db.execute(select(Cam).where(Cam.id == id, or_(
+        Cam.connection_resource_id.is_(None), exists(
+            select(ConnectionResource.id).join(Connection, Connection.id == ConnectionResource.connection_id).where(
+                ConnectionResource.id == Cam.connection_resource_id,
+                ConnectionResource.available == 1, Connection.enabled == 1, Cam.enabled == 1,
+            )
+        )
+    )))).scalar_one_or_none()
     if cam is None:
         raise AppError(OBJECT_NOT_FOUND, "Camera not found")
     return cam

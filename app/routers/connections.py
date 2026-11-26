@@ -38,7 +38,9 @@ from app.db.session import get_db
 from app.deps.auth import require_access
 from app.deps.list_query import ListQuery, list_query
 from app.deps.request_body import BulkBody, SingleBody, bulk_body, read_envelope, single_body
-from app.models.connection import Connection
+from app.models.connection import Connection, ConnectionCredentials
+from app.models.cams import Cam
+from app.models.connection import ConnectionResource
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
 from app.models.switch import Switch
@@ -47,6 +49,7 @@ from app.schemas.connection import (
     ConnectionOut,
     ConnectionPatch,
     _validate_tuya_meta,
+    _validate_ufanet_meta,
     redact_meta,
 )
 from app.services import connection_sync, tuya_client_pool
@@ -99,6 +102,8 @@ def _serialize(conn: Connection) -> dict:
         name=conn.name,
         meta=redact_meta(conn.provider, conn.meta or {}),
         enabled=conn.enabled,
+        status=conn.status,
+        last_checked_at=conn.last_checked_at,
         last_synced_at=conn.last_synced_at,
         last_sync_error=conn.last_sync_error,
         added_at=conn.added_at,
@@ -107,9 +112,11 @@ def _serialize(conn: Connection) -> dict:
 
 
 async def _get_visible_connection(
-    id: int, payload: TokenPayload, db: AsyncSession
+    id: int, payload: TokenPayload, db: AsyncSession, *, for_update: bool = False
 ) -> Connection:
     stmt = select(Connection).where(Connection.id == id)
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     condition = _visibility_where(payload)
     if condition is not None:
         stmt = stmt.where(condition)
@@ -134,17 +141,20 @@ def _err(exc: AppError) -> dict:
 
 
 def _new_connection(obj: ConnectionCreate, payload: TokenPayload, now: int) -> Connection:
-    return Connection(
+    conn = Connection(
         uid=payload.uid,
         provider=obj.provider,
         name=obj.name,
-        meta=obj.meta,
+        meta={"contract": obj.meta["contract"]} if obj.provider == "ufanet-smart-home" else obj.meta,
         enabled=obj.enabled,
         last_synced_at=None,
         last_sync_error=None,
         added_at=now,
         updated_at=now,
     )
+    if obj.provider == "ufanet-smart-home":
+        conn.credentials = ConnectionCredentials(credentials=dict(obj.meta), updated_at=now)
+    return conn
 
 
 async def _sync_quietly(conn: Connection, db: AsyncSession) -> None:
@@ -172,10 +182,13 @@ def _apply_patch(conn: Connection, fields: dict, payload: TokenPayload) -> tuple
     # because half-populating credentials would leave the connection in a
     # non-authenticatable state. Validate the new blob under the current
     # provider (provider itself is immutable — see ConnectionPatch).
-    if fields.get("meta") is not None and conn.provider == "tuya_cloud":
+    if fields.get("meta") is not None:
         # Keep the invariant "stored meta is always valid for its provider".
         try:
-            _validate_tuya_meta(fields["meta"])
+            if conn.provider == "tuya_cloud":
+                _validate_tuya_meta(fields["meta"])
+            elif conn.provider == "ufanet-smart-home":
+                _validate_ufanet_meta(fields["meta"])
         except ValueError as exc:
             raise AppError(CONNECTION_INVALID, str(exc)) from exc
 
@@ -185,6 +198,18 @@ def _apply_patch(conn: Connection, fields: dict, payload: TokenPayload) -> tuple
         if value is None:
             # explicit None means "not set" -> no-op
             continue
+        if key == "meta" and conn.provider == "ufanet-smart-home":
+            old_credentials = conn.credentials.credentials if conn.credentials else None
+            if old_credentials != value:
+                changed = True
+                should_resync = True
+                if conn.credentials is None:
+                    conn.credentials = ConnectionCredentials(credentials=dict(value), updated_at=int(time.time()))
+                else:
+                    conn.credentials.credentials = dict(value)
+                    conn.credentials.updated_at = int(time.time())
+                conn.meta = {"contract": value["contract"]}
+            continue
         if getattr(conn, key) != value:
             changed = True
             if key in ("meta", "enabled"):
@@ -192,6 +217,12 @@ def _apply_patch(conn: Connection, fields: dict, payload: TokenPayload) -> tuple
         setattr(conn, key, value)
     if changed:
         conn.updated_at = int(time.time())
+        if conn.provider == "ufanet-smart-home":
+            conn.sync_revision += 1
+            conn.status = "unknown"
+            conn.last_checked_at = None
+            conn.last_synced_at = None
+            conn.last_sync_error = None
     return changed, should_resync, old_meta
 
 
@@ -225,9 +256,13 @@ async def _delete_conn_row(conn: Connection, payload: TokenPayload, db: AsyncSes
     del_meta = conn.meta or {}
     key = (del_meta.get("access_id"), del_meta.get("endpoint"))
 
-    # Auto-synced switches cascade via the FK (see migration 0011). Their
-    # polymorphic invitations/sharings do NOT cascade (no FK on device_id) —
-    # clean those up per-switch first.
+    await _delete_connection_devices(conn, db)
+    await db.delete(conn)
+    return key
+
+
+async def _delete_connection_devices(conn: Connection, db: AsyncSession) -> None:
+    # Polymorphic invitations/sharings do not cascade with device deletion.
     auto_switch_ids = (
         await db.execute(
             select(Switch.id).where(
@@ -249,8 +284,21 @@ async def _delete_conn_row(conn: Connection, payload: TokenPayload, db: AsyncSes
             )
         )
 
-    await db.delete(conn)
-    return key
+    camera_ids = (await db.execute(
+        select(Cam.id).join(ConnectionResource, Cam.connection_resource_id == ConnectionResource.id)
+        .where(ConnectionResource.connection_id == conn.id)
+    )).scalars().all()
+    if camera_ids:
+        await db.execute(Invitation.__table__.delete().where(
+            Invitation.device_type == "cams", Invitation.device_id.in_(camera_ids)))
+        await db.execute(Sharing.__table__.delete().where(
+            Sharing.device_type == "cams", Sharing.device_id.in_(camera_ids)))
+
+    if auto_switch_ids and conn.provider == "ufanet-smart-home":
+        await db.execute(Switch.__table__.delete().where(Switch.id.in_(auto_switch_ids)))
+    if camera_ids:
+        await db.execute(Cam.__table__.delete().where(Cam.id.in_(camera_ids)))
+    await db.execute(ConnectionResource.__table__.delete().where(ConnectionResource.connection_id == conn.id))
 
 
 async def _evict_deleted(key: tuple | None) -> None:
@@ -375,9 +423,12 @@ async def patch_connections_bulk(
             failed.append({"id": cid, "error": item.error})
             continue
         try:
-            conn = await _get_visible_connection(cid, payload, db)
+            conn = await _get_visible_connection(cid, payload, db, for_update=True)
             fields = item.obj.model_dump(exclude_unset=True)
-            _, resync, old_meta = _apply_patch(conn, fields, payload)
+            changed, resync, old_meta = _apply_patch(conn, fields, payload)
+            if changed and conn.provider == "ufanet-smart-home":
+                await _delete_connection_devices(conn, db)
+                resync = True
         except AppError as exc:
             if not body.partial_allowed:
                 await db.rollback()
@@ -407,9 +458,12 @@ async def patch_connection(
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
-    conn = await _get_visible_connection(connection_id, payload, db)
+    conn = await _get_visible_connection(connection_id, payload, db, for_update=True)
     fields = body.obj.model_dump(exclude_unset=True)
     changed, should_resync, old_meta = _apply_patch(conn, fields, payload)
+    if changed and conn.provider == "ufanet-smart-home":
+        await _delete_connection_devices(conn, db)
+        should_resync = True
     await db.commit()
 
     await _evict_pool(old_meta, fields.get("meta"))
@@ -439,7 +493,7 @@ async def delete_connections_bulk(
     keys = []
     for cid in id_list:
         try:
-            conn = await _get_visible_connection(cid, payload, db)
+            conn = await _get_visible_connection(cid, payload, db, for_update=True)
             keys.append(await _delete_conn_row(conn, payload, db))
         except AppError as exc:
             if not options.partial_allowed:
@@ -467,7 +521,7 @@ async def delete_connection(
     payload: TokenPayload = Depends(require_access),
     db: AsyncSession = Depends(get_db),
 ):
-    conn = await _get_visible_connection(connection_id, payload, db)
+    conn = await _get_visible_connection(connection_id, payload, db, for_update=True)
     key = await _delete_conn_row(conn, payload, db)
     await db.commit()
     await _evict_deleted(key)

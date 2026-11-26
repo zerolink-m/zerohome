@@ -36,6 +36,7 @@ async def select_cams() -> list[tuple[int, str]]:
         stmt_cams = select(Cam).where(
             Cam.id.in_(cam_ids),
             Cam.enabled == 1,
+            Cam.connection_resource_id.is_(None),
         )
         result_cams = await db.execute(stmt_cams)
         cameras = result_cams.scalars().all()

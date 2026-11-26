@@ -24,6 +24,23 @@ _task: asyncio.Task | None = None
 
 async def _sync_one(db, conn: Connection) -> None:
     """Dispatch on provider; record success/failure on the Connection row."""
+    if conn.provider == "ufanet-smart-home":
+        from app.services.connection_sync.ufanet_sync import sync_ufanet
+
+        connection_id = conn.id
+        try:
+            await sync_ufanet(db, connection_id)
+        except Exception as exc:
+            await db.rollback()
+            current = await db.get(Connection, connection_id)
+            if current is not None:
+                current.status = "unavailable"
+                current.last_checked_at = int(time.time())
+                current.last_sync_error = f"Ufanet: {type(exc).__name__}"
+                current.updated_at = current.last_checked_at
+                await db.commit()
+            logger.warning("Ufanet sync failed for connection_id=%s: %s", connection_id, type(exc).__name__)
+        return
     now = int(time.time())
     try:
         if conn.provider == "tuya_cloud":

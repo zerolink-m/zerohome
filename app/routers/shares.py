@@ -82,6 +82,9 @@ async def _build_share(body: SharingCreate, payload: TokenPayload, db: AsyncSess
     if payload.role != "admin" and device.ownuser != payload.uid:
         raise AppError(FORBIDDEN_RESOURCE, "Создавать ссылки может только владелец или admin")
 
+    if body.device_type == "cams" and body.type == "record" and device.connection_resource_id is not None:
+        raise AppError(SHARE_INVALID, "Локальные записи недоступны для облачной камеры")
+
     ttl = body.ttl_seconds if body.ttl_seconds is not None else settings.SHARE_TOKEN_MIN_TTL_SECONDS
     if ttl < settings.SHARE_TOKEN_MIN_TTL_SECONDS or ttl > settings.SHARE_TOKEN_MAX_TTL_SECONDS:
         raise AppError(

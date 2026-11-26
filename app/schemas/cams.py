@@ -49,8 +49,8 @@ class CamOutFull(StrictModel):
     name: str
     enabled: int
     notify: int
-    protocol: str
-    address: str
+    protocol: str | None
+    address: str | None
     port: int
     path: str
     username: str
@@ -75,8 +75,8 @@ class CamOutRestricted(StrictModel):
     owner: int
     name: str
     enabled: int
-    protocol: str
-    address: str
+    protocol: str | None
+    address: str | None
     port: int
     path: str
     control_protocol: str | None

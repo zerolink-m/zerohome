@@ -1,12 +1,14 @@
 import time
+import asyncio
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi import Request
 
 from app.core.codes import (
+    BAD_GATEWAY,
     BULK_LIMIT_EXCEEDED,
     FORBIDDEN_RESOURCE,
     OBJECT_NOT_FOUND,
@@ -26,6 +28,7 @@ from app.deps.auth import AccessContext, require_access, resolve_device_use_acce
 from app.deps.list_query import ListQuery, list_query
 from app.deps.request_body import BulkBody, SingleBody, bulk_body, read_envelope, single_body
 from app.models.invitation import Invitation
+from app.models.connection import Connection, ConnectionCredentials, ConnectionResource
 from app.models.sharing import Sharing
 from app.models.switch import Switch
 from app.models.user import User
@@ -52,6 +55,7 @@ SWITCHES_COLUMNS = {
 }
 switches_query = list_query(model=Switch, sortable=SWITCHES_COLUMNS, searchable=SWITCHES_COLUMNS)
 MAX_BULK = 100
+_open_locks: dict[int, asyncio.Lock] = {}
 
 
 def _single_body(key, schema):
@@ -76,12 +80,20 @@ def _invitation_exists_clause(payload: TokenPayload):
 
 
 def _visibility_where(payload: TokenPayload):
+    available = or_(Switch.control_proto.is_(None), Switch.control_proto != "ufanet-smart-home", exists(
+        select(ConnectionResource.id).join(Connection, Connection.id == ConnectionResource.connection_id).where(
+            ConnectionResource.connection_id == Switch.connection_id,
+            ConnectionResource.external_id == Switch.external_id,
+            ConnectionResource.resource_type == "skud", ConnectionResource.available == 1,
+            ConnectionResource.capabilities["open"].as_boolean().is_(True), Connection.enabled == 1,
+        )
+    ))
     if payload.role == "admin":
-        return None
-    return or_(
+        return available
+    return and_(available, or_(
         Switch.ownuser == payload.uid,
         and_(Switch.enabled == 1, _invitation_exists_clause(payload)),
-    )
+    ))
 
 
 def _can_manage(switch: Switch, payload: TokenPayload) -> bool:
@@ -468,6 +480,96 @@ async def delete_switch(
 # --- state (custom endpoints) --------------------------------------------------
 
 
+@router.post(
+    "/{id}/open",
+    dependencies=[Depends(rate_limit("switches_open", capacity=30, per_minute=30))],
+)
+async def open_switch(id: int, ctx: AccessContext = Depends(resolve_device_use_access), db: AsyncSession = Depends(get_db)):
+    from app.services.ufanet_open import open_shared
+
+    switch = await _get_switch_for_access(id, ctx, db)
+    if not switch.enabled or switch.control_proto != "ufanet-smart-home" or not switch.connection_id or not switch.external_id:
+        raise AppError(VALIDATION_ERROR, "Устройство недоступно для открытия")
+    connection = await db.get(Connection, switch.connection_id)
+    credentials = await db.get(ConnectionCredentials, switch.connection_id)
+    resource = (await db.execute(select(ConnectionResource).where(
+        ConnectionResource.connection_id == switch.connection_id,
+        ConnectionResource.resource_type == "skud",
+        ConnectionResource.external_id == switch.external_id,
+    ))).scalar_one_or_none()
+    if (connection is None or not connection.enabled or connection.provider != "ufanet-smart-home"
+            or connection.uid != switch.ownuser or credentials is None or resource is None
+            or not resource.available or (resource.capabilities or {}).get("open") is not True):
+        raise AppError(VALIDATION_ERROR, "Подключение или СКУД недоступны для открытия")
+    values = credentials.credentials
+    if not isinstance(values, dict) or not all(isinstance(values.get(k), str) and values[k] for k in ("contract", "password")):
+        raise AppError(VALIDATION_ERROR, "Данные подключения Ufanet недоступны")
+    connection_id = switch.connection_id
+    lock = _open_locks.setdefault(id, asyncio.Lock())
+    if lock.locked():
+        raise AppError(VALIDATION_ERROR, "Открытие СКУД уже выполняется")
+    async with lock:
+        # End the initial read transaction before acquiring the connection-scoped
+        # MySQL lock, which must stay on the same connection until release.
+        await db.rollback()
+        connection_handle = await db.connection()
+        dialect = connection_handle.dialect.name
+        lock_name = f"zerohome:skud:open:{id}"
+        acquired = False
+        try:
+            if dialect in ("mysql", "mariadb"):
+                acquired = (await connection_handle.execute(
+                    text("SELECT GET_LOCK(:name, 0)"), {"name": lock_name}
+                )).scalar_one() == 1
+                if not acquired:
+                    raise AppError(VALIDATION_ERROR, "Открытие СКУД уже выполняется")
+            elif dialect != "sqlite":
+                raise AppError(BAD_GATEWAY, "Блокировка открытия СКУД недоступна")
+            # Refresh after acquiring the cross-node lock. Locking the parent
+            # serializes this decision with disable, deletion and catalog sync.
+            connection = (await db.execute(select(Connection).where(
+                Connection.id == connection_id
+            ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+            switch = (await db.execute(select(Switch).where(
+                Switch.id == id
+            ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+            if connection is None or switch is None or not connection.enabled or not switch.enabled:
+                raise AppError(VALIDATION_ERROR, "Подключение или СКУД недоступны для открытия")
+            credentials = await db.get(ConnectionCredentials, connection.id, populate_existing=True)
+            resource = (await db.execute(select(ConnectionResource).where(
+                ConnectionResource.connection_id == connection.id,
+                ConnectionResource.resource_type == "skud",
+                ConnectionResource.external_id == switch.external_id,
+            ).execution_options(populate_existing=True))).scalar_one_or_none()
+            if (connection.provider != "ufanet-smart-home" or connection.uid != switch.ownuser
+                    or switch.connection_id != connection.id
+                    or switch.control_proto != "ufanet-smart-home" or credentials is None
+                    or resource is None or not resource.available
+                    or (resource.capabilities or {}).get("open") is not True):
+                raise AppError(VALIDATION_ERROR, "Подключение или СКУД недоступны для открытия")
+            if ctx.payload is not None:
+                await _get_visible_switch(id, ctx.payload, db)
+            elif await db.get(Sharing, ctx.share.sha_id, populate_existing=True) is None:
+                raise AppError(FORBIDDEN_RESOURCE, "Ссылка доступа отозвана")
+            values = credentials.credentials
+            if not isinstance(values, dict) or not all(isinstance(values.get(k), str) and values[k] for k in ("contract", "password")):
+                raise AppError(VALIDATION_ERROR, "Данные подключения Ufanet недоступны")
+            opened = await open_shared(values["contract"], values["password"], switch.external_id)
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError(BAD_GATEWAY, "Не удалось определить результат открытия СКУД") from exc
+        finally:
+            if acquired:
+                try:
+                    await connection_handle.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+                except Exception:
+                    await connection_handle.invalidate()
+    if not opened:
+        raise AppError(BAD_GATEWAY, "Ufanet отклонил открытие СКУД")
+    return single("open", {"success": True})
+
+
 @router.get(
     "/{id}/state",
     dependencies=[Depends(rate_limit("switches_state_read", capacity=300, per_minute=300))],
@@ -478,6 +580,8 @@ async def get_switch_state(
     db: AsyncSession = Depends(get_db),
 ):
     switch = await _get_switch_for_access(id, ctx, db)
+    if switch.control_proto == "ufanet-smart-home":
+        raise AppError(VALIDATION_ERROR, "СКУД не поддерживает получение состояния")
     return single("state", SwitchStateOut(state=switch.state, state_updated_at=switch.state_updated_at).model_dump())
 
 
@@ -492,6 +596,8 @@ async def set_switch_state(
     db: AsyncSession = Depends(get_db),
 ):
     switch = await _get_switch_for_access(id, ctx, db)
+    if switch.control_proto == "ufanet-smart-home":
+        raise AppError(VALIDATION_ERROR, "СКУД не поддерживает изменение состояния")
     new_state = body.obj.state
 
     try:

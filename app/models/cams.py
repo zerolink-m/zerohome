@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, ForeignKey, Integer, JSON, SmallInteger, String
+from sqlalchemy import BigInteger, ForeignKey, Integer, JSON, SmallInteger, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -12,8 +12,12 @@ class Cam(Base):
     address/...) — see the first positional arg of mapped_column."""
 
     __tablename__ = "cams"
+    __table_args__ = (UniqueConstraint("connection_resource_id", name="uq_cams_connection_resource"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    connection_resource_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("connection_resources.id", ondelete="CASCADE"), nullable=True
+    )
     ownuser: Mapped[int] = mapped_column(
         "owner", Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )

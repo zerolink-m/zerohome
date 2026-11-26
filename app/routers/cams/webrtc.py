@@ -85,6 +85,9 @@ async def webrtc_stream(
             await websocket.close(code=1008, reason="Слишком много подключений")
             return
 
+        if cam.connection_resource_id is not None:
+            await websocket.close(code=1008, reason="Для облачной камеры доступен HLS")
+            return
         target = await view_proxy.view_target(db, id)
         if target is not None:
             await view_proxy.proxy_websocket(websocket, target)
@@ -92,6 +95,9 @@ async def webrtc_stream(
 
     # This node is the actual media/signaling owner (or clustering is off).
     # Ingress nodes proxy above before consulting their own local capability.
+    if cam.connection_resource_id is not None:
+        await websocket.close(code=1008, reason="Для облачной камеры доступен HLS")
+        return
     if not worker_enabled(settings, "webrtc"):
         await websocket.close(code=1008, reason="WebRTC отключён на этой ноде")
         return

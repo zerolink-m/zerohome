@@ -235,7 +235,9 @@ async def get_camera_stats(db: AsyncSession) -> dict:
     enabled_cams = await db.scalar(select(func.count(Cam.id)).where(Cam.enabled == 1))
     onvif_cams = await db.scalar(select(func.count(Cam.id)).where(Cam.onvif_enabled == 1))
     ptz_cams = await db.scalar(select(func.count(Cam.id)).where(Cam.onvif_ptz_enabled == 1))
-    recording_cams = await db.scalar(select(func.count(Cam.id)).where(Cam.record == 1))
+    recording_cams = await db.scalar(
+        select(func.count(Cam.id)).where(Cam.record == 1, Cam.connection_resource_id.is_(None))
+    )
 
     return {
         "total": total_cams or 0,
@@ -254,7 +256,7 @@ async def get_recording_stats(db: AsyncSession) -> dict:
     total_size = 0
     recording_count = 0
 
-    result = await db.execute(select(Cam).where(Cam.record == 1))
+    result = await db.execute(select(Cam).where(Cam.record == 1, Cam.connection_resource_id.is_(None)))
     cams = result.scalars().all()
 
     for cam in cams:
