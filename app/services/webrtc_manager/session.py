@@ -7,11 +7,12 @@ import hashlib
 import base64
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, VideoStreamTrack
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCIceCandidate, VideoStreamTrack
 from aiortc.contrib.media import MediaBlackhole
+from aiortc.sdp import candidate_from_sdp
 from aiortc.mediastreams import MediaStreamError, VIDEO_TIME_BASE, VIDEO_CLOCK_RATE
 from av import VideoFrame
 import av
@@ -42,6 +43,7 @@ class WebRTCSession:
     video_track: RTSPVideoStreamTrack
     created_at: float
     audio_track: RTSPAudioStreamTrack | None = None
+    pending_ice: list[RTCIceCandidate | None] = field(default_factory=list)
 
 
 _sessions: dict[str, WebRTCSession] = {}  # session_id -> WebRTCSession
@@ -163,6 +165,7 @@ async def handle_answer(session_id: str, sdp: str) -> None:
     logger.debug("webrtc: Setting remote description (answer)...")
     answer = RTCSessionDescription(sdp=sdp, type="answer")
     await pc.setRemoteDescription(answer)
+    await _flush_pending_ice(session)
     logger.debug("webrtc: Remote description set")
 
 
@@ -179,6 +182,7 @@ async def handle_offer(session_id: str, sdp: str) -> str:
     logger.debug("webrtc: Setting remote description...")
     offer = RTCSessionDescription(sdp=sdp, type="offer")
     await pc.setRemoteDescription(offer)
+    await _flush_pending_ice(session)
     logger.debug("webrtc: Remote description set")
 
     logger.debug("webrtc: Creating answer...")
@@ -195,16 +199,51 @@ async def handle_offer(session_id: str, sdp: str) -> str:
     return sanitize_local_sdp(pc.localDescription.sdp)
 
 
-async def add_ice_candidate(session_id: str, candidate: dict) -> None:
-    """Add ICE candidate to peer connection"""
+async def _flush_pending_ice(session: WebRTCSession) -> None:
+    for candidate in session.pending_ice:
+        await session.peer_connection.addIceCandidate(candidate)
+    session.pending_ice.clear()
+
+
+def _parse_ice_candidate(candidate: dict | None) -> RTCIceCandidate | None:
+    if candidate is None or (isinstance(candidate, dict) and candidate.get("candidate") == ""):
+        return None
+    if not isinstance(candidate, dict):
+        raise WebRTCStreamError("Некорректный ICE-кандидат")
+
+    raw = candidate.get("candidate")
+    mid = candidate.get("sdpMid")
+    index = candidate.get("sdpMLineIndex")
+    if (
+        not isinstance(raw, str) or len(raw) > 2048
+        or (mid is not None and not isinstance(mid, str))
+        or (index is not None and (type(index) is not int or index < 0))
+        or (mid is None and index is None)
+    ):
+        raise WebRTCStreamError("Некорректный ICE-кандидат")
+    try:
+        parsed = candidate_from_sdp(raw.removeprefix("candidate:"))
+    except (AssertionError, IndexError, ValueError) as exc:
+        raise WebRTCStreamError("Некорректный ICE-кандидат") from exc
+    parsed.sdpMid = mid
+    parsed.sdpMLineIndex = index
+    return parsed
+
+
+async def add_ice_candidate(session_id: str, candidate: dict | None) -> None:
+    """Accept the candidate fields produced by RTCIceCandidate.toJSON()."""
     async with _guard:
         session = _sessions.get(session_id)
-
     if session is None:
         return
 
-    # aiortc handles ICE candidates automatically
-    # This is mostly for future extensions
+    parsed = _parse_ice_candidate(candidate)
+    if session.peer_connection.remoteDescription is None:
+        if len(session.pending_ice) >= 64:
+            raise WebRTCStreamError("Слишком много ICE-кандидатов до получения SDP")
+        session.pending_ice.append(parsed)
+        return
+    await session.peer_connection.addIceCandidate(parsed)
 
 
 async def close_session(session_id: str) -> None:

@@ -1,18 +1,15 @@
 import asyncio
+import json
 
-import httpx
 import tinytuya
 
 from app.core.codes import BAD_REQUEST, SERVER_ERROR
 from app.core.config import settings
 from app.core.errors import AppError
 from app.models.switch import Switch
-from app.schemas.switch import CustomAction, CustomResponse, CustomSyncAction
-from app.services import tuya_client_pool
+from app.schemas.switch import CustomAction, CustomResponse, CustomSyncAction, tuya_cloud_endpoint
+from app.services import custom_switch_http, tuya_client_pool
 from app.services.tuya import TuyaError
-
-_SEND_TIMEOUT_SECONDS = 10.0
-
 
 async def _with_timeout(coro):
     try:
@@ -25,20 +22,24 @@ def _tuya_local_set_state_sync(meta: dict, state: int) -> None:
     device = tinytuya.OutletDevice(meta["device_id"], meta["ip"], meta["local_key"])
     device.set_version(float(meta.get("version", "3.3")))
     device.set_socketPersistent(False)
-    if state == 1:
-        device.turn_on()
-    else:
-        device.turn_off()
+    result = device.turn_on() if state == 1 else device.turn_off()
+    # TinyTuya can confirm the command with an empty ACK (None).
+    if isinstance(result, dict) and ("Error" in result or "Err" in result):
+        raise AppError(SERVER_ERROR, "Tuya Local не выполнил команду")
 
 
 async def _tuya_cloud_client(meta: dict):
     """Get (or lazily create) the pooled TuyaCloudClient for this switch's
     credentials. Credentials live in the switch's controlmeta, mirrored from
     the parent Connection at sync time."""
+    try:
+        endpoint = tuya_cloud_endpoint(meta["endpoint"])
+    except ValueError as exc:
+        raise AppError(BAD_REQUEST, str(exc)) from exc
     return await tuya_client_pool.get_client(
         access_id=meta["access_id"],
         access_secret=meta["access_secret"],
-        endpoint=meta["endpoint"],
+        endpoint=endpoint,
     )
 
 
@@ -87,18 +88,15 @@ async def _tuya_cloud_get_state(meta: dict) -> int:
 
     # Master (dp_codes list): OR across all channels — "on" iff any child is on.
     # Child (dp_code single): just that one DP.
-    values: list[bool] = []
-    for code in codes:
-        v = by_code.get(code)
-        if v is None:
-            continue
-        values.append(bool(v))
-    if not values:
+    values = [by_code.get(code) for code in codes]
+    if any(v is True for v in values):
+        return 1
+    if not all(v is False for v in values):
         raise AppError(
             SERVER_ERROR,
-            f"В ответе Tuya Cloud нет ни одного из ожидаемых DP: {codes}",
+            "Tuya Cloud вернул неполное или некорректное состояние",
         )
-    return 1 if any(values) else 0
+    return 0
 
 
 def _tuya_local_get_state_sync(meta: dict) -> int:
@@ -107,8 +105,8 @@ def _tuya_local_get_state_sync(meta: dict) -> int:
     device.set_socketPersistent(False)
     status = device.status()
     dps = status.get("dps") if isinstance(status, dict) else None
-    if not isinstance(dps, dict) or "1" not in dps:
-        raise AppError(SERVER_ERROR, f"Не удалось получить статус устройства: {status}")
+    if not isinstance(dps, dict) or not isinstance(dps.get("1"), bool):
+        raise AppError(SERVER_ERROR, "Не удалось получить статус устройства Tuya Local")
     return 1 if dps["1"] else 0
 
 
@@ -148,7 +146,7 @@ def _step_into(value, segment: str):
     return value
 
 
-def _extract_path_value(path: str, resp: httpx.Response):
+def _extract_path_value(path: str, resp: custom_switch_http.Reply):
     if path == "status://":
         return resp.status_code
 
@@ -160,7 +158,7 @@ def _extract_path_value(path: str, resp: httpx.Response):
 
     if path.startswith("json://body"):
         try:
-            value = resp.json()
+            value = json.loads(resp.body)
         except ValueError as exc:
             raise AppError(SERVER_ERROR, "Ответ устройства не является валидным JSON") from exc
         rest = path[len("json://body"):]
@@ -171,19 +169,7 @@ def _extract_path_value(path: str, resp: httpx.Response):
     raise AppError(SERVER_ERROR, f"Неподдерживаемый path: {path}")
 
 
-async def _send_custom_request(client: httpx.AsyncClient, request) -> httpx.Response:
-    headers = dict(request.headers)
-    if request.body is not None:
-        headers["Content-Type"] = "text/plain"
-    return await client.request(
-        request.method,
-        request.url,
-        headers=headers,
-        content=request.body,
-    )
-
-
-def _evaluate_custom_response(spec: CustomResponse | None, resp: httpx.Response) -> None:
+def _evaluate_custom_response(spec: CustomResponse | None, resp: custom_switch_http.Reply) -> None:
     if spec is None:
         if resp.status_code < 200 or resp.status_code >= 300:
             raise AppError(SERVER_ERROR, f"Устройство вернуло ошибку: {resp.status_code}")
@@ -195,17 +181,17 @@ def _evaluate_custom_response(spec: CustomResponse | None, resp: httpx.Response)
         raise AppError(SERVER_ERROR, f"Не удалось сопоставить значение '{raw}' из ответа устройства")
 
 
-async def _custom_set_state(meta: dict, state: int) -> None:
+async def _custom_set_state(meta: dict, state: int, allow_local: bool) -> None:
     action = CustomAction(**(meta["on"] if state == 1 else meta["off"]))
-
-    async with httpx.AsyncClient(timeout=_SEND_TIMEOUT_SECONDS) as client:
-        resp = await _send_custom_request(client, action.request)
-
-    response_spec = getattr(action, "response", None)
+    response_spec = action.response
+    resp = await custom_switch_http.send(
+        action.request, allow_local,
+        read_body=response_spec is not None and response_spec.path.startswith("json://body"),
+    )
     _evaluate_custom_response(response_spec, resp)
 
 
-def _resolve_custom_response_state(spec: CustomResponse, resp: httpx.Response) -> int:
+def _resolve_custom_response_state(spec: CustomResponse, resp: custom_switch_http.Reply) -> int:
     raw = _extract_path_value(spec.path, resp)
     mapped = spec.map.get(str(raw))
     if mapped is None:
@@ -213,26 +199,28 @@ def _resolve_custom_response_state(spec: CustomResponse, resp: httpx.Response) -
     return mapped
 
 
-async def _custom_get_state(meta: dict) -> int:
+async def _custom_get_state(meta: dict, allow_local: bool) -> int:
     sync_meta = meta.get("sync")
     if sync_meta is None:
         raise AppError(BAD_REQUEST, "Для этого устройства не настроен sync")
     action = CustomSyncAction(**sync_meta)
 
-    async with httpx.AsyncClient(timeout=_SEND_TIMEOUT_SECONDS) as client:
-        resp = await _send_custom_request(client, action.request)
+    resp = await custom_switch_http.send(
+        action.request, allow_local, read_body=action.response.path.startswith("json://body"),
+    )
 
     return _resolve_custom_response_state(action.response, resp)
 
 
-async def set_state(switch: Switch, state: int) -> None:
+async def set_state(switch: Switch, state: int, *, db=None) -> None:
     meta = switch.controlmeta or {}
     if switch.control_proto == "tuya_local":
         await _with_timeout(asyncio.to_thread(_tuya_local_set_state_sync, meta, state))
     elif switch.control_proto == "tuya_cloud":
         await _with_timeout(_tuya_cloud_set_state(meta, state))
     elif switch.control_proto == "custom":
-        await _with_timeout(_custom_set_state(meta, state))
+        allow_local = db is not None and await custom_switch_http.owner_allows_local(db, switch.ownuser)
+        await _with_timeout(_custom_set_state(meta, state, allow_local))
     else:
         raise AppError(BAD_REQUEST, f"Неизвестный control_proto: {switch.control_proto}")
 
@@ -246,7 +234,7 @@ def supports_sync(switch: Switch) -> bool:
     return False
 
 
-async def get_state(switch: Switch) -> int:
+async def get_state(switch: Switch, *, db=None) -> int:
     """Queries the device's real current state. Raises AppError if unsupported or unreachable."""
     meta = switch.controlmeta or {}
     if switch.control_proto == "tuya_local":
@@ -254,6 +242,7 @@ async def get_state(switch: Switch) -> int:
     elif switch.control_proto == "tuya_cloud":
         return await _with_timeout(_tuya_cloud_get_state(meta))
     elif switch.control_proto == "custom":
-        return await _with_timeout(_custom_get_state(meta))
+        allow_local = db is not None and await custom_switch_http.owner_allows_local(db, switch.ownuser)
+        return await _with_timeout(_custom_get_state(meta, allow_local))
     else:
         raise AppError(BAD_REQUEST, f"Неизвестный control_proto: {switch.control_proto}")

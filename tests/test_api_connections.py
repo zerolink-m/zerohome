@@ -41,7 +41,7 @@ def _mock_ext(monkeypatch):
     async def sync(cid):
         calls["sync"].append(cid)
 
-    async def inval(a, e):
+    async def inval(a, e, access_secret):
         calls["inval"].append((a, e))
 
     monkeypatch.setattr("app.routers.connections.connection_sync.sync_connection_now", sync)
@@ -165,8 +165,8 @@ async def test_ufanet_edit_replaces_devices_and_revokes_access(client, users, se
         assert not (await db.execute(select(Invitation))).scalars().all()
         assert not (await db.execute(select(Sharing))).scalars().all()
         new_cam, new_switch = imported[0]
-        assert (await db.get(Cam, new_cam)).enabled == 0
-        assert (await db.get(Switch, new_switch)).enabled == 0
+        assert (await db.get(Cam, new_cam)).enabled == 1
+        assert (await db.get(Switch, new_switch)).enabled == 1
 
     # Bulk changes follow the same lifecycle. Disabling does not import until
     # the connection is enabled again.

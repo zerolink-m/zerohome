@@ -19,6 +19,7 @@ from app.services.ingest.hub import IngestHub
 from app.services.ingest.supervisor import IngestSupervisor
 from app.services.webrtc_manager import probe as probe_mod
 from app.services.webrtc_manager import process as procs
+from app.services.webrtc_manager.ice import WebRTCStreamError
 from app.services.webrtc_manager.track import RTSPVideoStreamTrack
 from tests.fmp4_builder import fragment, init_segment
 from tests.ingest.conftest import alive, wait_until
@@ -181,12 +182,19 @@ async def test_probe_failure_or_rejecting_decoder_falls_back(env, monkeypatch, c
     caplog.set_level(logging.INFO)
     env.feed_init()
     monkeypatch.setenv("FAKE_WEBRTC_PROBE", "fail")  # also fails direct probing -> use direct sizes below
-    track, _ = make_track()
-    with pytest.raises(Exception, match="ffprobe"):
+    track, ended = make_track()
+    with pytest.raises(MediaStreamError) as error:
         await asyncio.wait_for(track.recv(), 5)  # hub probe failed, direct probe failed too
-    assert "falling back to direct" in caplog.text
-    assert "secret" not in caplog.text
+    assert isinstance(error.value.__cause__, WebRTCStreamError)
+    assert "ffprobe" in str(error.value.__cause__)
+    assert "ffprobe" in track.end_reason
+    assert ended == [track]
+    assert "falling back to direct RTSP" in caplog.text
+    assert "secret" not in caplog.text and "secret" not in track.end_reason
+    probes = [a for a in runs(env.args_log) if "-show_entries" in a]
+    assert len(probes) == 2 and "pipe:0" in probes[0] and URL in probes[1]
     assert env.hub.subscriber_count(1) == 0
+    await track.aclose()
     monkeypatch.delenv("FAKE_WEBRTC_PROBE")
     # decoder refuses its options (rejects hub AND direct): no frames, clean error, nothing left
     monkeypatch.setenv("FAKE_WEBRTC_MODE", "reject")
@@ -196,6 +204,26 @@ async def test_probe_failure_or_rejecting_decoder_falls_back(env, monkeypatch, c
     assert track.source == "direct" and "secret" not in (track.end_reason or "")
     assert env.hub.subscriber_count(1) == 0 and not procs._live or await wait_until(lambda: not procs._live)
     assert len(ended) == 1
+
+
+@pytest.mark.parametrize("hub_unavailable", ["offline", "probe_failed"])
+async def test_cluster_does_not_fall_back_to_camera(env, monkeypatch, hub_unavailable):
+    monkeypatch.setattr(settings, "CLUSTER_ENABLED", True)
+    if hub_unavailable == "offline":
+        env.running[1] = False
+    else:
+        env.feed_init()
+        monkeypatch.setenv("FAKE_WEBRTC_PROBE", "fail")
+
+    track, ended = make_track()
+    with pytest.raises(MediaStreamError) as error:
+        await asyncio.wait_for(track.recv(), 5)
+    assert isinstance(error.value.__cause__, WebRTCStreamError)
+    assert "ingest" in str(error.value.__cause__)
+    assert "ingest" in track.end_reason and ended == [track]
+    assert not any(URL in argv for argv in runs(env.args_log))
+    assert env.hub.subscriber_count(1) == 0
+    await track.aclose()
 
 
 async def test_hub_decoder_failure_falls_back_to_direct_that_works(env, monkeypatch):

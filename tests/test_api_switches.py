@@ -16,8 +16,8 @@ async def tok(uid, role="user"):
 
 def sw(name="s", **kw):
     return {"control_protocol": "custom", "name": name, "control_metadata": {
-        "on": {"request": {"url": "http://x/on", "method": "GET"}},
-        "off": {"request": {"url": "http://x/off", "method": "GET"}}}, **kw}
+        "on": {"request": {"url": "http://1.1.1.1/on", "method": "GET"}},
+        "off": {"request": {"url": "http://1.1.1.1/off", "method": "GET"}}}, **kw}
 
 
 def body(**obj):
@@ -40,7 +40,7 @@ async def users(mk_user):
 def _mock_ext(monkeypatch):
     calls = []
 
-    async def set_state(switch, state):
+    async def set_state(switch, state, *, db=None):
         calls.append((switch.id, state))
 
     monkeypatch.setattr("app.routers.switches.switch_client.set_state", set_state)
@@ -175,7 +175,7 @@ async def test_patch_auto_restricted_fields(client, users, sessionmaker_):
     r = await client.patch(f"/v1/switches/{sid}", headers=h, json=body(control_protocol="custom"))
     assert r.status_code == 403 and r.json()["code"] == FORBIDDEN_RESOURCE
     r = await client.patch(f"/v1/switches/{sid}", headers=h, json=body(name="renamed"))
-    assert r.json()["code"] == "002"
+    assert r.status_code == 403 and r.json()["code"] == FORBIDDEN_RESOURCE
 
 
 async def test_bulk_delete_auto_partial(client, users, sessionmaker_):

@@ -29,9 +29,6 @@ class PushSettings(Base):
     motion_min_object_size: Mapped[float] = mapped_column(
         Float, nullable=False, default=0.02, server_default="0.02"
     )
-    motion_cooldown_seconds: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0, server_default="0"
-    )
     motion_detect_person: Mapped[int] = mapped_column(
         SmallInteger, nullable=False, default=1, server_default="1"
     )

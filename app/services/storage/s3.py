@@ -36,10 +36,13 @@ def endpoint_host(endpoint: str) -> str:
     parts = urlsplit(endpoint)
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise RuntimeError("S3_ENDPOINT must be an absolute http(s) URL, for example http://minio:9000")
+    if parts.query or parts.fragment or parts.username is not None or parts.password is not None:
+        raise RuntimeError("S3_ENDPOINT must not include credentials, a query, or a fragment")
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
     port = parts.port
     if port is None or (parts.scheme == "https" and port == 443) or (parts.scheme == "http" and port == 80):
-        return parts.hostname
-    return f"{parts.hostname}:{port}"
+        return host
+    return f"{host}:{port}"
 
 
 def object_uri(bucket: str, key: str) -> str:
@@ -152,7 +155,10 @@ class S3Storage:
         return True
 
     async def _request(self, method: str, key: str, data: bytes | None = None, content_type: str | None = None) -> httpx.Response:
-        uri = object_uri(self.bucket, key)
+        endpoint = httpx.URL(self.endpoint)
+        prefix = quote(endpoint.raw_path.decode("ascii").rstrip("/"), safe="/%")
+        url = endpoint.copy_with(raw_path=(prefix + object_uri(self.bucket, key)).encode("ascii"))
+        uri = url.raw_path.decode("ascii")
         body = data if data is not None else b""
         body_hash = payload_hash(body) if method == "PUT" else _EMPTY_PAYLOAD_HASH
         amz_date = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -170,7 +176,7 @@ class S3Storage:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 return await client.request(
                     method,
-                    self.endpoint + uri,
+                    url,
                     content=body if method == "PUT" else None,
                     headers=headers,
                 )

@@ -34,7 +34,7 @@ router = APIRouter(prefix="/v1/users", tags=["users"])
 USERS_COLUMNS = ["id", "name", "surname", "email", "role", "added_at", "updated_at"]
 users_query = list_query(model=User, sortable=USERS_COLUMNS, searchable=USERS_COLUMNS)
 MAX_BULK = 100
-ADMIN_ONLY_FIELDS = ("role", "allow_record", "allow_tuya_local", "motion_detection_allowed")
+ADMIN_ONLY_FIELDS = ("role", "allow_record", "allow_tuya_local", "local_connections_allowed", "motion_detection_allowed")
 
 
 def _crud_body(key, schema):
@@ -67,6 +67,7 @@ def _to_out(user: User) -> dict:
         role=user.role,
         allow_record=user.allowrecord or 0,
         allow_tuya_local=user.allowtuyalocal or 0,
+        local_connections_allowed=user.local_connections_allowed,
         motion_detection_allowed=user.motion_detection_allowed,
         push=user.push,
         push_metadata=user.pushmeta,
@@ -89,11 +90,12 @@ async def _get_user(db: AsyncSession, id: int) -> User:
     return user
 
 
-async def _new_user(db: AsyncSession, name, surname, email, password, role) -> User:
+async def _new_user(db: AsyncSession, data: UserCreate) -> User:
     now = int(time.time())
     user = User(
-        name=name, surname=surname, email=email,
-        password=await hash_password(password), role=role or "user",
+        name=data.name, surname=data.surname, email=data.email,
+        password=await hash_password(data.password), role=data.role or "user",
+        local_connections_allowed=data.local_connections_allowed,
         added_at=now, updated_at=now,
     )
     db.add(user)
@@ -102,7 +104,7 @@ async def _new_user(db: AsyncSession, name, surname, email, password, role) -> U
     except IntegrityError:
         await db.rollback()
         raise AppError(EMAIL_TAKEN, "Email уже занят", fields={
-            "email": field_error("already taken", type="string", value=email)})
+            "email": field_error("already taken", type="string", value=data.email)})
     return user
 
 
@@ -130,6 +132,8 @@ async def _apply_patch(db: AsyncSession, user: User, body: UserPatch, payload: T
         user.allowrecord = fields["allow_record"]
     if "allow_tuya_local" in fields and fields["allow_tuya_local"] is not None:
         user.allowtuyalocal = fields["allow_tuya_local"]
+    if "local_connections_allowed" in fields:
+        user.local_connections_allowed = fields["local_connections_allowed"]
     if "motion_detection_allowed" in fields and fields["motion_detection_allowed"] is not None:
         user.motion_detection_allowed = fields["motion_detection_allowed"]
     if "push" in fields:
@@ -213,8 +217,7 @@ async def create_user(
     req: SingleBody[UserCreate] = Depends(_crud_body("user", UserCreate)),
     db: AsyncSession = Depends(get_db),
 ):
-    b = req.obj
-    user = await _new_user(db, b.name, b.surname, b.email, b.password, b.role)
+    user = await _new_user(db, req.obj)
     out = _to_out(user)
     await db.commit()
     return created("user", out)
@@ -231,7 +234,7 @@ async def create_users_bulk(
     failed: list[dict] = req.invalid()
     for index, b in req.valid():
         try:
-            user = await _new_user(db, b.name, b.surname, b.email, b.password, b.role)
+            user = await _new_user(db, b)
             succeeded.append(_to_out(user))
             if partial:
                 await db.commit()

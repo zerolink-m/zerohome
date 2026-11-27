@@ -37,7 +37,7 @@ async def materialize_ufanet_skuds(db: AsyncSession, connection_id: int) -> list
         switch = by_external_id.get(resource.external_id)
         if switch is None:
             switch = Switch(
-                ownuser=connection.uid, name=resource.name, enabled=0, notify=0,
+                ownuser=connection.uid, name=resource.name, enabled=1, notify=0,
                 control_proto="ufanet-smart-home", controlmeta={}, state=0,
                 state_updated_at=now, added_by="auto", connection_id=connection_id,
                 external_id=resource.external_id, is_master=1, parent=None,

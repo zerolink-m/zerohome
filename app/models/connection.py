@@ -40,6 +40,7 @@ class Connection(Base):
 class ConnectionCredentials(Base):
     __tablename__ = "connection_credentials"
     connection_id: Mapped[int] = mapped_column(Integer, ForeignKey("connections.id", ondelete="CASCADE"), primary_key=True)
+    # Ufanet credentials intentionally remain unencrypted JSON in this table.
     credentials: Mapped[dict] = mapped_column(JSON, nullable=False)
     updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 

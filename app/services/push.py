@@ -5,7 +5,7 @@ import logging
 import os
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
@@ -146,134 +146,96 @@ async def notify_user(
         return False
 
 
-def _without(users, skip_ids):
-    if not skip_ids:
-        return list(users)
-    return [user for user in users if getattr(user, "id", None) not in skip_ids]
+def users_with_device_access(device_type: str, device_id: int, *, include_admins: bool = True):
+    """Users eligible to receive job content under the device's current permissions."""
+    device = {"cams": Cam, "switches": Switch}[device_type]
+    invited = select(Invitation.id).where(
+        Invitation.device_type == device_type,
+        Invitation.device_id == device.id,
+        Invitation.status == "accepted",
+        func.lower(Invitation.email) == func.lower(User.email),
+    ).correlate(device, User).exists()
+    access = [device.ownuser == User.id, invited]
+    if include_admins:
+        access.append(User.role == "admin")
+    return select(User).where(
+        select(device.id).where(device.id == device_id, or_(*access)).correlate(User).exists()
+    )
 
 
-async def _notify_recipients(db, device_type: str, device_id: int, owner_id: int, message: str,
-                             delivered: list | None = None, skip_ids: set | None = None):
-    """Notifies users who have push_settings.enabled=1 for this device."""
-    # Get all push_settings for this device where enabled=1
-    stmt = select(PushSettings).where(
+async def _notify_recipients(db, device_type: str, device_id: int, message: str,
+                             delivered: list | None = None, skip_ids: set | None = None,
+                             filter_func=None):
+    """Send only while the recipient still has access and push enabled."""
+    preference = select(PushSettings).where(
         PushSettings.device_type == device_type,
         PushSettings.device_id == device_id,
-        PushSettings.enabled == 1,
     )
-    result = await db.execute(stmt)
-    push_settings_list = result.scalars().all()
+    prefs = (await db.scalars(preference)).all()
+    configured = bool(prefs)
+    recipients = users_with_device_access(device_type, device_id, include_admins=configured)
+    if configured or filter_func is not None:
+        candidates = [
+            ps.user_id for ps in prefs
+            if ps.enabled == 1 and (filter_func is None or filter_func(ps))
+        ]
+        recipients = recipients.where(User.id.in_(candidates))
+    ids = (await db.scalars(recipients.with_only_columns(User.id))).all()
+    await db.rollback()  # The delivery session is read-only. End its current snapshot.
 
-    if not push_settings_list:
-        # Fallback: if no push_settings exist, use old behavior (owner + invited)
-        owner = await db.get(User, owner_id)
-        recipients = [owner] if owner is not None else []
-
-        accepted_emails = (
-            (
-                await db.execute(
-                    select(Invitation.email).where(
-                        Invitation.device_type == device_type,
-                        Invitation.device_id == device_id,
-                        Invitation.status == "accepted",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-        if accepted_emails:
-            invitees = (
-                (
-                    await db.execute(
-                        select(User).where(
-                            func.lower(User.email).in_([e.lower() for e in accepted_emails])
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            recipients.extend(invitees)
-
-        recipients = _without(recipients, skip_ids)
-        if not recipients:
-            return True
-        return await _notify_users(recipients, message, delivered)
-    # New behavior: notify based on push_settings
-    user_ids = [ps.user_id for ps in push_settings_list]
-    stmt_users = select(User).where(User.id.in_(user_ids))
-    result_users = await db.execute(stmt_users)
-    users = _without(result_users.scalars().all(), skip_ids)
-    if not users:
-        return True
-    return await _notify_users(users, message, delivered)
+    ok = True
+    for uid in ids:
+        if skip_ids and uid in skip_ids:
+            continue
+        user = (await db.scalars(recipients.where(User.id == uid))).first()
+        should_send = user is not None
+        if should_send:
+            current = (await db.scalars(preference.where(PushSettings.user_id == uid))).first()
+            if current is not None:
+                should_send = current.enabled == 1 and (filter_func is None or filter_func(current))
+            elif configured:
+                should_send = False
+        # Release the transaction before network I/O and retain loaded user fields.
+        if user is not None:
+            db.expunge(user)
+        await db.rollback()
+        if not should_send:
+            continue
+        if await notify_user(user, message):
+            if delivered is not None:
+                delivered.append(uid)
+        else:
+            ok = False
+    return ok
 
 
 async def _notify_recipients_filtered(
     db,
     device_type: str,
     device_id: int,
-    owner_id: int,
     message: str,
-    filter_func=None,
+    filter_func,
     delivered: list | None = None,
     skip_ids: set | None = None,
 ):
-    """Notifies users with additional filtering based on push_settings.
-
-    filter_func: function(push_settings) -> bool to filter which users to notify
-    """
-    # Get all push_settings for this device where enabled=1
-    stmt = select(PushSettings).where(
-        PushSettings.device_type == device_type,
-        PushSettings.device_id == device_id,
-        PushSettings.enabled == 1,
+    """Send only to explicitly configured recipients who pass the job filter."""
+    if device_type not in {"cams", "switches"}:
+        return True
+    return await _notify_recipients(
+        db, device_type, device_id, message, delivered=delivered, skip_ids=skip_ids,
+        filter_func=filter_func,
     )
-    result = await db.execute(stmt)
-    push_settings_list = result.scalars().all()
-
-    # Apply filter if provided
-    if filter_func:
-        push_settings_list = [ps for ps in push_settings_list if filter_func(ps)]
-
-    if not push_settings_list:
-        return True
-
-    # Get users
-    user_ids = [ps.user_id for ps in push_settings_list]
-    stmt_users = select(User).where(User.id.in_(user_ids))
-    result_users = await db.execute(stmt_users)
-    users = _without(result_users.scalars().all(), skip_ids)
-    if not users:
-        return True
-    return await _notify_users(users, message, delivered)
-
-
-async def _notify_users(users, message: str, delivered: list | None = None) -> bool:
-    ok = True
-    for user in users:
-        # Do not short-circuit: one failure must not skip the remaining recipients.
-        if not await notify_user(user, message):
-            ok = False
-            continue
-        if delivered is not None:
-            uid = getattr(user, "id", None)
-            if isinstance(uid, int) and not isinstance(uid, bool):
-                delivered.append(uid)
-    return ok
 
 
 async def notify_cam_recipients(db, cam: Cam, message: str, *,
                                 delivered: list | None = None, skip_ids: set | None = None) -> bool:
-    return await _notify_recipients(db, "cams", cam.id, cam.ownuser, message,
+    return await _notify_recipients(db, "cams", cam.id, message,
                                     delivered=delivered, skip_ids=skip_ids)
 
 
 async def notify_switch_recipients(db, switch: Switch, message: str, *,
                                    delivered: list | None = None, skip_ids: set | None = None) -> bool:
-    return await _notify_recipients(db, "switches", switch.id, switch.ownuser, message,
+    return await _notify_recipients(db, "switches", switch.id, message,
                                     delivered=delivered, skip_ids=skip_ids)
 
 

@@ -1,25 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
-from app.core.config import settings
-from app.db.session import AsyncSessionLocal
 from app.models.connection import Connection
-from app.models.invitation import Invitation
-from app.models.sharing import Sharing
 from app.models.switch import Switch
 from app.services import tuya_client_pool
-from app.services.tuya import Function, Specifications, TuyaError
+from app.services.tuya import TuyaError
 
 logger = logging.getLogger("app.services.connection_sync")
 
 from app.services.connection_sync.helpers import (
     _TUYA_ALLOWED_CATEGORIES,
-    _aggregate_state_from_children,
     _cleanup_orphan_shares,
     _switch_dp_codes,
     _tuya_child_controlmeta,
@@ -39,7 +33,10 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
         for the master and all children; external_switch_channel = the DP
         code on children, NULL on master.
     """
-    m = conn.meta or {}
+    connection_id = conn.id
+    revision = conn.sync_revision
+    m = dict(conn.meta or {})
+    await db.rollback()
     tuya_uid = m.get("tuya_uid")
     if not isinstance(tuya_uid, str) or not tuya_uid:
         # Misconfiguration, not a provider failure — surface as a plain
@@ -59,13 +56,17 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
     # than 50 devices (the old client had this exact latent bug).
     devices = []
     last_row_key: str | None = None
+    cursors = set()
     while True:
         page, last_row_key = await client.list_user_devices(
             tuya_uid, last_row_key=last_row_key
         )
         devices.extend(page)
-        if not last_row_key or not page:
+        if not last_row_key:
             break
+        if not page or last_row_key in cursors:
+            raise TuyaError("Incomplete Tuya catalog pagination")
+        cursors.add(last_row_key)
 
     # Filter to categories we support. Index by external_id.
     remote: dict[str, dict] = {}
@@ -82,29 +83,43 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
     # bounded. Cache-friendly (each device is small).
     dp_by_device: dict[str, list[str]] = {}
     status_by_device: dict[str, dict[str, bool]] = {}
-    for ext_id in list(remote.keys()):
+    errors: set[str] = set()
+    for ext_id in remote:
         try:
             spec = await client.get_device_specifications(ext_id)
             dp_by_device[ext_id] = _switch_dp_codes(spec)
         except TuyaError as exc:
-            # A single-device spec failure shouldn't nuke the whole connection.
-            # Drop the device — better than materialising channels we don't
-            # know exist.
+            # Preserve all existing rows for this device until its channels
+            # can be read successfully.
             logger.warning(
                 "connection_id=%s device=%s specifications failed: %s",
-                conn.id, ext_id, exc,
+                connection_id, ext_id, exc,
             )
-            remote.pop(ext_id, None)
+            errors.add("Tuya: не удалось получить характеристики устройств")
+            continue
+        if not dp_by_device[ext_id]:
             continue
         try:
             items = await client.get_device_status(ext_id)
             status_by_device[ext_id] = {
-                i.code: bool(i.value)
+                i.code: i.value
                 for i in items
-                if isinstance(i.code, str)
+                if isinstance(i.value, bool)
             }
+            if any(code not in status_by_device[ext_id] for code in dp_by_device[ext_id]):
+                errors.add("Tuya: получено неполное состояние устройств")
         except TuyaError:
-            status_by_device[ext_id] = {}
+            errors.add("Tuya: не удалось получить состояние устройств")
+
+    conn = (await db.execute(
+        select(Connection).where(Connection.id == connection_id)
+        .with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if (conn is None or not conn.enabled or conn.provider != "tuya_cloud"
+            or conn.sync_revision != revision or conn.meta != m):
+        # A newer sync or an edit won while this catalog was being fetched.
+        await db.rollback()
+        return
 
     existing = (
         await db.execute(
@@ -124,6 +139,9 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
     seen_keys: set[tuple[str, str | None]] = set()
 
     for ext_id, d in remote.items():
+        if ext_id not in dp_by_device:
+            seen_keys.update(key for key in existing_by_key if key[0] == ext_id)
+            continue
         remote_name = d.get("name") or ""
         dp_codes = dp_by_device.get(ext_id) or []
         if not dp_codes:
@@ -139,13 +157,16 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
         master = existing_by_key.get(master_key)
         # Aggregate master state from what the device reports right now
         # (OR across the DP codes we care about).
-        agg_state = 1 if any(status.get(code) for code in dp_codes) else 0
+        states = [status.get(code) for code in dp_codes]
+        agg_state = 1 if True in states else (None if None in states else 0)
 
         if master is None:
+            if agg_state is None:
+                continue
             master = Switch(
                 ownuser=conn.uid,
                 name=remote_name,
-                enabled=0,
+                enabled=1,
                 notify=0,
                 control_proto="tuya_cloud",
                 controlmeta=master_meta,
@@ -170,7 +191,7 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
             if not master.name and remote_name:
                 master.name = remote_name
                 master.updated_at = now
-            if master.state != agg_state:
+            if agg_state is not None and master.state != agg_state:
                 master.state = agg_state
                 master.state_updated_at = now
 
@@ -179,7 +200,8 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
             child_key = (ext_id, dp_code)
             seen_keys.add(child_key)
             child_meta = _tuya_child_controlmeta(conn, d, dp_code)
-            channel_state = 1 if status.get(dp_code) else 0
+            value = status.get(dp_code)
+            channel_state = int(value) if value is not None else None
 
             # Default child name: append channel index only for multi-channel
             # devices; single-channel keeps the plain device name.
@@ -189,11 +211,13 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
 
             child = existing_by_key.get(child_key)
             if child is None:
+                if channel_state is None:
+                    continue
                 db.add(
                     Switch(
                         ownuser=conn.uid,
                         name=default_child_name,
-                        enabled=0,
+                        enabled=1,
                         notify=0,
                         control_proto="tuya_cloud",
                         controlmeta=child_meta,
@@ -216,7 +240,7 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
                 if not child.name and default_child_name:
                     child.name = default_child_name
                     child.updated_at = now
-                if child.state != channel_state:
+                if channel_state is not None and child.state != channel_state:
                     child.state = channel_state
                     child.state_updated_at = now
                 # Repair parent link if the master got recreated.
@@ -234,3 +258,12 @@ async def _sync_tuya_connection(db, conn: Connection) -> None:
     for row in to_delete:
         await _cleanup_orphan_shares(db, row.id)
         await db.delete(row)
+
+    conn.status = "unavailable" if errors else "online"
+    conn.last_checked_at = now
+    conn.last_sync_error = "; ".join(sorted(errors)) or None
+    if not errors:
+        conn.last_synced_at = now
+    conn.updated_at = now
+    conn.sync_revision += 1
+    await db.commit()

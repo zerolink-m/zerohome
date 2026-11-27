@@ -1,8 +1,8 @@
 """Persist a motion event, its photo, and the notification job.
 
-The event (photo_state='uploading') and the job are committed together. The bytes are stored
-afterwards; one retry, then photo_state='failed'. The job stays either way: the worker sends
-the photo once it is 'ready', or the text alone when the upload failed.
+When there are push recipients, the event (photo_state='uploading') and job are
+committed together. The bytes are stored afterwards with one retry. If uploading
+fails, the worker delivers the notification as text.
 """
 from __future__ import annotations
 
@@ -57,16 +57,17 @@ async def save_motion_event_and_photo(
             notified_user_ids=json.dumps(list(notified_user_ids)),
         )
         db.add(event)
-        await notify_queue.enqueue(
-            db,
-            kind="motion",
-            device_type="cams",
-            device_id=cam_id,
-            message=message,
-            photo_key=key,
-            payload={"object_type": object_type, "user_ids": list(notified_user_ids)},
-            now=detected_at,
-        )
+        if notified_user_ids:
+            await notify_queue.enqueue(
+                db,
+                kind="motion",
+                device_type="cams",
+                device_id=cam_id,
+                message=message,
+                photo_key=key,
+                payload={"object_type": object_type, "user_ids": list(notified_user_ids)},
+                now=detected_at,
+            )
         await db.commit()
         await db.refresh(event)
         event_id = event.id

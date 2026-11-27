@@ -131,11 +131,15 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
                         await self._start_hub(hub)
                         await self._await_first_frame()
                     except _HubUnavailable as exc:
-                        logger.warning("webrtc: cam %s hub source failed (%s), falling back to direct",
-                                       self.cam_id, exc)
-                elif settings.INGEST_ENABLED and self.cam_id:
-                    logger.info("webrtc: cam %s hub not available, using direct RTSP", self.cam_id)
+                        if settings.CLUSTER_ENABLED:
+                            logger.warning("webrtc: cam %s hub source failed (%s), cannot start from ingest",
+                                           self.cam_id, exc)
+                        else:
+                            logger.warning("webrtc: cam %s hub source failed (%s), falling back to direct RTSP",
+                                           self.cam_id, exc)
                 if not self._started:
+                    if settings.CLUSTER_ENABLED:
+                        raise WebRTCStreamError("Поток камеры от узла ingest недоступен")
                     await self._start_direct()
             finally:
                 self._starting = False
@@ -464,7 +468,11 @@ class RTSPVideoStreamTrack(VideoStreamTrack):
         re-encodes, no references to keep), and _read_frames caps the queue at a few
         seconds. Timestamps follow the wall clock, so drops do not speed playback up."""
         if not self._started:
-            await self.start()
+            try:
+                await self.start()
+            except WebRTCStreamError as exc:
+                self._finish(str(exc))
+                raise MediaStreamError from exc
 
         while not self._frames:
             if self._ended or self._stopped:

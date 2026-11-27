@@ -119,7 +119,7 @@ async def test_disable_during_fetch_discards_result(sessionmaker_, mk_user, monk
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_empty_skud_catalog_fails_closed_and_recovers(sessionmaker_, mk_user, monkeypatch):
+async def test_empty_skud_catalog_is_successful_and_can_restore_resources(sessionmaker_, mk_user, monkeypatch):
     import ufanet_async
 
     owner = await mk_user("skud-empty@example.org")
@@ -159,7 +159,9 @@ async def test_ambiguous_empty_skud_catalog_fails_closed_and_recovers(sessionmak
         resource = (await db.execute(select(ConnectionResource))).scalar_one()
         assert resource.available == 0
         assert (await db.get(Switch, sid)).enabled == 1
-        assert "AmbiguousEmptyCatalog" in (await db.get(Connection, cid)).last_sync_error
+        conn = await db.get(Connection, cid)
+        assert conn.status == "online"
+        assert conn.last_sync_error is None
 
     async def restored(client):
         return [("1", "door", {"open": True}, {})]

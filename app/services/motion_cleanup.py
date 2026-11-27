@@ -6,7 +6,7 @@ import logging
 import os
 import time
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
@@ -37,38 +37,32 @@ async def _cleanup_once() -> None:
             logger.info(f"Cleaning up {len(old_events)} motion events older than 7 days")
 
             deleted_files = 0
+            deleted_events = 0
             storage = storage_layer.get_storage()
             for event in old_events:
-                if event.photo_key:
-                    try:
-                        if await storage.exists(event.photo_key):
-                            await storage.delete(event.photo_key)
-                            deleted_files += 1
-                        else:
-                            await storage.delete(event.photo_key)
-                    except Exception as exc:
-                        logger.warning(
-                            "failed to delete motion photo for event %s: %s",
-                            event.id, type(exc).__name__,
-                        )
-                elif event.photo_filename:
-                    photo_path = storage_layer.legacy_motion_path(event.cam_id, event.photo_filename)
-                    if os.path.isfile(photo_path):
+                try:
+                    if event.photo_key:
+                        await storage.delete(event.photo_key)
+                        deleted_files += 1
+                    elif event.photo_filename:
+                        path = storage_layer.legacy_motion_path(event.cam_id, event.photo_filename)
                         try:
-                            os.remove(photo_path)
+                            os.remove(path)
                             deleted_files += 1
-                        except Exception as exc:
-                            logger.warning(
-                                "failed to delete legacy motion photo for event %s: %s",
-                                event.id, type(exc).__name__,
-                            )
+                        except FileNotFoundError:
+                            pass
+                except Exception as exc:
+                    logger.warning(
+                        "failed to delete motion photo for event %s: %s",
+                        event.id, type(exc).__name__,
+                    )
+                    continue
 
-            # Delete from database
-            stmt_delete = delete(MotionEvent).where(MotionEvent.detected_at < seven_days_ago)
-            await db.execute(stmt_delete)
+                await db.delete(event)
+                deleted_events += 1
+
             await db.commit()
-
-            logger.info(f"Cleaned up {len(old_events)} events and {deleted_files} photos")
+            logger.info("Cleaned up %s events and %s photos", deleted_events, deleted_files)
             _prune_empty_dirs(settings.motion_files_path)
 
     except Exception as exc:

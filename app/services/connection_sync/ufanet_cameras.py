@@ -41,7 +41,7 @@ async def materialize_ufanet_cameras(db: AsyncSession, connection_id: int) -> li
         camera = by_resource.get(resource.id)
         if camera is None:
             camera = Cam(
-                ownuser=connection.uid, name=resource.name, enabled=0,
+                ownuser=connection.uid, name=resource.name, enabled=1,
                 connection_resource_id=resource.id, port=0, path="",
                 username="", password="", added_at=now, updated_at=now,
             )

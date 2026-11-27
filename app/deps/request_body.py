@@ -84,6 +84,7 @@ class BulkBody(Generic[T]):
 
 async def read_envelope(request: Request, *, optional: bool = False) -> tuple[dict, Options]:
     """Parse and check the Request object -> (data dict, Options)."""
+    # The ingress proxy is responsible for limiting body size before this full read.
     raw = await request.body()
     if not raw or not raw.strip():
         if optional:

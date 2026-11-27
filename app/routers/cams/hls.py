@@ -11,16 +11,16 @@ from app.core.introspection import supports
 from app.core.rate_limit import PointBudget
 from app.db.session import get_db
 from app.deps.auth import AccessContext, require_access_qs, resolve_stream_access
-from app.models.cams import Cam
 from app.services import hls_manager, ufanet_media
-from app.services.cluster import view_proxy
 from app.services.cluster.identity import worker_enabled
 
 from app.routers.cams._common import _LONG_CACHE_HEADERS, _NO_CACHE_HEADERS, _get_cam_for_access, _get_visible_cam, router
 
 
 
-HLS_BUDGET = PointBudget("cams_hls", capacity=50, per_minute=50)
+# With 2-second segments, one live viewer can make around 60 requests per minute.
+HLS_BUDGET = PointBudget("cams_hls", capacity=240, per_minute=240)
+HLS_ARCHIVE_BUDGET = PointBudget("cams_hls_archive", capacity=50, per_minute=50)
 
 
 async def _hls_access(
@@ -29,21 +29,8 @@ async def _hls_access(
     authorization: str | None = Header(None),
     token: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
-) -> AccessContext | None:
-    # A trusted internal hop was already authorized by the node that received
-    # the client. Clustering off never takes this branch (trusted_proxied is false).
-    if view_proxy.trusted_proxied(request):
-        return None
+) -> AccessContext:
     return await resolve_stream_access(id, request, authorization, token, db)
-
-
-async def _cam_for_hls(id: int, ctx: AccessContext | None, db: AsyncSession) -> Cam:
-    if ctx is not None:
-        return await _get_cam_for_access(id, ctx, db)
-    cam = await db.get(Cam, id)
-    if cam is None:
-        raise AppError(OBJECT_NOT_FOUND, "Camera not found")
-    return cam
 
 
 @router.get("/{id}/hls/playlist.m3u8")
@@ -51,18 +38,18 @@ async def _cam_for_hls(id: int, ctx: AccessContext | None, db: AsyncSession) -> 
 async def get_hls_playlist(
     id: int,
     request: Request,
-    ctx: AccessContext | None = Depends(_hls_access),
+    ctx: AccessContext = Depends(_hls_access),
     db: AsyncSession = Depends(get_db),
 ):
     if not settings.HLS_ENABLED:
         raise AppError(BAD_REQUEST, "HLS стриминг отключен")
 
-    cam = await _cam_for_hls(id, ctx, db)
+    cam = await _get_cam_for_access(id, ctx, db)
+    await HLS_BUDGET.charge(request, 1)
+    if not worker_enabled(settings, "hls"):
+        raise AppError(BAD_REQUEST, "HLS стриминг отключен на этой ноде")
+
     if cam.connection_resource_id is not None:
-        if ctx is None:
-            ctx = await resolve_stream_access(id, request, request.headers.get('authorization'), request.query_params.get('token'), db)
-            cam = await _get_cam_for_access(id, ctx, db)
-        await HLS_BUDGET.charge(request, 1)
         text, base, host = await ufanet_media.playlist(db, cam)
         try:
             token = request.query_params.get("token")
@@ -71,17 +58,6 @@ async def get_hls_playlist(
         except (KeyError, ValueError) as exc:
             raise AppError(SERVER_ERROR, "Unsupported Ucams playlist") from exc
         return Response(content=body, media_type="application/vnd.apple.mpegurl", headers=_NO_CACHE_HEADERS)
-    if ctx is not None:
-        await HLS_BUDGET.charge(request, 1)
-        target = await view_proxy.view_target(db, cam.id)
-        if target is not None:
-            return await view_proxy.proxy_http(request, target)
-
-    # Apply node-local policy only after routing: an ingress node with HLS
-    # disabled locally must still proxy to the node that owns this camera.
-    if not worker_enabled(settings, "hls"):
-        raise AppError(BAD_REQUEST, "HLS стриминг отключен на этой ноде")
-
     try:
         session = await hls_manager.get_or_create_session(cam)
     except hls_manager.HLSStreamError as exc:
@@ -131,7 +107,7 @@ async def get_ufanet_archive_playlist(
     cam = await _get_visible_cam(id, payload, db)
     if cam.connection_resource_id is None:
         raise AppError(OBJECT_NOT_FOUND, "Cloud archive not available")
-    await HLS_BUDGET.charge(request, 1)
+    await HLS_ARCHIVE_BUDGET.charge(request, 1)
     text, base, host = await ufanet_media.playlist(db, cam, start, duration)
     params = {'start': start, 'duration': duration}
     if request.query_params.get('token'):
@@ -155,7 +131,7 @@ async def get_ufanet_archive_resource(
     cam = await _get_visible_cam(id, payload, db)
     if cam.connection_resource_id is None:
         raise AppError(FILE_NOT_FOUND, "Resource not found")
-    await HLS_BUDGET.charge(request, 1)
+    await HLS_ARCHIVE_BUDGET.charge(request, 1)
     await ufanet_media.check_camera(db, cam)
     try:
         url, host = ufanet_media.open_resource(key, id, f'archive:{start}:{duration}')
@@ -173,7 +149,7 @@ async def get_hls_segment(
     id: int,
     segment: str,
     request: Request,
-    ctx: AccessContext | None = Depends(_hls_access),
+    ctx: AccessContext = Depends(_hls_access),
     db: AsyncSession = Depends(get_db),
 ):
     if not settings.HLS_ENABLED:
@@ -183,12 +159,12 @@ async def get_hls_segment(
     if not segment.endswith(".ts") or "/" in segment or "\\" in segment or segment in (".", ".."):
         raise AppError(FILE_NOT_FOUND, "Segment not found")
 
-    cam = await _cam_for_hls(id, ctx, db)
+    cam = await _get_cam_for_access(id, ctx, db)
+    await HLS_BUDGET.charge(request, 1)
+    if not worker_enabled(settings, "hls"):
+        raise AppError(BAD_REQUEST, "HLS стриминг отключен на этой ноде")
+
     if cam.connection_resource_id is not None:
-        if ctx is None:
-            ctx = await resolve_stream_access(id, request, request.headers.get('authorization'), request.query_params.get('token'), db)
-            cam = await _get_cam_for_access(id, ctx, db)
-        await HLS_BUDGET.charge(request, 1)
         if not segment.startswith('u-'):
             raise AppError(FILE_NOT_FOUND, "Segment not found")
         await ufanet_media.check_camera(db, cam)
@@ -200,15 +176,6 @@ async def get_hls_segment(
         except Exception as exc:
             raise AppError(SERVER_ERROR, "Ucams segment unavailable") from exc
         return Response(content=data, media_type=content_type.split(';', 1)[0] or 'application/octet-stream', headers=_NO_CACHE_HEADERS)
-    if ctx is not None:
-        await HLS_BUDGET.charge(request, 1)
-        target = await view_proxy.view_target(db, cam.id)
-        if target is not None:
-            return await view_proxy.proxy_http(request, target)
-
-    if not worker_enabled(settings, "hls"):
-        raise AppError(BAD_REQUEST, "HLS стриминг отключен на этой ноде")
-
     try:
         session = await hls_manager.get_or_create_session(cam)
     except hls_manager.HLSStreamError as exc:

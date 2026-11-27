@@ -17,12 +17,8 @@ level and hand them out to callers.
 
 Keying
 ------
-The cache key is ``(access_id, endpoint)`` rather than ``connection_id``.
-That way if two Connection rows happen to reference the same Tuya project
-(same access_id + same region host), they share one client and one token
-cache. `access_secret` is not part of the key — a secret rotation must be
-followed by `invalidate(access_id, endpoint)` from the router so the next
-call rebuilds the client with the new secret.
+The cache key includes the access ID, endpoint and a digest of the access
+secret. Only callers with matching credentials share a token cache.
 
 Concurrency
 -----------
@@ -43,35 +39,28 @@ from the router on Connection PATCH/DELETE).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 
+from app.schemas.connection import TUYA_ENDPOINTS
 from app.services.tuya import TuyaCloudClient
 
 logger = logging.getLogger(__name__)
 
 
-# Module-level state. A single pool instance is fine for the process — we
-# don't ship multi-tenant isolation at this layer.
-_clients: dict[tuple[str, str], TuyaCloudClient] = {}
+_clients: dict[tuple[str, str, bytes], TuyaCloudClient] = {}
 _lock: asyncio.Lock = asyncio.Lock()
 
 
-def _key(access_id: str, endpoint: str) -> tuple[str, str]:
-    return (access_id, endpoint)
+def _key(access_id: str, endpoint: str, access_secret: str) -> tuple[str, str, bytes]:
+    return access_id, TUYA_ENDPOINTS.get(endpoint, endpoint), hashlib.sha256(access_secret.encode()).digest()
 
 
 async def get_client(
     access_id: str, access_secret: str, endpoint: str
 ) -> TuyaCloudClient:
-    """Return a cached client for these credentials, creating one if absent.
-
-    `access_secret` is used only when we actually build a new client — an
-    existing entry is returned as-is regardless of the secret passed in.
-    Callers that rotate secrets must call `invalidate()` first, otherwise
-    the pool will keep serving the old client (with the old secret, which
-    will then fail auth against Tuya on the next request).
-    """
-    key = _key(access_id, endpoint)
+    """Return a cached client only for matching credentials."""
+    key = _key(access_id, endpoint, access_secret)
 
     # Fast path: already cached, no lock needed for reads on a dict in a
     # single event loop.
@@ -98,31 +87,21 @@ async def get_client(
         return client
 
 
-async def invalidate(access_id: str, endpoint: str) -> None:
+async def invalidate(access_id: str, endpoint: str, access_secret: str) -> None:
     """Drop the cached client for these credentials and close its httpx pool.
 
     Called from `routers/connections.py` when the underlying Connection's
     `meta` is patched or the row is deleted — the next `get_client` call
     will rebuild with the fresh secret. Safe to call for keys that aren't
     currently cached (no-op)."""
-    key = _key(access_id, endpoint)
     async with _lock:
-        client = _clients.pop(key, None)
+        client = _clients.pop(_key(access_id, endpoint, access_secret), None)
     if client is None:
         return
     try:
         await client.close()
     except Exception:
-        # Closing a stale client shouldn't be able to break the request that
-        # triggered the invalidation — swallow and log.
-        logger.exception(
-            "tuya client close failed for access_id=%s endpoint=%s",
-            access_id, endpoint,
-        )
-    else:
-        logger.info(
-            "tuya client invalidated for access_id=%s endpoint=%s", access_id, endpoint
-        )
+        logger.exception("tuya client close failed for access_id=%s endpoint=%s", access_id, endpoint)
 
 
 async def close_all() -> None:

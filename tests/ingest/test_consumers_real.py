@@ -144,7 +144,7 @@ async def test_motion_source_decodes_native_size_frames_from_live_fragments_only
 
     ps = SimpleNamespace(user_id=1, motion_detect_person=1, motion_detect_dog=1, motion_detect_cat=1,
                          motion_detect_car=1, motion_min_confidence=0.5, motion_min_object_size=0.01,
-                         motion_cooldown_seconds=0, motion_license_plate_ocr=0)
+                         motion_license_plate_ocr=0)
     s = MotionDetectionSession(Cam(id=1, name="c", proto="rtsp", addr="127.0.0.1", port=554, path="/x",
                                    username="u", password="p"), [ps])
     seen = []

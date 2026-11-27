@@ -15,7 +15,8 @@ def build_rtsp_url(cam: Cam) -> str:
     path = cam.path or ""
     if path and not path.startswith("/"):
         path = f"/{path}"
-    return f"rtsp://{user}:{pwd}@{cam.addr}:{cam.port}{path}"
+    host = f"[{cam.addr}]" if ":" in cam.addr and not cam.addr.startswith("[") else cam.addr
+    return f"rtsp://{user}:{pwd}@{host}:{cam.port}{path}"
 
 
 def mask_credentials(text: str) -> str:

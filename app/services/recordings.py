@@ -34,6 +34,7 @@ this only checks the filesystem-dependent bit that Pydantic can't validate."""
             "record_meta.local.path обязателен и должен быть непустой строкой",
         )
 
+    # Users trusted with allowrecord may select any directory readable by the service.
     path = local["path"]
     if not (os.path.isdir(path) and os.access(path, os.R_OK)):
         raise AppError(BAD_REQUEST, f"Путь record_meta.local.path недоступен: {path}")

@@ -240,10 +240,7 @@ class ClusterRunner:
             if f.prepare is not None and caps.get(f.name):
                 await f.prepare()
         await self._heartbeat(register=True)
-        try:
-            await self.reconcile_once()
-        except Exception:
-            logger.exception("cluster: first reconcile failed")
+        await self.reconcile_once()
         self._tasks = [
             asyncio.create_task(self._heartbeat_loop(), name="cluster-heartbeat"),
             asyncio.create_task(self._reconcile_loop(), name="cluster-reconcile"),
@@ -290,7 +287,9 @@ class ClusterRunner:
             await self._db(lambda db: fn(db, self.node_id, caps, self.settings.NODE_ADDRESS,
                                          APP_VERSION, self._now()))
         except Exception:
-            logger.warning("cluster: node %s failed", "register" if register else "heartbeat", exc_info=True)
+            if register:
+                raise
+            logger.warning("cluster: node heartbeat failed", exc_info=True)
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -558,20 +557,17 @@ async def start() -> None:
         return
     from app.services.cluster.remote_hub import RemoteHub, set_bridge
 
-    _runner = ClusterRunner()
-    bridge = RemoteHub(runner=_runner, settings=app_settings)
+    runner = ClusterRunner()
+    bridge = RemoteHub(runner=runner, settings=app_settings)
+    _runner = runner
     set_bridge(bridge)
-    _runner.attach_media(bridge)
+    runner.attach_media(bridge)
     try:
         await bridge.start()
-        await _runner.start()
-    except Exception:
-        logger.exception("cluster: failed to start")
-        try:
-            await bridge.stop()
-        except Exception:
-            logger.exception("cluster: remote hub failed to stop after start error")
-        set_bridge(None)
+        await runner.start()
+    except (Exception, asyncio.CancelledError):
+        await stop()
+        raise
 
 
 def request_reconcile() -> None:

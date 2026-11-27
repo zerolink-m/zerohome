@@ -1,18 +1,17 @@
 """Lifecycle service for motion detection - auto-start on cameras with enabled motion."""
 from __future__ import annotations
 
-import asyncio
 import logging
 
-from sqlalchemy import select
+from sqlalchemy.orm import aliased
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.cams import Cam
-from app.models.push_settings import PushSettings
 from app.models.user import User
 from app.services import motion_detection
 from app.services.cluster.identity import worker_enabled
+from app.services.motion_detection.manager import eligible_preferences
 
 logger = logging.getLogger(__name__)
 
@@ -20,36 +19,39 @@ logger = logging.getLogger(__name__)
 async def select_cams() -> list[tuple[int, str]]:
     """(cam_id, name) of cameras where motion detection should run: enabled camera,
     a user turned it on in push_settings, and the camera owner is allowed to use it."""
+    owner = aliased(User)
+    stmt = (
+        eligible_preferences()
+        .with_only_columns(Cam.id, Cam.name)
+        .join(owner, owner.id == Cam.ownuser)
+        .where(Cam.enabled == 1, Cam.connection_resource_id.is_(None), owner.motion_detection_allowed == 1)
+        .distinct()
+    )
     async with AsyncSessionLocal() as db:
-        # Get all cameras with motion detection enabled in push_settings
-        stmt = select(PushSettings.device_id).where(
-            PushSettings.device_type == "cams",
-            PushSettings.motion_detection_enabled == 1,
-        ).distinct()
+        return [(cam_id, name) for cam_id, name in (await db.execute(stmt)).all()]
 
-        result = await db.execute(stmt)
-        cam_ids = [row[0] for row in result.fetchall()]
 
-        if not cam_ids:
-            return []
+async def on_preferences_changed(cam_id: int) -> None:
+    if settings.CLUSTER_ENABLED:
+        from app.services.cluster.runner import request_reconcile
+        request_reconcile()
+    elif worker_enabled(settings, "motion"):
+        # The running session refreshes its settings and exits itself when none remain.
+        await motion_detection.start_motion_detection(cam_id)
 
-        stmt_cams = select(Cam).where(
-            Cam.id.in_(cam_ids),
-            Cam.enabled == 1,
-            Cam.connection_resource_id.is_(None),
-        )
-        result_cams = await db.execute(stmt_cams)
-        cameras = result_cams.scalars().all()
 
-        selected: list[tuple[int, str]] = []
-        for cam in cameras:
-            # Check if owner has motion_detection_allowed
-            owner = await db.get(User, cam.ownuser)
-            if owner and owner.motion_detection_allowed == 1:
-                selected.append((cam.id, cam.name))
-            else:
-                logger.debug(f"Cam {cam.id}: owner doesn't have motion_detection_allowed")
-        return selected
+async def on_cam_saved(cam: Cam, fields: set[str]) -> None:
+    if settings.CLUSTER_ENABLED:
+        return  # Camera changes already request cluster reconciliation.
+    if fields & {"enabled", "protocol", "address", "port", "path", "username", "password", "name"}:
+        await motion_detection.stop_motion_detection(cam.id)
+        if cam.enabled == 1:
+            await on_preferences_changed(cam.id)
+
+
+async def on_cam_deleted(cam_id: int) -> None:
+    if not settings.CLUSTER_ENABLED:
+        await motion_detection.stop_motion_detection(cam_id)
 
 
 async def start_all_enabled() -> None:

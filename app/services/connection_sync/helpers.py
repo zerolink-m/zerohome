@@ -48,6 +48,8 @@ def _tuya_master_controlmeta(conn: Connection, device: dict, dp_codes: list[str]
     so `switch_client.set_state` on the master fires a batch of all channels
     in a single Tuya API call."""
     m = conn.meta or {}
+    # Copied credentials intentionally remain in switch metadata exposed to
+    # the owner and administrators. Invited users get the restricted view.
     return {
         "access_id": m.get("access_id"),
         "access_secret": m.get("access_secret"),
@@ -61,6 +63,7 @@ def _tuya_child_controlmeta(conn: Connection, device: dict, dp_code: str) -> dic
     """Child row's controlmeta: just one DP code — the channel this row
     represents. Everything else mirrors the master."""
     m = conn.meta or {}
+    # Same intentional credential exposure as for the master row.
     return {
         "access_id": m.get("access_id"),
         "access_secret": m.get("access_secret"),

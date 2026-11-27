@@ -16,8 +16,8 @@ NON_NULLABLE = {
     CamOnvifPatch: ["onvif_enabled", "onvif_snapshot_enabled", "onvif_ptz_enabled"],
     CamRecordingPatch: ["record"],
     ConnectionPatch: ["name", "enabled", "meta"],
-    UserPatch: ["name", "surname", "email", "password", "role", "motion_detection_allowed"],
-    SwitchPatch: ["name", "enabled", "notify"],
+    UserPatch: ["name", "surname", "email", "password", "role", "motion_detection_allowed", "local_connections_allowed"],
+    SwitchPatch: ["name", "enabled", "notify", "control_protocol", "control_metadata"],
     PushSettingsUpdate: list(PushSettingsUpdate.model_fields),
     ONVIFSettingsUpdate: list(ONVIFSettingsUpdate.model_fields),
 }
@@ -25,7 +25,6 @@ NULLABLE = {
     CamPatch: ["control_protocol", "control_address", "control_port", "control_username", "control_password"],
     CamRecordingPatch: ["record_type", "record_metadata"],
     UserPatch: ["allow_record", "allow_tuya_local"],
-    SwitchPatch: ["control_protocol", "control_metadata"],
 }
 
 

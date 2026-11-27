@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import aclosing
 import time
 
 from fastapi import Depends, Request
@@ -25,6 +27,17 @@ from app.routers.cams._common import _get_cam_for_access, router, single_body_fo
 STREAM_BUDGET = PointBudget("cams_stream", capacity=30, per_minute=30)
 STREAM_OPEN_COST = 10
 STREAM_ATTACH_COST = 3
+
+
+class _LiveStreamResponse(StreamingResponse):
+    async def stream_response(self, send) -> None:
+        async def send_with_timeout(message) -> None:
+            async with asyncio.timeout(30):
+                await send(message)
+
+        # Close the body iterator (and detach the viewer) even if a socket write stalls.
+        async with aclosing(self.body_iterator):
+            await super().stream_response(send_with_timeout)
 
 
 @router.get("/{id}/stream")
@@ -55,7 +68,8 @@ async def stream_cam(
         finally:
             await stream_manager.detach(cam.id, session, queue)
 
-    return StreamingResponse(body(), media_type="video/mp4")
+    # Existing streams intentionally keep the access granted when they were opened.
+    return _LiveStreamResponse(body(), media_type="video/mp4")
 
 
 @router.get("/{id}/ptz", dependencies=[Depends(rate_limit("cams_read", capacity=60, per_minute=60))])

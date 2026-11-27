@@ -224,7 +224,8 @@ Share-токен не даёт доступа к остальным эндпои
 | `cams_webrtc` | 20 / 20 | подключение WS `/cams/{id}/webrtc` |
 | `webrtc_ice` | 60 / 60 | `GET /webrtc/ice` |
 | `cams_stream` | 30 / 30 (open 10, attach 3) | `GET /cams/{id}/stream` |
-| `cams_hls` | 50 / 50 | HLS |
+| `cams_hls` | 240 / 240 | HLS прямого эфира |
+| `cams_hls_archive` | 50 / 50 | HLS архива Ufanet |
 | `cams_ptz_move` / `cams_recording_file` | 15 / 15 · 20 / 20 | PTZ POST · файл записи |
 | `*_read` (users, cams, switches, connections, shares, invitations, push_settings, motion) | 60 / 60 | чтение |
 | `*_write` (users, cams, switches, shares, invitations, push_settings) | 20 / 20 | запись |
@@ -334,7 +335,7 @@ OPTIONS учитывает глобальный rate limit.
 
 ```json
 {"id": 1, "name": "Ivan", "surname": "Petrov", "email": "ivan@example.com", "role": "user",
- "allow_record": 0, "allow_tuya_local": 0, "motion_detection_allowed": 0,
+ "allow_record": 0, "allow_tuya_local": 0, "local_connections_allowed": false, "motion_detection_allowed": 0,
  "push": null, "push_metadata": null, "added_at": 1760000000, "updated_at": 1760000000}
 ```
 
@@ -343,7 +344,7 @@ OPTIONS учитывает глобальный rate limit.
 | Метод | Путь | Права | Тело | Ответ | Ошибки |
 |---|---|---|---|---|---|
 | GET | `/v1/users` | access (user видит только себя) | list-query | `data.users[]` + `settings` | `125`–`129`, `158`, `297`, `300`, `066`, `351` |
-| POST | `/v1/users` | admin | `data.user = {name, surname, email, password, role?}` | `039`, `data.user` | `186`, `269`, `115` |
+| POST | `/v1/users` | admin | `data.user = {name, surname, email, password, role?, local_connections_allowed?}` | `039`, `data.user` | `186`, `269`, `115` |
 | POST | `/v1/users/bulk` | admin | `data.users[]` (≤ 100) | Bulk (`039`/`041`) | `186`, `269`, `073`, `115`, `132` |
 | GET | `/v1/users/bulk/{ids}` | access | — | `data.users[]` в порядке ids | `189`, `215`, `269`, `132` |
 | PATCH | `/v1/users/bulk/{ids}` | access | `data.users[]` — патчи в порядке соответствующих ids | Bulk (`002`/`004`) | `189`, `215`, `269`, `115`, `132` |
@@ -353,8 +354,8 @@ OPTIONS учитывает глобальный rate limit.
 | PATCH | `/v1/users/{id}` | access (своё или admin) | `data.user = {…}` (все поля необязательны) | `002`/`007`, `data.user` | `189`, `215`, `269`, `115` |
 | DELETE | `/v1/users/{id}` | admin | — | `009`, `data.user = {"id": n}` | `186`, `215` |
 
-- Поля создания: `name`, `surname` 1..64, `email` ≤ 255, `password` 1..128, `role` ∈ `admin|user` (по умолчанию `user`).
-- Поля патча (`UserPatch`): `name`, `surname`, `email`, `password`, `role`, `allow_record` (0/1), `allow_tuya_local` (0/1), `motion_detection_allowed` (0/1), `push` (`telegram`), `push_metadata`. `role`, `allow_record`, `allow_tuya_local`, `motion_detection_allowed` меняет только **admin**; от обычного пользователя эти поля молча отбрасываются, в `metadata.warnings` попадает `"Fields ignored (admin only): …"`. `push = "telegram"` требует `push_metadata.telegram`; `push_metadata` без `push` — `269`. Если ничего не изменилось — `007`.
+- При создании пользователя администратор может задать `role` (`admin|user`, по умолчанию `user`) и `local_connections_allowed` (`true|false`, по умолчанию `false`). Остальные поля создания: `name` и `surname` длиной 1..64, `email` до 255 символов, `password` длиной 1..128.
+- Патч поддерживает `name`, `surname`, `email`, `password`, `role`, `allow_record` (0/1), `allow_tuya_local` (0/1), `local_connections_allowed` (логическое значение), `motion_detection_allowed` (0/1), `push` (`telegram`) и `push_metadata`. Только администратор может менять роль и разрешения. Если обычный пользователь прислал эти поля, сервер пропускает их и возвращает предупреждение `Fields ignored (admin only): …` в `metadata.warnings`. Для `push = "telegram"` требуется `push_metadata.telegram`. Если передать `push_metadata` без `push`, сервер вернёт `269`. Если ничего не изменилось, сервер вернёт `007`.
 - Удаление пользователя каскадно удаляет его камеры (с приглашениями и share-ссылками, останавливает стримы), выключатели (с приглашениями и ссылками), соединения и сессии. Удаление самого себя не запрещено.
 - Сортировка/поиск по: `id, name, surname, email, role, added_at, updated_at`.
 - Rate limit: чтение 60 / 60 (`users_read`), запись 20 / 20 (`users_write`; общая корзина с sessions).
@@ -464,7 +465,7 @@ Rate limit 20 / 20 (`cams_write`). Всегда возвращает `002` (да
 
 ### 6.5 HLS (если `HLS_ENABLED`)
 
-Права: **access | share:stream**. Бюджет `cams_hls` 50 / 50, 1 очко за запрос.
+Права: **access | share:stream**. Бюджет прямого эфира `cams_hls` 240 / 240, 1 очко за запрос. У HLS-архива Ufanet отдельный бюджет 50 / 50.
 
 | Метод | Путь | Ответ | Ошибки |
 |---|---|---|---|
@@ -473,11 +474,13 @@ Rate limit 20 / 20 (`cams_write`). Всегда возвращает `002` (да
 
 HLS-сессия запускается первым запросом плейлиста и останавливается после `HLS_IDLE_TIMEOUT_SECONDS` без запросов; после перезапуска источника нумерация сегментов продолжается, а плейлист помечается `EXT-X-DISCONTINUITY`.
 
+В кластере каждая нода обслуживает `/stream`, HLS и WebRTC локально. Для обычных камер источник fMP4 поступает от владельца аренды `ingest`. HLS-плейлист и его сегменты запрашиваются у одной ноды.
+
 ### 6.6 WebRTC (если `WEBRTC_ENABLED`)
 
 `WS /v1/cams/{id}/webrtc?token=<bearer или share:stream токен>` — **custom WebSocket** (не CursedJSON). Токен — только в query, dash-кодирование поддерживается (обязателен; без него — отказ рукопожатия). Любая ошибка авторизации/конфигурации закрывает соединение **`close(1008)`** с причиной (WebRTC отключён, токен недействителен/ссылка отозвана, камера не найдена, ошибка авторизации). Права на камеру проверяются так же, как у stream/PTZ: access-токен — владелец, admin или приглашённый (accepted, камера `enabled`); чужая/невидимая или несуществующая камера → `close(1008)`; share-токен — тип `stream` для этой камеры и неотозванная ссылка. Rate limit подключения: 20 / 20 (`cams_webrtc`), при превышении — `close(1008)`.
 
-Протокол (JSON-сообщения): сервер → клиент `{"type": "offer", "sdp": "..."}`; клиент → сервер `{"type": "answer", "sdp": "..."}` и `{"type": "ice_candidate", "candidate": ...}`; ошибки: `{"type": "error", "message": "..."}` (нет SDP, неизвестный тип сообщения, ошибка обработки answer — после неё соединение закрывается).
+Протокол (JSON-сообщения): сервер → клиент `{"type": "offer", "sdp": "..."}`; клиент → сервер `{"type": "answer", "sdp": "..."}` и `{"type": "ice_candidate", "candidate": ...}`, где `candidate` — объект из `RTCIceCandidate.toJSON()` или `null` после завершения сбора; ошибки: `{"type": "error", "message": "..."}` (нет SDP, неизвестный тип сообщения, ошибка обработки answer — после неё соединение закрывается).
 
 **ICE-серверы для клиента.** `GET /v1/webrtc/ice` — `Authorization: Bearer <bearer сессии или share:stream токен>` (share-токен любой камеры, ссылка не отозвана; `?token=` не принимается; session-токен и share других типов — `167`; без токена — `177`). Rate limit 60 / 60 (`webrtc_ice`, `321`). Ответ `000`: `data.ice = {"ice_servers": [{"urls": ["stun:..."]}, {"urls": ["turn:host:3478?transport=udp", "turns:host:5349?transport=tcp"], "username": "<unix-время истечения>", "credential": "<HMAC-SHA1 base64>"}], "ttl": 3600}`. STUN — из `WEBRTC_STUN_SERVER`; TURN (udp) — `WEBRTC_TURN_SERVER` + `WEBRTC_TURN_SECRET` с временными учётными данными (coturn `use-auth-secret`, срок `WEBRTC_TURN_CREDENTIAL_TTL_SECONDS`, по умолчанию 3600); `turns:` (tcp) добавляется при заданном `WEBRTC_TURNS_SERVER`. Секрет в ответ не попадает; если TURN не настроен — только STUN, если ничего нет — `ice_servers: []`. Эндпоинт не зависит от `WEBRTC_ENABLED`.
 
@@ -510,16 +513,18 @@ HLS-сессия запускается первым запросом плейл
 `control_metadata`:
 
 - `tuya_local`: `{device_id, ip, local_key, version}` (все обязательны; требуется `allow_tuya_local = 1` у пользователя, иначе `385`).
-- `tuya_cloud`: `{access_id, access_secret, endpoint, device_id}` + `dp_codes` (список; для мастер-строки) **или** `dp_code` (строка; взаимоисключающие), `region` (необязательно).
+- `tuya_cloud`: `{access_id, access_secret, endpoint, device_id}` с необязательным `region`. Можно передать `dp_codes` (список для мастер-строки) либо `dp_code` (один код). `endpoint` принимает известный хост Tuya OpenAPI или код региона из списка для подключений.
 - `custom`: `{on: {request, response?}, off: {request, response?}, sync?: {request, response}}`, где `request = {url (http/https), method (GET|POST|PUT|PATCH|DELETE), headers?, body?}`, `response = {path ("status://" | "header://<имя>" | "json://body…"), map: {<значение>: 0|1}}`.
 
-Патч (`SwitchPatch`): `name, enabled, notify, control_protocol, control_metadata`; `control_metadata` без `control_protocol` — `269`. Для авто-синхронизируемых выключателей (`added_by = auto`, создаются соединением) разрешены только `name`, `enabled`, `notify`; изменение `control_*` или удаление → `189`.
+Патч поддерживает поля `name`, `enabled`, `notify`, `control_protocol` и `control_metadata`. Для смены протокола нужны оба поля `control_*`, иначе API отвечает `269`. Переключение на Tuya Cloud или Ufanet запрещено. Для выключателей, созданных синхронизацией, PATCH и DELETE возвращают `189`. Чтение, приглашения, ссылки и команды остаются доступны по правилам доступа к устройству.
+
+Для любого локального адреса в `custom.on`, `custom.off` и `custom.sync` требуется `local_connections_allowed = true` у владельца выключателя. Сервер проверяет адреса при записи и при каждом HTTP-подключении. Приглашённый или пользователь со ссылкой `device_use` может управлять таким выключателем без собственного флага. Отзыв разрешения у владельца блокирует его локальные адреса. Запросы не следуют перенаправлениям.
 
 | Метод | Путь | Права | Тело | Ответ | Ошибки |
 |---|---|---|---|---|---|
 | GET | `/v1/switches` | access (видимые) | list-query | `data.switches[]` + `settings` | query-коды |
-| POST | `/v1/switches` | access | `data.switch = {…}` | `039`, `data.switch` | `385`, `269` |
-| POST | `/v1/switches/bulk` | access | `data.switches[]` | Bulk `039`/`041` | `385`, `269`, `073`, `132` |
+| POST | `/v1/switches` | access | `data.switch = {…}` | `039`, `data.switch` | `189`, `385`, `269` |
+| POST | `/v1/switches/bulk` | access | `data.switches[]` | Bulk `039`/`041` | `189`, `385`, `269`, `073`, `132` |
 | GET | `/v1/switches/bulk/{ids}` | access | — | `data.switches[]` | `215`, `269`, `132` |
 | PATCH | `/v1/switches/bulk/{ids}` | access (владелец/admin) | `data.switches[]` — i-й патч к i-му id | Bulk `002`/`004` | `189`, `385`, `215`, `269`, `132` |
 | DELETE | `/v1/switches/bulk/{ids}` | access (владелец/admin) | необязательное `{options}` или `?partial_allowed` | Bulk `009`/`012` | `189`, `215`, `269`, `132` |
@@ -527,7 +532,7 @@ HLS-сессия запускается первым запросом плейл
 | PATCH | `/v1/switches/{switch_id}` | access (владелец/admin) | `data.switch = {…}` | `002`/`007`, `data.switch` | `189`, `385`, `215`, `269` |
 | DELETE | `/v1/switches/{switch_id}` | access (владелец/admin) | — | `009`, `data.switch = {"id": n}` | `189`, `215` |
 | GET | `/v1/switches/{id}/state` | access \| share:device_use | — | `data.state = {"state": 0\|1, "state_updated_at": n}` | `215`, auth-коды |
-| POST | `/v1/switches/{id}/state` | access \| share:device_use | `data.state = {"state": 0\|1}` | `data.state = {"state", "state_updated_at"}` | `215`, `269`, `332`, auth-коды |
+| POST | `/v1/switches/{id}/state` | access \| share:device_use | `data.state = {"state": 0\|1}` | `data.state = {"state", "state_updated_at"}` | `189`, `215`, `269`, `332`, auth-коды |
 | POST | `/v1/switches/{id}/open` | access \| share:device_use | — | `data.open = {"success": true}` | `215`, `269`, `361`, auth-коды |
 
 - `POST …/state` отправляет команду устройству; при ошибке — `332`; для мастер-строки состояние применяется ко всем дочерним, для дочерней пересчитывается агрегат мастера. Для СКУД Ufanet используйте `POST …/open`: маршруты состояния не поддерживаются. Для приглашённого `GET state` доступен только при видимом (`enabled=1`) выключателе; через share-токен — всегда для своего выключателя. Неизвестный `control_protocol` у выключателя → `059`.
@@ -549,7 +554,9 @@ HLS-сессия запускается первым запросом плейл
  "added_at": 1760000000, "updated_at": 1760000000}
 ```
 
-Создание: `provider` (**обязательно**), `name` 1..255 (**обязательно**), `meta` (**обязательно**), `enabled` 0/1 (по умолчанию 1). Для `tuya_cloud` формат `meta` — `{access_id, access_secret, endpoint, tuya_uid?}`, где `endpoint` — код региона `cn|us|us-e|eu|eu-w|in|sg` либо хост из справочника Tuya. Для `ufanet-smart-home` — `{contract, password}`. Патч: `name`, `enabled`, `meta` (замена целиком; `provider` неизменяем). Невалидный `meta` в патче → `393`. Включённое подключение синхронизируется после создания и изменения реквизитов, а также по ручному запросу. При любом изменении подключения Ufanet связанные камеры и СКУД удаляются вместе с приглашениями и ссылками; если подключение включено, устройства импортируются заново выключенными. Если синхронизация не удалась, они появятся после успешной синхронизации. Ufanet импортирует камеры и shared СКУД выключенными; их можно включить через PATCH. `status`, `last_checked_at` и `last_sync_error` отражают результат синхронизации.
+При создании требуются `provider`, `name` длиной 1..255 и `meta`. Поле `enabled` принимает 0/1 и по умолчанию равно 1. Для `tuya_cloud` формат `meta` — `{access_id, access_secret, endpoint, tuya_uid?}`, где `endpoint` — код региона `cn|us|us-e|eu|eu-w|in|sg` либо хост из справочника Tuya. Для `ufanet-smart-home` передаются `{contract, password}`. Патч поддерживает `name`, `enabled` и полную замену `meta`. Невалидный `meta` в патче возвращает `393`. Включённое подключение синхронизируется после создания, изменения реквизитов и по ручному запросу.
+
+При любом изменении подключения Ufanet камеры и СКУД удаляются вместе с приглашениями и ссылками. Если подключение включено, доступные камеры и shared СКУД импортируются заново с `enabled = 1`. Новые выключатели Tuya также создаются включёнными в сервисе, а их физическое состояние берётся из ответа Tuya. Существующие отключённые импортированные устройства сохраняют значение `enabled`. Пустой каталог СКУД при действующей авторизации считается успешным ответом и отмечает прежние СКУД недоступными до повторного появления в каталоге. Ошибки получения характеристик Tuya сохраняют ранее импортированные устройства. Ошибки чтения состояния Tuya сохраняют последнее известное состояние. Поля `status`, `last_checked_at` и `last_sync_error` отражают результат синхронизации обоих провайдеров.
 
 Камеры Ufanet поддерживают снимок и live HLS через существующие маршруты камеры. `GET /v1/cams/{id}/hls/archive/playlist.m3u8?start=<unix>&duration=<секунды>` выдаёт архивный HLS, длительность от 1 до 86400 секунд. `GET /v1/cams/{id}/hls/archive/resource/{key}` выдаёт ресурс плейлиста и принимает те же параметры времени. Оба запроса требуют авторизацию сессии и доступ к камере. `POST /v1/switches/{id}/open` открывает включённую shared СКУД владельцем, администратором, приглашённым пользователем или по ссылке `share:device_use`. При неоднозначном ответе результат открытия неизвестен.
 
@@ -642,13 +649,13 @@ HLS-сессия запускается первым запросом плейл
 ```json
 {"id": 1, "user_id": 1, "device_type": "cams", "device_id": 1,
  "enabled": 1, "motion_detection_enabled": 0, "motion_min_confidence": 0.6, "motion_min_object_size": 0.02,
- "motion_cooldown_seconds": 0, "motion_detect_person": 1, "motion_detect_dog": 1, "motion_detect_cat": 1,
+ "motion_detect_person": 1, "motion_detect_dog": 1, "motion_detect_cat": 1,
  "motion_detect_car": 1, "motion_license_plate_ocr": 1,
  "notify_offline": 1, "notify_online": 1, "notify_state_change": 1,
  "created_at": 1760000000, "updated_at": 1760000000}
 ```
 
-Ограничения: флаги 0/1; `motion_min_confidence`, `motion_min_object_size` — 0.0..1.0; `motion_cooldown_seconds` ≥ 0. Новые поля создают `269`. Rate limit: чтение 60 / 60 (`push_settings_read`), запись 20 / 20 (`push_settings_write`).
+Ограничения: флаги 0/1; `motion_min_confidence`, `motion_min_object_size` — 0.0..1.0. Неизвестные поля возвращают `269`. Rate limit: чтение 60 / 60 (`push_settings_read`), запись 20 / 20 (`push_settings_write`).
 
 ---
 
@@ -669,6 +676,7 @@ HLS-сессия запускается первым запросом плейл
 | POST | `/v1/cams/{cam_id}/motion/stop` | access (владелец/admin) | — | `000`, `data.motion = {"cam_id", "stopped", "is_active"}` | `189`, `215` |
 
 - Список событий: по умолчанию **limit 50**, максимум **200**; без `sort_by` — новые первыми (`detected_at` по убыванию; в `settings.order` при этом будет `desc`, `sort_by` — `null`). Сортировка/поиск по: `id, detected_at, object_type, confidence, object_size, license_plate`.
+- Общий параметр `MOTION_COOLDOWN_SECONDS` задаёт паузу после сохранения события на каждой камере. Значение по умолчанию — `0`. Событие сохраняется и при выключенном push. Для получения push должны совпасть персональный тип объекта, порог уверенности и размер.
 - `start`: у владельца камеры должен быть `motion_detection_allowed = 1` (иначе `189`; проверяется и для admin).
 - Удаление события идемпотентно относительно отсутствующего фото. Если удаление существующего фото из локального или S3-хранилища завершается ошибкой, API возвращает `336` и сохраняет DB-событие; повторите запрос после устранения ошибки.
 - Каталог фото событий задаётся настройкой `MOTION_FILES_DIR` (по умолчанию `motion_files`, относительный путь — от корня проекта). Rate limit: чтение 60 / 60 (`motion_read`), фото 100 / 60 (`motion_photo`), удаление 30 / 30 (`motion_write`), start/stop 10 / 10 (`motion_control`).

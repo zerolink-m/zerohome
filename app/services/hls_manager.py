@@ -497,10 +497,10 @@ async def get_or_create_session(cam: Cam) -> _HLSSession:
                 await candidate.start(hub)
                 session = candidate
             except HLSStreamError as exc:
-                logger.warning("hls: cam %s hub source failed (%s), falling back to direct", cam.id, exc)
-        elif settings.INGEST_ENABLED:
-            logger.info("hls: cam %s hub not available, using direct RTSP", cam.id)
+                logger.warning("hls: cam %s hub source failed (%s), cannot start from ingest", cam.id, exc)
         if session is None:
+            if settings.CLUSTER_ENABLED:
+                raise HLSStreamError("Поток камеры от узла ingest недоступен")
             session = _HLSSession(cam.id, _build_rtsp_url(cam))
             await session.start()
 
@@ -561,16 +561,17 @@ async def _idle_stop(cam_id: int, session: _HLSSession) -> None:
 
 async def stop(cam_id: int) -> None:
     """Force stop HLS session for a camera"""
-    async with _guard:
-        session = _sessions.pop(cam_id, None)
+    async with _cam_lock(cam_id):
+        async with _guard:
+            session = _sessions.pop(cam_id, None)
 
-    if session is None:
-        return
+        if session is None:
+            return
 
-    if session.idle_task is not None:
-        session.idle_task.cancel()
+        if session.idle_task is not None:
+            session.idle_task.cancel()
 
-    await session.stop("stopped")
+        await session.stop("stopped")
 
 
 async def stop_all(timeout: float = _STOP_ALL_TIMEOUT_SECONDS) -> None:

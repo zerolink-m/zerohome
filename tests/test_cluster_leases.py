@@ -139,7 +139,17 @@ def test_migration_chain():
     nullable = script.get_revision("48000_user_nullable_settings")
     assert nullable.down_revision == "47900_runtime_configuration"
     assert len(nullable.revision) <= 32
-    assert script.get_heads() == ["48300_connection_revision"]
+    for revision, previous in (
+        ("48100_connection_resources", "48000_user_nullable_settings"),
+        ("48200_camera_resource", "48100_connection_resources"),
+        ("48300_connection_revision", "48200_camera_resource"),
+        ("48400_local_connections", "48300_connection_revision"),
+        ("48500_motion_cooldown", "48400_local_connections"),
+    ):
+        current = script.get_revision(revision)
+        assert current.down_revision == previous
+        assert len(current.revision) <= 32
+    assert script.get_heads() == ["48500_motion_cooldown"]
 
 
 def _settings(**kw):

@@ -16,6 +16,7 @@ from app.models.cams import Cam
 from app.models.push_settings import PushSettings
 from app.models.switch import Switch
 from app.schemas.push_settings import PushSettingsResponse, PushSettingsUpdate
+from app.services import motion_lifecycle
 
 router = APIRouter(prefix="/v1", tags=["push_settings"])
 
@@ -77,6 +78,7 @@ async def _check_device_access(
     is_admin: bool,
 ) -> None:
     """Check if user has access to device."""
+    # Invitees intentionally retain access to push settings while a device is disabled.
     if device_type == "cams":
         cam = await db.get(Cam, device_id)
         if cam is None:
@@ -151,8 +153,10 @@ async def update_cam_push_settings(
     await _check_device_access(db, payload.uid, "cams", cam_id, payload.role == "admin")
     settings = await _get_or_create_push_settings(db, payload.uid, "cams", cam_id)
 
-    # Update only provided fields
-    return await _apply_update(db, settings, body.obj)
+    updated = await _apply_update(db, settings, body.obj)
+    if "motion_detection_enabled" in body.obj.model_fields_set:
+        await motion_lifecycle.on_preferences_changed(cam_id)
+    return updated
 
 
 @router.get(

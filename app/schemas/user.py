@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import EmailStr, Field, field_validator, model_validator
+from pydantic import EmailStr, Field, StrictBool, field_validator, model_validator
 
 from app.schemas.base import NonNullablePatch, StrictModel
 
@@ -22,6 +22,7 @@ class UserCreate(StrictModel):
     email: EmailStr = Field(max_length=255)
     password: str = Field(min_length=1, max_length=128)
     role: Literal["admin", "user"] | None = None
+    local_connections_allowed: StrictBool = False
 
     @field_validator('email')
     @classmethod
@@ -37,6 +38,7 @@ class UserOut(StrictModel):
     role: Literal["admin", "user"]
     allow_record: int
     allow_tuya_local: int
+    local_connections_allowed: bool
     motion_detection_allowed: int
     push: Literal["telegram"] | None
     push_metadata: PushMeta | None
@@ -45,7 +47,9 @@ class UserOut(StrictModel):
 
 
 class UserPatch(NonNullablePatch, StrictModel):
-    non_nullable = ("name", "surname", "email", "password", "role", "motion_detection_allowed")
+    non_nullable = (
+        "name", "surname", "email", "password", "role", "motion_detection_allowed", "local_connections_allowed",
+    )
 
     name: str | None = Field(default=None, min_length=1, max_length=64)
     surname: str | None = Field(default=None, min_length=1, max_length=64)
@@ -54,6 +58,7 @@ class UserPatch(NonNullablePatch, StrictModel):
     role: Literal["admin", "user"] | None = None
     allow_record: Literal[0, 1] | None = None
     allow_tuya_local: Literal[0, 1] | None = None
+    local_connections_allowed: StrictBool | None = None
     motion_detection_allowed: Literal[0, 1] | None = None
     push: Literal["telegram"] | None = None
     push_metadata: PushMeta | None = None

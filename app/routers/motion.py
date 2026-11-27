@@ -40,6 +40,7 @@ async def _check_cam_access(db: AsyncSession, cam_id: int, user_id: int, is_admi
     if cam is None:
         raise AppError(OBJECT_NOT_FOUND, "Камера не найдена")
 
+    # Accepted invitees intentionally retain access to motion history while a camera is disabled.
     if not is_admin and cam.ownuser != user_id:
         # Check if user has invitation
         from app.models.invitation import Invitation

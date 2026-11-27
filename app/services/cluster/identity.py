@@ -126,16 +126,6 @@ def worker_enabled(settings: Any, name: str) -> bool:
     return local_capabilities(settings).get(name, False)
 
 
-def stream_advertised(settings: Any, name: str) -> bool:
-    """Standalone advertises only locally enabled streams; cluster ingress may proxy.
-
-    The actual owner still applies its own local capability before serving a stream.
-    """
-    if settings.CLUSTER_ENABLED:
-        return bool(getattr(settings, f"{name.upper()}_ENABLED", False))
-    return worker_enabled(settings, name)
-
-
 def supported_capabilities() -> dict[str, bool]:
     """Capabilities implemented by this application build, enabled on first registration."""
     return {

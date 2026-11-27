@@ -40,7 +40,7 @@ from app.schemas.switch import (
     SwitchStateIn,
     SwitchStateOut,
 )
-from app.services import notify_queue, switch_client
+from app.services import custom_switch_http, notify_queue, switch_client
 
 router = APIRouter(prefix="/v1/switches", tags=["switches"])
 
@@ -196,21 +196,19 @@ async def _apply_patch(switch: Switch, fields: dict, payload: TokenPayload, db: 
     if not _can_manage(switch, payload):
         raise AppError(FORBIDDEN_RESOURCE, "Изменение устройства доступно только владельцу или admin")
 
-    # Auto-synced switches are managed by the sync worker: the user may only
-    # rename them, toggle enabled, or toggle notify. control_protocol/control_metadata
-    # would be stomped on the next tick anyway, so refusing early gives a
-    # clearer error than "your edit silently vanished".
     if switch.added_by == "auto":
-        forbidden_on_auto = {"control_protocol", "control_metadata"} & set(fields.keys())
-        if forbidden_on_auto:
-            raise AppError(
-                FORBIDDEN_RESOURCE,
-                f"Для auto-устройств запрещено менять поля: {sorted(forbidden_on_auto)}",
-            )
+        raise AppError(FORBIDDEN_RESOURCE, "Синхронизированный выключатель доступен только для чтения и управления")
 
     target_controlproto = fields.get("control_protocol", switch.control_proto)
+    if target_controlproto != switch.control_proto:
+        if target_controlproto in {"tuya_cloud", "ufanet-smart-home"}:
+            raise AppError(FORBIDDEN_RESOURCE, "Нельзя изменить протокол на Tuya Cloud или Ufanet")
+        if "control_metadata" not in fields:
+            raise AppError(VALIDATION_ERROR, "Для смены протокола требуется control_metadata")
     if target_controlproto != switch.control_proto or "control_metadata" in fields:
         await _check_tuya_local_allowed(target_controlproto, payload, db)
+        if target_controlproto == "custom":
+            await custom_switch_http.validate_metadata(db, switch.ownuser, fields["control_metadata"])
 
     notify_enabled = fields.get("notify") == 1 and switch.notify != 1
 
@@ -328,6 +326,8 @@ async def create_switch(
     db: AsyncSession = Depends(get_db),
 ):
     await _check_tuya_local_allowed(body.obj.control_protocol, payload, db)
+    if body.obj.control_protocol == "custom":
+        await custom_switch_http.validate_metadata(db, payload.uid, body.obj.control_metadata)
 
     switch = _new_switch(body.obj, payload, int(time.time()))
     db.add(switch)
@@ -348,6 +348,8 @@ async def create_switches_bulk(
     for index, obj in body.valid():
         try:
             await _check_tuya_local_allowed(obj.control_protocol, payload, db)
+            if obj.control_protocol == "custom":
+                await custom_switch_http.validate_metadata(db, payload.uid, obj.control_metadata)
         except AppError as exc:
             if not body.partial_allowed:
                 raise
@@ -601,7 +603,7 @@ async def set_switch_state(
     new_state = body.obj.state
 
     try:
-        await switch_client.set_state(switch, new_state)
+        await switch_client.set_state(switch, new_state, db=db)
     except AppError:
         raise
     except Exception as exc:

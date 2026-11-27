@@ -1,6 +1,6 @@
 """The only place cluster media opens a socket.
 
-TLS is not enabled. These two functions return plain TCP. When TLS is added,
+Cluster media intentionally uses plain TCP on the trusted network. When TLS is added,
 wrap the socket here and nowhere else (server accept and client dial). Until
 that exists the fMP4 payload is readable by anyone on the path.
 

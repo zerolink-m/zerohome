@@ -20,7 +20,7 @@ def _switch_label(switch: Switch) -> str:
 
 async def _sync_one(db, switch: Switch) -> None:
     try:
-        state = await switch_client.get_state(switch)
+        state = await switch_client.get_state(switch, db=db)
     except Exception:
         logger.exception("switch sync failed for switch_id=%s", switch.id)
         return
@@ -32,14 +32,14 @@ async def _sync_one(db, switch: Switch) -> None:
     switch.state = state
     switch.state_updated_at = int(time.time())
 
-    # Notify users with notify_state_change=1 — same transaction as the state change.
-    from datetime import datetime
-    now = datetime.fromtimestamp(time.time()).strftime("%d.%m.%Y %H:%M:%S")
-    message = f"🔌 Устройство {_switch_label(switch)} изменило состояние: {'включено' if state == 1 else 'выключено'}\n\nВремя: {now}"
-    await notify_queue.enqueue(
-        db, kind="switch", device_type="switches", device_id=switch.id,
-        message=message, payload={"filter": "notify_state_change"},
-    )
+    if switch.notify == 1:
+        from datetime import datetime
+        now = datetime.fromtimestamp(time.time()).strftime("%d.%m.%Y %H:%M:%S")
+        message = f"🔌 Устройство {_switch_label(switch)} изменило состояние: {'включено' if state == 1 else 'выключено'}\n\nВремя: {now}"
+        await notify_queue.enqueue(
+            db, kind="switch", device_type="switches", device_id=switch.id,
+            message=message, payload={"filter": "notify_state_change"},
+        )
     await db.commit()
 
     logger.info("switch_id=%s state changed %s -> %s via sync", switch.id, previous, state)
@@ -47,9 +47,13 @@ async def _sync_one(db, switch: Switch) -> None:
 
 async def _sync_once() -> None:
     async with AsyncSessionLocal() as db:
-        switches = (await db.execute(select(Switch).where(Switch.enabled == 1))).scalars().all()
-        for switch in switches:
-            if not switch_client.supports_sync(switch):
+        ids = (await db.execute(select(Switch.id).where(Switch.enabled == 1))).scalars().all()
+    for switch_id in ids:
+        # Read each device and its owner's network permission in a fresh
+        # transaction, even when the preceding device reported no change.
+        async with AsyncSessionLocal() as db:
+            switch = await db.get(Switch, switch_id)
+            if switch is None or not switch.enabled or not switch_client.supports_sync(switch):
                 continue
             await _sync_one(db, switch)
 

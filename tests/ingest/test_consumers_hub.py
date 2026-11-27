@@ -230,7 +230,7 @@ async def test_snapshot_shutdown_kills_running_decoders_and_orphans_are_reaped(e
 def make_session(**kw):
     ps = SimpleNamespace(user_id=1, motion_detect_person=1, motion_detect_dog=1, motion_detect_cat=1,
                          motion_detect_car=1, motion_min_confidence=0.5, motion_min_object_size=0.01,
-                         motion_cooldown_seconds=0, motion_license_plate_ocr=0)
+                         motion_license_plate_ocr=0)
     session = MotionDetectionSession(make_cam(**kw), [ps])
     seen = []
 

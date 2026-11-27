@@ -88,17 +88,15 @@ async def sync_ufanet(db, connection_id: int) -> None:
         return
 
     now = int(time.time())
-    # A failed or ambiguous Smart Home catalog must fail closed.  Preserve the
-    # resource rows and local settings so a later successful sync restores them.
-    if 'skud' in errors or ('skud' in results and not results['skud']):
+    # Failed reads disable access without deleting resources. An authenticated
+    # empty catalog is a successful read and marks absent resources unavailable.
+    if 'skud' in errors:
         resources = (await db.execute(select(ConnectionResource).where(
             ConnectionResource.connection_id == connection_id,
             ConnectionResource.resource_type == 'skud',
         ))).scalars().all()
         for resource in resources:
             resource.available = 0
-        if 'skud' in results:
-            errors['skud'] = 'AmbiguousEmptyCatalog'
     for kind, items in results.items():
         existing = (await db.execute(select(ConnectionResource).where(
             ConnectionResource.connection_id == connection_id,
@@ -120,8 +118,6 @@ async def sync_ufanet(db, connection_id: int) -> None:
             resource.last_seen_at = now
         for resource in existing:
             if resource.external_id not in seen:
-                if kind == 'skud' and not items:
-                    continue
                 resource.available = 0
     await db.flush()
     if 'camera' in results:

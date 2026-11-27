@@ -23,6 +23,7 @@ _STDIN_DRAIN_TIMEOUT_SECONDS = 10.0  # transcoder not reading its stdin this lon
 _TERM_TIMEOUT_SECONDS = 2.0  # transcoder: SIGTERM, then SIGKILL after this
 _KILL_TIMEOUT_SECONDS = 2.0
 _STOP_ALL_TIMEOUT_SECONDS = 6.0
+_VIEWER_BUFFER_FRAGMENTS = 16
 
 
 class StreamStartError(Exception):
@@ -70,14 +71,18 @@ class _StreamSession:
             try:
                 queue.put_nowait(chunk)
             except asyncio.QueueFull:
-                pass
-
-    def close_all(self) -> None:
-        for queue in list(self.subscribers):
-            try:
+                self.subscribers.discard(queue)
+                while not queue.empty():
+                    queue.get_nowait()
                 queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+                logger.info("stream: cam %s disconnected a slow viewer", self.cam_id)
+
+    def close_all(self, *, discard_pending: bool = False) -> None:
+        for queue in self.subscribers:
+            if discard_pending or queue.full():
+                while not queue.empty():
+                    queue.get_nowait()
+            queue.put_nowait(None)
         self.subscribers.clear()
 
 
@@ -409,7 +414,7 @@ async def _spawn_hub(cam: Cam, hub) -> _StreamSession:
 
 
 def _attach(session: _StreamSession) -> asyncio.Queue:
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_VIEWER_BUFFER_FRAGMENTS)
     # ВАЖНО: всегда отправляем init_segment первым для каждого нового подключения
     if session.init_segment is not None:
         queue.put_nowait(session.init_segment)
@@ -454,10 +459,10 @@ async def get_or_attach(cam: Cam) -> tuple[asyncio.Queue, _StreamSession]:
             try:
                 session = await _spawn_hub(cam, hub)
             except _HubUnavailable as exc:
-                logger.warning("stream: cam %s hub source failed (%s), falling back to direct", cam.id, exc)
-        elif settings.INGEST_ENABLED:
-            logger.info("stream: cam %s hub not available, using direct RTSP", cam.id)
+                logger.warning("stream: cam %s hub source failed (%s), cannot start from ingest", cam.id, exc)
         if session is None:
+            if settings.CLUSTER_ENABLED:
+                raise StreamStartError("Поток камеры от узла ingest недоступен")
             session = await _spawn(cam)
         async with _guard:
             _sessions[cam.id] = session
@@ -470,7 +475,7 @@ async def get_or_attach(cam: Cam) -> tuple[asyncio.Queue, _StreamSession]:
 async def detach(cam_id: int, session: _StreamSession, queue: asyncio.Queue) -> None:
     async with _guard:
         session.subscribers.discard(queue)
-        if not session.subscribers and _sessions.get(cam_id) is session:
+        if not session.subscribers and _sessions.get(cam_id) is session and session.idle_task is None:
             session.idle_task = asyncio.create_task(_idle_stop(cam_id, session))
 
 
@@ -486,13 +491,15 @@ async def _idle_stop(cam_id: int, session: _StreamSession) -> None:
 
 
 async def stop(cam_id: int) -> None:
-    async with _guard:
-        session = _sessions.pop(cam_id, None)
-    if session is None:
-        return
-    if session.idle_task is not None:
-        session.idle_task.cancel()
-    await _kill_session(session)
+    async with _cam_lock(cam_id):
+        async with _guard:
+            session = _sessions.pop(cam_id, None)
+        if session is None:
+            return
+        if session.idle_task is not None:
+            session.idle_task.cancel()
+        session.close_all(discard_pending=True)
+        await _kill_session(session)
 
 
 async def stop_all(timeout: float = _STOP_ALL_TIMEOUT_SECONDS) -> None:

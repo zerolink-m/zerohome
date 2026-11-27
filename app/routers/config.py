@@ -30,7 +30,7 @@ from app.schemas.config import (
     SettingPatch,
 )
 from app.services import frontend_version
-from app.services.cluster.identity import stream_advertised
+from app.services.cluster.identity import worker_enabled
 from app.services.runtime_configuration import (
     global_fields,
     node_fields,
@@ -148,7 +148,7 @@ async def get_supported_streams():
         "features": ["low_latency", "seek", "pause"],
     }]
 
-    if stream_advertised(settings, "hls"):
+    if worker_enabled(settings, "hls"):
         streams.append({
             "format": "hls",
             "enabled": True,
@@ -161,7 +161,7 @@ async def get_supported_streams():
             "features": ["adaptive_bitrate", "wide_compatibility", "ios_native"],
         })
 
-    if stream_advertised(settings, "webrtc") and settings.WEBRTC_STUN_SERVER:
+    if worker_enabled(settings, "webrtc"):
         streams.append({
             "format": "webrtc",
             "enabled": True,

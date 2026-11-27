@@ -10,7 +10,7 @@ import time
 from app.core.config import settings
 from app.models.cams import Cam
 from app.services.ingest import consumer
-from app.services.rtsp_url import mask_credentials
+from app.services.rtsp_url import build_rtsp_url, mask_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +150,7 @@ async def get_cached_snapshot(
 ) -> bytes:
     """One cached JPEG per recording: whichever `seek` first materializes it wins,
 and every later request for the same recording gets that same frame back."""
+    # Intentionally share a single cached preview across all seek values for this recording.
     cache_path = _cache_path(cam_id, recording_id)
 
     if os.path.isfile(cache_path):
@@ -316,7 +317,7 @@ async def _grab_from_rtsp(cam: Cam) -> bytes:
         raise SnapshotError("Камера не имеет настроенного RTSP адреса")
 
     # Build RTSP URL
-    rtsp_url = f"{cam.proto}://{cam.username}:{cam.password}@{cam.addr}:{cam.port}{cam.path}"
+    rtsp_url = build_rtsp_url(cam)
     safe_url = f"{cam.proto}://***:***@{cam.addr}:{cam.port}{cam.path}"
     logger.debug(f"[Snapshot] Cam {cam.id}: ffmpeg запрос к {safe_url}")
 

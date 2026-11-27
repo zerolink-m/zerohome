@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Enum, Integer, JSON, SmallInteger, String
+from sqlalchemy import BigInteger, Boolean, Enum, Integer, JSON, SmallInteger, String, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -29,6 +29,9 @@ class User(Base):
     )
     allowtuyalocal: Mapped[int | None] = mapped_column(
         "allow_tuya_local", SmallInteger, nullable=True
+    )
+    local_connections_allowed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
     )
     push: Mapped[str | None] = mapped_column(Enum("telegram", name="user_push"), nullable=True)
     pushmeta: Mapped[dict | None] = mapped_column("push_metadata", JSON, nullable=True)

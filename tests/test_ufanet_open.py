@@ -19,8 +19,7 @@ async def test_materialized_skud_open(client, mk_user, sessionmaker_, monkeypatc
         db.add(ConnectionResource(connection_id=connection.id, resource_type='skud', external_id='00042', name='Door', capabilities={'open': True}, attributes={}, available=1, first_seen_at=1, last_seen_at=1))
         await db.flush()
         switch = (await materialize_ufanet_skuds(db, connection.id))[0]
-        assert switch.enabled == 0
-        switch.enabled = 1
+        assert switch.enabled == 1
         switch_id = switch.id
         connection_id = connection.id
         await db.commit()

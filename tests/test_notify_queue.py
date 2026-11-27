@@ -145,15 +145,25 @@ async def test_concurrent_claim_single_winner(file_sm):
     assert won[0].state == "sending"
 
 
-async def test_partial_delivery_is_not_repeated(sessionmaker_, mk_user, monkeypatch):
+async def test_partial_delivery_is_not_repeated(sessionmaker_, mk_user, mk_cam, monkeypatch):
     """One recipient accepted, one did not: the retry goes only to the one who missed it."""
+    from app.models.invitation import Invitation
+    from app.models.push_settings import PushSettings
     from app.services import notify_worker
 
     ok_id = await mk_user("ok@x.io")
     miss_id = await mk_user("miss@x.io")
+    cam_id = await mk_cam(ok_id)
     async with sessionmaker_() as db:
+        db.add(Invitation(device_type="cams", device_id=cam_id, email="miss@x.io",
+                          status="accepted", invited_by=ok_id, added_at=1))
+        for uid in (ok_id, miss_id):
+            db.add(PushSettings(
+                id=uid, user_id=uid, device_type="cams", device_id=cam_id,
+                motion_detection_enabled=1, created_at=1, updated_at=1,
+            ))
         job = NotificationJob(
-            kind="motion", device_type="cams", device_id=1, message="person",
+            kind="motion", device_type="cams", device_id=cam_id, message="person",
             payload={"object_type": "person", "user_ids": [ok_id, miss_id]},
             state="pending", attempts=0, available_at=1_000, created_at=1_000, updated_at=1_000,
         )

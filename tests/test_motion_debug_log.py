@@ -1,5 +1,6 @@
 """MOTION_DEBUG_LOG: one INFO line per inference with the raw YOLO detections and the verdict."""
 import logging
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -39,7 +40,7 @@ class _Model:
 
 def _session(**kw):
     ps = dict(user_id=1, motion_detect_person=1, motion_detect_dog=1, motion_detect_cat=1, motion_detect_car=1,
-              motion_min_confidence=0.6, motion_min_object_size=0.02, motion_cooldown_seconds=0,
+              motion_min_confidence=0.6, motion_min_object_size=0.02,
               motion_license_plate_ocr=0)
     ps.update(kw)
     cam = SimpleNamespace(id=7, name="c", proto="rtsp", username="u", password="p", addr="x", port=554, path="/")
@@ -48,6 +49,7 @@ def _session(**kw):
 
     async def save(*args):
         session.saved.append(args)
+        return True
 
     session._save_and_notify = save
     return session
@@ -110,12 +112,13 @@ async def test_flag_on_tracker_and_event(caplog, monkeypatch):
 
 async def test_flag_on_cooldown(caplog, monkeypatch):
     monkeypatch.setattr(settings, "MOTION_DEBUG_LOG", True)
-    s = _session(motion_cooldown_seconds=60)
-    s.last_notification_time[(1, "person")] = 1000.0
+    monkeypatch.setattr(settings, "MOTION_COOLDOWN_SECONDS", 60)
+    s = _session()
+    s._last_event_at = time.monotonic()
     with caplog.at_level(logging.INFO, logger=LOGGER):
         await s._process_frame(FRAME, _Model(_box(0, 0.9, (0, 0, 200, 100))), 1, 1000.0)
         await s._process_frame(FRAME, _Model(_box(0, 0.9, (60, 0, 260, 100))), 2, 1001.0)
-    assert "no_event: cooldown (person)" in _lines(caplog)[-1]
+    assert "no_event: cooldown" in _lines(caplog)[-1]
     assert not s.saved
 
 

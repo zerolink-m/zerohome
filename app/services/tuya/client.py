@@ -27,6 +27,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 
+from app.schemas.connection import TUYA_ENDPOINTS
 from app.services.tuya.constants import _CONFIRM_BACKOFF_MS, _DEFAULT_TIMEOUT, _LOGGER, _MAX_RETRIES, _RETRYABLE_CODES, _TOKEN_INVALID_CODES
 from app.services.tuya.errors import TuyaError, _exception_for
 from app.services.tuya.models import DPValue, Device, Function, FunctionValues, HomeInfo, LogEntry, Specifications, StreamURL, WebRTCConfig
@@ -64,6 +65,7 @@ class TuyaCloudClient:
 
         # Strip scheme if the caller accidentally passed a URL.
         endpoint = endpoint.replace("https://", "").replace("http://", "").strip("/")
+        endpoint = TUYA_ENDPOINTS.get(endpoint, endpoint)
 
         self._access_id = access_id
         self._access_secret = access_secret
@@ -375,8 +377,17 @@ class TuyaCloudClient:
         # Tuya returns either a bare list or an object with ``devices`` + ``last_row_key``.
         if isinstance(result, list):
             return [Device.model_validate(d) for d in result], None
-        devices = [Device.model_validate(d) for d in (result or {}).get("devices", [])]
-        return devices, (result or {}).get("last_row_key")
+        if not isinstance(result, dict) or not isinstance(result.get("devices"), list):
+            raise TuyaError("Incomplete Tuya device catalog")
+        next_cursor = result.get("last_row_key")
+        if next_cursor is not None and not isinstance(next_cursor, str):
+            raise TuyaError("Invalid Tuya catalog cursor")
+        has_more = result.get("has_more")
+        if has_more is True and not next_cursor:
+            raise TuyaError("Missing Tuya catalog cursor")
+        if has_more is False:
+            next_cursor = None
+        return [Device.model_validate(d) for d in result["devices"]], next_cursor
 
     async def get_device_status(self, device_id: str) -> list[DPValue]:
         """Return the current DP status list.

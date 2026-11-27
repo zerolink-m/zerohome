@@ -223,21 +223,28 @@ def _http(monkeypatch, recorder):
 
 
 async def test_notification_waits_while_uploading_then_sends_photo(
-    sessionmaker_, monkeypatch, mk_user,
+    sessionmaker_, monkeypatch, mk_user, mk_cam,
 ):
+    from app.models.push_settings import PushSettings
+
     owner = await mk_user("push@x.io")
+    cam_id = await mk_cam(owner)
     async with sessionmaker_() as db:
         user = await db.get(User, owner)
         user.push = "telegram"
         user.pushmeta = {"telegram": {"bot_token": "123456:SECRET-TOKEN", "telegram_id": 7}}
+        db.add(PushSettings(
+            id=1, user_id=owner, device_type="cams", device_id=cam_id,
+            motion_detection_enabled=1, created_at=1, updated_at=1,
+        ))
         event = MotionEvent(
-            cam_id=1, detected_at=1_000, object_type="person", confidence=0.8,
+            cam_id=cam_id, detected_at=1_000, object_type="person", confidence=0.8,
             object_size=0.1, photo_filename="a.jpg", photo_key="motion/1/a.jpg",
             photo_state="uploading",
         )
         db.add(event)
         job = NotificationJob(
-            kind="motion", device_type="cams", device_id=1, message="person on cam",
+            kind="motion", device_type="cams", device_id=cam_id, message="person on cam",
             photo_key="motion/1/a.jpg", payload={"object_type": "person", "user_ids": [owner]},
             state="pending", attempts=0, available_at=1_000, created_at=1_000, updated_at=1_000,
         )

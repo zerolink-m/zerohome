@@ -8,9 +8,7 @@ from app.core.config import settings
 from app.core.rate_limit import PointBudget
 from app.db.session import get_db
 from app.core.errors import AppError
-from app.models.cams import Cam
 from app.services import webrtc_manager
-from app.services.cluster import view_proxy
 from app.services.cluster.identity import worker_enabled
 
 from app.routers.cams._common import _get_cam_for_access, router
@@ -52,49 +50,28 @@ async def webrtc_stream(
         await websocket.close(code=1008, reason="WebRTC стриминг отключен")
         return
 
-    # A trusted internal hop was already authorized by the receiving node.
-    # Clustering off never sets this (trusted_proxied is false), so the auth
-    # block below is exactly the previous behavior.
-    if view_proxy.trusted_proxied(websocket):
-        cam = await db.get(Cam, id)
-        if cam is None:
-            await websocket.close(code=1008, reason="Нет доступа к камере")
-            return
-    else:
-        # Auth + camera access: same rules as stream/ptz (owner/admin/invited, or a
-        # matching 'stream' share token) via the shared helpers.
-        from app.deps.auth import extract_token_flexible, authorize_device_token
+    from app.deps.auth import authorize_device_token, extract_token_flexible
 
-        try:
-            raw = extract_token_flexible(None, token)
-            ctx = await authorize_device_token(raw, "cams", "stream", id, db,
-                                               websocket.headers.get("user-agent", ""))
-            cam = await _get_cam_for_access(id, ctx, db)
-        except AppError as e:
-            print(f"[WebRTC] Access denied: {e}")
-            await websocket.close(code=1008, reason="Нет доступа к камере")
-            return
-        except Exception as e:
-            print(f"[WebRTC] Auth error: {e}")
-            await websocket.close(code=1008, reason="Ошибка авторизации")
-            return
+    try:
+        raw = extract_token_flexible(None, token)
+        ctx = await authorize_device_token(raw, "cams", "stream", id, db,
+                                           websocket.headers.get("user-agent", ""))
+        cam = await _get_cam_for_access(id, ctx, db)
+    except AppError as e:
+        print(f"[WebRTC] Access denied: {e}")
+        await websocket.close(code=1008, reason="Нет доступа к камере")
+        return
+    except Exception as e:
+        print(f"[WebRTC] Auth error: {e}")
+        await websocket.close(code=1008, reason="Ошибка авторизации")
+        return
 
-        try:
-            await WEBRTC_BUDGET.charge(websocket, 1)
-        except AppError:
-            await websocket.close(code=1008, reason="Слишком много подключений")
-            return
+    try:
+        await WEBRTC_BUDGET.charge(websocket, 1)
+    except AppError:
+        await websocket.close(code=1008, reason="Слишком много подключений")
+        return
 
-        if cam.connection_resource_id is not None:
-            await websocket.close(code=1008, reason="Для облачной камеры доступен HLS")
-            return
-        target = await view_proxy.view_target(db, id)
-        if target is not None:
-            await view_proxy.proxy_websocket(websocket, target)
-            return
-
-    # This node is the actual media/signaling owner (or clustering is off).
-    # Ingress nodes proxy above before consulting their own local capability.
     if cam.connection_resource_id is not None:
         await websocket.close(code=1008, reason="Для облачной камеры доступен HLS")
         return
@@ -104,6 +81,7 @@ async def webrtc_stream(
 
     print(f"[WebRTC] Camera found: {cam.name} ({cam.addr}:{cam.port})")
 
+    # Existing sessions intentionally keep the authorization granted at connection time.
     await websocket.accept()
     print(f"[WebRTC] WebSocket accepted")
 
@@ -170,10 +148,10 @@ async def webrtc_stream(
                     break
 
             elif msg_type == "ice_candidate":
-                candidate = message.get("candidate")
-                if candidate:
-                    print(f"[WebRTC] Received ICE candidate")
-                    await webrtc_manager.add_ice_candidate(session_id, candidate)
+                try:
+                    await webrtc_manager.add_ice_candidate(session_id, message.get("candidate"))
+                except webrtc_manager.WebRTCStreamError as exc:
+                    await websocket.send_json({"type": "error", "message": str(exc)})
 
             else:
                 print(f"[WebRTC] Unknown message type: {msg_type}")

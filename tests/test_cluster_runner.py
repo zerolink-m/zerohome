@@ -776,42 +776,60 @@ async def test_apply_restarts_a_worker_whose_task_died(tmp_path):
         await sup.stop(1)
 
 
-async def test_dead_motion_session_is_started_again():
+async def test_dead_motion_session_is_started_again(sm, monkeypatch):
+    from app.models.cams import Cam
+    from app.models.push_settings import PushSettings
+    from app.models.user import User
     from app.services.motion_detection import manager as md
     from app.services.motion_detection.session import MotionDetectionSession
+
+    async with sm() as db:
+        db.add(User(id=1, name="Owner", surname="Test", email="motion@example.com",
+                    password="hash", motion_detection_allowed=1, added_at=1, updated_at=1))
+        cam = Cam(id=7, ownuser=1, name="camera", enabled=1, proto="rtsp",
+                  addr="192.0.2.1", port=554, path="", username="user", password="secret",
+                  added_at=1, updated_at=1)
+        db.add(cam)
+        db.add(PushSettings(id=1, user_id=1, device_type="cams", device_id=7,
+                            motion_detection_enabled=1, created_at=1, updated_at=1))
+        await db.commit()
 
     ran = []
     release = asyncio.Event()
 
     async def fake_run(self):
-        ran.append(1)
-        await release.wait()
-        self.is_running = False  # what _run's finally does after retries are exhausted
+        ran.append(self)
+        try:
+            await release.wait()
+        finally:
+            self.is_running = False  # what _run's finally does after retries are exhausted
 
-    session = MotionDetectionSession(type("C", (), {"id": 7})(), [])
-    session.is_running = False
-    session.task = None
-    md._active_sessions[7] = session
-    original = MotionDetectionSession._run
-    MotionDetectionSession._run = fake_run
+    monkeypatch.setattr(md, "AsyncSessionLocal", sm)
+    monkeypatch.setattr(settings, "MOTION_DETECTION_ENABLED", True)
+    monkeypatch.setattr(settings, "_node_capabilities", {"motion": True})
+    monkeypatch.setattr(MotionDetectionSession, "_run", fake_run)
+    dead_session = MotionDetectionSession(cam, [])
+    md._active_sessions[7] = dead_session
     try:
         assert await md.start_motion_detection(7) is True
         await asyncio.sleep(0)
-        assert ran == [1] and session.is_running
+        first_session = md._active_sessions[7]
+        assert first_session is not dead_session
+        assert ran == [first_session] and md.is_motion_detection_active(7)
+        assert [ps.user_id for ps in first_session.user_settings] == [1]
         assert await md.start_motion_detection(7) is True
-        assert ran == [1]  # still alive: not started a second time
-        first = session.task
+        assert md._active_sessions[7] is first_session and ran == [first_session]
+        first = first_session.task
         release.set()
         await asyncio.wait({first}, timeout=1)
-        assert session.is_running is False and first.done()
+        assert first_session.is_running is False and first.done()
+        assert not md.is_motion_detection_active(7)
         release.clear()
-        assert await md.start_motion_detection(7) is True
+        assert await asyncio.gather(md.start_motion_detection(7), md.start_motion_detection(7)) == [True, True]
         await asyncio.sleep(0)
-        assert ran == [1, 1] and session.is_running
+        second_session = md._active_sessions[7]
+        assert second_session is not first_session
+        assert ran == [first_session, second_session] and md.is_motion_detection_active(7)
     finally:
-        MotionDetectionSession._run = original
-        md._active_sessions.pop(7, None)
         release.set()
-        if session.task is not None and not session.task.done():
-            session.task.cancel()
-            await asyncio.wait({session.task}, timeout=1)
+        await md.stop_motion_detection(7)

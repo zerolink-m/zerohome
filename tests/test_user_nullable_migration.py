@@ -17,7 +17,7 @@ MIGRATION_PATH = (
 )
 
 
-def test_revision_follows_runtime_configuration_and_is_the_head():
+def test_revision_follows_runtime_configuration_and_is_in_head_history():
     config = Config()
     config.set_main_option(
         "script_location",
@@ -27,7 +27,15 @@ def test_revision_follows_runtime_configuration_and_is_the_head():
     revision = script.get_revision("48000_user_nullable_settings")
 
     assert revision.down_revision == "47900_runtime_configuration"
-    assert script.get_heads() == ["48300_connection_revision"]
+    assert script.get_heads() == ["48500_motion_cooldown"]
+    descendants = list(script.iterate_revisions("48500_motion_cooldown", revision.revision))
+    assert [item.revision for item in descendants] == [
+        "48500_motion_cooldown",
+        "48400_local_connections",
+        "48300_connection_revision",
+        "48200_camera_resource",
+        "48100_connection_resources",
+    ]
 
 
 def _load_migration():

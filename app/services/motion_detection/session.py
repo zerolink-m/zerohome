@@ -6,7 +6,9 @@ import contextlib
 import logging
 import time
 from datetime import datetime
-from typing import Dict, Optional
+from collections.abc import Awaitable, Callable
+from typing import Optional
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -20,8 +22,8 @@ from app.services.object_tracker import ObjectTracker
 
 logger = logging.getLogger("app.services.motion_detection")
 from app.services.ingest import consumer
-from app.services.motion_detection.yolo import YOLO_CLASSES, _get_yolo_model
-from app.services.rtsp_url import mask_credentials
+from app.services.motion_detection.yolo import YOLO_CLASSES, _get_yolo_model, infer, model_executor
+from app.services.rtsp_url import build_rtsp_url, mask_credentials
 from app.services.webrtc_manager.probe import ProbeError, probe_fmp4
 
 # Owned ffmpeg children of detection sessions (hub decoders and direct RTSP grabbers),
@@ -84,7 +86,9 @@ class MotionDetectionSession:
         self.cam = cam
         self.user_settings = user_settings
         self.tracker = ObjectTracker(max_age=2.0, iou_threshold=0.3)
-        self.last_notification_time: Dict[int, float] = {}  # user_id -> timestamp
+        self._last_event_at: float | None = None
+        self.load_preferences: Callable[[int], Awaitable[list[PushSettings]]] | None = None
+        self._preferences_checked_at = time.monotonic()
         self.is_running = False
         self.task: Optional[asyncio.Task] = None
         self.ffmpeg_process: Optional[asyncio.subprocess.Process] = None  # current frame source
@@ -155,10 +159,20 @@ class MotionDetectionSession:
             self.is_running = False
             logger.debug(f"[Cam {self.cam.id}] Detection loop exited")
 
+    async def _refresh_preferences(self) -> None:
+        if self.load_preferences is not None and time.monotonic() - self._preferences_checked_at >= 5:
+            self.user_settings = await self.load_preferences(self.cam.id)
+            self._preferences_checked_at = time.monotonic()
+            if not self.user_settings:
+                self.is_running = False
+
     async def _run_once(self) -> int:
         """One frame source from start to end; returns how many frames it decoded."""
+        await self._refresh_preferences()
+        if not self.is_running:
+            return 0
         # the model is loaded before any pipe is opened (loading takes seconds)
-        model = await asyncio.to_thread(_get_yolo_model)
+        model = await asyncio.get_running_loop().run_in_executor(model_executor, _get_yolo_model)
         hub = await consumer.ready_hub(self.cam.id, settings.INGEST_HUB_WAIT_SECONDS)
         if hub is not None:
             try:
@@ -211,9 +225,8 @@ class MotionDetectionSession:
         tasks: list[asyncio.Task] = []
         frames = 0
         try:
-            # Build RTSP URL
-            rtsp_url = f"{self.cam.proto}://{self.cam.username}:{self.cam.password}@{self.cam.addr}:{self.cam.port}{self.cam.path}"
-            logger.debug(f"[Cam {self.cam.id}] Connecting to RTSP: {self.cam.proto}://{self.cam.addr}:{self.cam.port}{self.cam.path}")
+            rtsp_url = build_rtsp_url(self.cam)
+            logger.debug("[Cam %s] Connecting to RTSP: %s", self.cam.id, mask_credentials(rtsp_url))
 
             # Use ffprobe to detect resolution
             probe_cmd = [
@@ -235,9 +248,12 @@ class MotionDetectionSession:
             )
             try:
                 stdout, stderr = await asyncio.wait_for(probe_proc.communicate(), timeout=10.0)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
                 with contextlib.suppress(ProcessLookupError):
                     probe_proc.kill()
+                await probe_proc.communicate()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
                 logger.error(f"[Cam {self.cam.id}] Timeout while probing stream")
                 return 0
 
@@ -280,7 +296,14 @@ class MotionDetectionSession:
                 try:
                     # readexactly: a plain read(n) returns whatever the pipe holds (a few
                     # hundred KB), i.e. a "truncated" frame for any real resolution
-                    raw_frame = await owned.process.stdout.readexactly(frame_size)
+                    raw_frame = await asyncio.wait_for(
+                        owned.process.stdout.readexactly(frame_size),
+                        timeout=(settings.INGEST_MOTION_FIRST_FRAME_TIMEOUT_SECONDS if frame_count == 0
+                                 else settings.INGEST_MOTION_STALL_SECONDS),
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[Cam %s] Direct RTSP frame timeout", self.cam.id)
+                    break
                 except asyncio.IncompleteReadError as exc:
                     if exc.partial:
                         logger.warning(f"[Cam {self.cam.id}] Incomplete frame (got {len(exc.partial)}/{frame_size} bytes)")
@@ -435,10 +458,17 @@ class MotionDetectionSession:
 
     async def _process_frame(self, frame: np.ndarray, model, frame_count: int, frame_ts: float | None = None):
         """Process a single frame. `frame_ts`: its capture time (default: now); frames that
-        come in bursts from the hub carry estimated times so the tracker, the cooldown and
-        the event time are not skewed by delivery."""
+        come in bursts from the hub carry estimated times for tracking and event timestamps."""
         if frame_ts is None:
             frame_ts = time.time()
+        if self.load_preferences is not None:
+            await self._refresh_preferences()
+            if not self.is_running:
+                return
+        if not self._check_cooldown():
+            if settings.MOTION_DEBUG_LOG:
+                self._log_frame_debug(frame, frame_count, 0.0, [], "no_event: cooldown", 0)
+            return
         # MOTION_DEBUG_LOG: one INFO line per inference (see _log_frame_debug); nothing is
         # collected or formatted when the switch is off.
         trace: list | None = [] if settings.MOTION_DEBUG_LOG else None
@@ -451,7 +481,7 @@ class MotionDetectionSession:
             logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Running YOLO inference...")
             if trace is not None:
                 _t0 = time.perf_counter()
-            results = model(frame, verbose=False)[0]
+            results = await asyncio.get_running_loop().run_in_executor(model_executor, infer, model, frame)
             if trace is not None:
                 infer_ms = (time.perf_counter() - _t0) * 1000
 
@@ -532,23 +562,22 @@ class MotionDetectionSession:
             for tracked_obj in moving_objects:
                 logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Processing tracked {tracked_obj.object_type} (id={tracked_obj.object_id}, age={tracked_obj.age:.1f}s)")
 
-                # Check cooldown
-                if not self._check_cooldown(tracked_obj.object_type, frame_ts):
-                    logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: {tracked_obj.object_type} in cooldown, skipping notification")
-                    verdict[0] = f"no_event: cooldown ({tracked_obj.object_type})"
-                    continue
-
                 # Get latest bbox and confidence
                 bbox = tracked_obj.get_latest_bbox()
                 confidence = tracked_obj.get_average_confidence()
                 x, y, w, h = bbox
                 obj_size = (w * h) / (frame.shape[0] * frame.shape[1])
 
-                logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: {tracked_obj.object_type} passed cooldown, avg_conf={confidence:.2f}")
+                logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: {tracked_obj.object_type} tracked, avg_conf={confidence:.2f}")
+
+                matching = self._matching_preferences(tracked_obj.object_type, confidence, obj_size)
+                if not matching:
+                    verdict[0] = "no_event: no matching detection settings"
+                    continue
 
                 # Extract license plate if it's a car
                 license_plate = None
-                if tracked_obj.object_type == 'car' and self._should_detect_license_plate():
+                if tracked_obj.object_type == "car" and any(ps.motion_license_plate_ocr for ps in matching):
                     logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Running OCR for car license plate...")
                     license_plate = await asyncio.to_thread(
                         license_plate_ocr.extract_license_plate,
@@ -562,7 +591,7 @@ class MotionDetectionSession:
 
                 # Save event and notify
                 logger.debug(f"[Cam {self.cam.id}] Frame #{frame_count}: Saving event and notifying users...")
-                await self._save_and_notify(
+                saved = await self._save_and_notify(
                     frame,
                     tracked_obj.object_type,
                     bbox,
@@ -571,8 +600,12 @@ class MotionDetectionSession:
                     license_plate,
                     frame_ts,
                 )
-                events += 1  # the save was attempted (a DB/disk failure is logged by _save_and_notify)
-                verdict[0] = ""
+                if saved:
+                    events += 1
+                    verdict[0] = ""
+                    self._last_event_at = time.monotonic()
+                    if not self._check_cooldown():
+                        break
 
         except Exception as exc:
             verdict[0] = f"no_event: error {exc!r}"
@@ -600,9 +633,13 @@ class MotionDetectionSession:
         field_name = f"motion_detect_{object_type}"
         return any(getattr(ps, field_name, 0) == 1 for ps in self.user_settings)
 
-    def _should_detect_license_plate(self) -> bool:
-        """Check if any user wants license plate OCR."""
-        return any(ps.motion_license_plate_ocr == 1 for ps in self.user_settings)
+    def _matching_preferences(self, object_type: str, confidence: float, size: float) -> list[PushSettings]:
+        return [
+            ps for ps in self.user_settings
+            if getattr(ps, f"motion_detect_{object_type}", 0) == 1
+            and confidence >= ps.motion_min_confidence
+            and size >= ps.motion_min_object_size
+        ]
 
     def _get_min_confidence(self) -> float:
         """Get minimum confidence from user settings."""
@@ -614,22 +651,11 @@ class MotionDetectionSession:
         sizes = [ps.motion_min_object_size for ps in self.user_settings]
         return min(sizes) if sizes else 0.02
 
-    def _check_cooldown(self, object_type: str, now: float | None = None) -> bool:
-        """Check cooldown for notifications."""
-        current_time = time.time() if now is None else now
-
-        # Check each user's cooldown
-        for ps in self.user_settings:
-            if ps.motion_cooldown_seconds == 0:
-                continue
-
-            key = (ps.user_id, object_type)
-            last_time = self.last_notification_time.get(key, 0)
-
-            if current_time - last_time < ps.motion_cooldown_seconds:
-                return False
-
-        return True
+    def _check_cooldown(self) -> bool:
+        return (
+            self._last_event_at is None
+            or time.monotonic() - self._last_event_at >= settings.MOTION_COOLDOWN_SECONDS
+        )
 
     def _motion_message(self, object_type: str, detected_at: int, confidence: float,
                         license_plate: Optional[str]) -> str:
@@ -654,13 +680,14 @@ class MotionDetectionSession:
         object_size: float,
         license_plate: Optional[str],
         frame_ts: float | None = None,
-    ):
-        """Save event to database and queue a notification in the same transaction."""
+    ) -> bool:
+        """Save a detection and enqueue push for users whose filters match."""
+
         try:
             if frame_ts is None:
                 frame_ts = time.time()
             timestamp = int(frame_ts)
-            filename = f"{timestamp}_{object_type}_{int(confidence * 100)}.jpg"
+            filename = f"{timestamp}_{object_type}_{uuid4().hex}.jpg"
             logger.debug(
                 f"[Cam {self.cam.id}] Saving event: {object_type} conf={confidence:.2f} size={object_size:.4f}"
             )
@@ -678,7 +705,7 @@ class MotionDetectionSession:
             jpeg = await asyncio.to_thread(_encode, frame_copy)
             if not jpeg:
                 logger.error(f"[Cam {self.cam.id}] Failed to encode motion photo")
-                return
+                return False
 
             message = self._motion_message(object_type, timestamp, confidence, license_plate)
             event_id = await save_motion_event_and_photo(
@@ -690,17 +717,17 @@ class MotionDetectionSession:
                 license_plate=license_plate,
                 photo_filename=filename,
                 bbox=bbox,
-                notified_user_ids=[ps.user_id for ps in self.user_settings],
+                notified_user_ids=[
+                    ps.user_id for ps in self._matching_preferences(object_type, confidence, object_size)
+                    if ps.enabled == 1
+                ],
                 message=message,
                 jpeg=jpeg,
             )
             logger.debug(f"[Cam {self.cam.id}] Event saved (id={event_id})")
 
-            # Cooldown decides whether the next frame creates an event; unchanged.
-            for ps in self.user_settings:
-                key = (ps.user_id, object_type)
-                self.last_notification_time[key] = frame_ts
-                logger.debug(f"[Cam {self.cam.id}] Updated cooldown for user_id={ps.user_id}, {object_type}")
+            return True
 
-        except Exception as exc:
-            logger.error(f"[Cam {self.cam.id}] Error saving/notifying event: {exc}", exc_info=True)
+        except Exception:
+            logger.exception("[Cam %s] Error saving or notifying motion event", self.cam.id)
+            return False

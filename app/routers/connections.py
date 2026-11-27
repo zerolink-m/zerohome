@@ -52,7 +52,7 @@ from app.schemas.connection import (
     _validate_ufanet_meta,
     redact_meta,
 )
-from app.services import connection_sync, tuya_client_pool
+from app.services import connection_sync, tuya_client_pool, tuya_events
 
 router = APIRouter(prefix="/v1/connections", tags=["connections"])
 
@@ -217,8 +217,8 @@ def _apply_patch(conn: Connection, fields: dict, payload: TokenPayload) -> tuple
         setattr(conn, key, value)
     if changed:
         conn.updated_at = int(time.time())
-        if conn.provider == "ufanet-smart-home":
-            conn.sync_revision += 1
+        conn.sync_revision += 1
+        if should_resync or conn.provider == "ufanet-smart-home":
             conn.status = "unknown"
             conn.last_checked_at = None
             conn.last_synced_at = None
@@ -227,34 +227,22 @@ def _apply_patch(conn: Connection, fields: dict, payload: TokenPayload) -> tuple
 
 
 async def _evict_pool(old_meta: dict, new_meta: dict | None) -> None:
-    """Evict the pooled TuyaCloudClient keyed on the pre-patch credentials so a
-    rotated access_secret (or changed endpoint) takes effect immediately
-    instead of after the cached token's ~2h TTL. Also evict the new key in
-    case only the secret changed (same access_id+endpoint key) — that key is
-    unchanged but its client still holds the old secret."""
+    """Close the old client when this connection replaces its credentials."""
     if new_meta is None:
         return
-    old_access_id = old_meta.get("access_id")
-    old_endpoint = old_meta.get("endpoint")
-    if isinstance(old_access_id, str) and isinstance(old_endpoint, str):
-        await tuya_client_pool.invalidate(old_access_id, old_endpoint)
-    new_access_id = new_meta.get("access_id")
-    new_endpoint = new_meta.get("endpoint")
-    if (
-        isinstance(new_access_id, str)
-        and isinstance(new_endpoint, str)
-        and (new_access_id, new_endpoint) != (old_access_id, old_endpoint)
-    ):
-        await tuya_client_pool.invalidate(new_access_id, new_endpoint)
+    fields = ("access_id", "endpoint", "access_secret")
+    old_key = tuple(old_meta.get(key) for key in fields)
+    if old_key != tuple(new_meta.get(key) for key in fields):
+        await _evict_deleted(old_key)
 
 
 async def _delete_conn_row(conn: Connection, payload: TokenPayload, db: AsyncSession) -> tuple | None:
-    """Permission checks + deletion (no commit). Returns (access_id, endpoint) for pool eviction."""
+    """Permission checks + deletion (no commit). Returns credentials for pool eviction."""
     if not _can_manage(conn, payload):
         raise AppError(FORBIDDEN_RESOURCE, "Удаление соединения доступно только владельцу или admin")
 
     del_meta = conn.meta or {}
-    key = (del_meta.get("access_id"), del_meta.get("endpoint"))
+    key = (del_meta.get("access_id"), del_meta.get("endpoint"), del_meta.get("access_secret"))
 
     await _delete_connection_devices(conn, db)
     await db.delete(conn)
@@ -303,8 +291,8 @@ async def _delete_connection_devices(conn: Connection, db: AsyncSession) -> None
 
 async def _evict_deleted(key: tuple | None) -> None:
     # evict the cached client after the row is gone so we don't leak an httpx pool
-    if key and isinstance(key[0], str) and isinstance(key[1], str):
-        await tuya_client_pool.invalidate(key[0], key[1])
+    if key and all(isinstance(part, str) for part in key):
+        await tuya_client_pool.invalidate(*key)
 
 
 # --- list / get ----------------------------------------------------------------
@@ -368,6 +356,7 @@ async def create_connection(
     db.add(conn)
     await db.commit()
 
+    tuya_events.request_refresh()
     if conn.enabled == 1:
         await _sync_quietly(conn, db)
     else:
@@ -391,6 +380,7 @@ async def create_connections_bulk(
     if not rows:
         return bulk("connections", [], failed, op="create", partial=False)
     await db.commit()
+    tuya_events.request_refresh()
     for row in rows:
         if row.enabled == 1:
             await _sync_quietly(row, db)
@@ -441,6 +431,7 @@ async def patch_connections_bulk(
         await db.rollback()
         return bulk("connections", [], failed, op="edit", partial=False)
     await db.commit()
+    tuya_events.request_refresh()
     for conn, resync, old_meta, fields in done:
         await _evict_pool(old_meta, fields.get("meta"))
         if resync and conn.enabled == 1:
@@ -466,6 +457,7 @@ async def patch_connection(
         should_resync = True
     await db.commit()
 
+    tuya_events.request_refresh()
     await _evict_pool(old_meta, fields.get("meta"))
 
     if should_resync and conn.enabled == 1:
@@ -507,6 +499,7 @@ async def delete_connections_bulk(
         await db.rollback()
         return bulk("connections", [], failed, op="delete", partial=False)
     await db.commit()
+    tuya_events.request_refresh()
     for key in keys:
         await _evict_deleted(key)
     return bulk("connections", succeeded, failed, op="delete", partial=options.partial_allowed)
@@ -524,6 +517,7 @@ async def delete_connection(
     conn = await _get_visible_connection(connection_id, payload, db, for_update=True)
     key = await _delete_conn_row(conn, payload, db)
     await db.commit()
+    tuya_events.request_refresh()
     await _evict_deleted(key)
     return deleted("connection", {"id": connection_id})
 

@@ -194,22 +194,36 @@ async def fail(db: AsyncSession, job: NotificationJob, now: int, max_attempts: i
     return False
 
 
-async def defer(db: AsyncSession, job: NotificationJob, now: int, delay: int) -> bool:
-    """Put the job back without counting the claim as a failed send (photo still uploading).
-
-    attempts is undone and the generation is cleared, so the claimer cannot complete it later.
-    """
+async def renew_claim(db: AsyncSession, job: NotificationJob, now: int, lease_seconds: int) -> bool:
+    """Extend the current generation while a lengthy delivery is in progress."""
     res = await db.execute(
         update(NotificationJob)
-        .where(*_owned(job))
-        .values(
-            state="pending",
-            available_at=now + delay,
-            attempts=max(0, int(job.attempts) - 1),
-            claimed_by=None,
-            claimed_generation=None,
-            updated_at=now,
-        ),
+        .where(*_owned(job), NotificationJob.available_at > now)
+        .values(available_at=now + lease_seconds, updated_at=now),
+        execution_options=_NO_MATCH,
+    )
+    if res.rowcount == 1:
+        await db.commit()
+        return True
+    await db.rollback()
+    return False
+
+
+async def defer(db: AsyncSession, job: NotificationJob, now: int, delay: int,
+                delivered: list[int] | None = None) -> bool:
+    """Return a deferred or interrupted claim to the queue, preserving delivery progress."""
+    values = dict(
+        state="pending",
+        available_at=now + delay,
+        attempts=max(0, int(job.attempts) - 1),
+        claimed_by=None,
+        claimed_generation=None,
+        updated_at=now,
+    )
+    if delivered:
+        values["payload"] = _merge_delivered(job.payload, delivered)
+    res = await db.execute(
+        update(NotificationJob).where(*_owned(job)).values(**values),
         execution_options=_NO_MATCH,
     )
     if res.rowcount == 1:

@@ -14,7 +14,6 @@ class PushSettingsBase(BaseModel):
     motion_detection_enabled: int = Field(0, ge=0, le=1)
     motion_min_confidence: float = Field(0.6, ge=0.0, le=1.0)
     motion_min_object_size: float = Field(0.02, ge=0.0, le=1.0)
-    motion_cooldown_seconds: int = Field(0, ge=0)
     motion_detect_person: int = Field(1, ge=0, le=1)
     motion_detect_dog: int = Field(1, ge=0, le=1)
     motion_detect_cat: int = Field(1, ge=0, le=1)
@@ -34,7 +33,7 @@ class PushSettingsUpdate(NonNullablePatch):
 
     non_nullable = (
         "enabled", "motion_detection_enabled", "motion_min_confidence", "motion_min_object_size",
-        "motion_cooldown_seconds", "motion_detect_person", "motion_detect_dog", "motion_detect_cat",
+        "motion_detect_person", "motion_detect_dog", "motion_detect_cat",
         "motion_detect_car", "motion_license_plate_ocr", "notify_offline", "notify_online",
         "notify_state_change",
     )
@@ -44,7 +43,6 @@ class PushSettingsUpdate(NonNullablePatch):
     motion_detection_enabled: int | None = Field(None, ge=0, le=1)
     motion_min_confidence: float | None = Field(None, ge=0.0, le=1.0)
     motion_min_object_size: float | None = Field(None, ge=0.0, le=1.0)
-    motion_cooldown_seconds: int | None = Field(None, ge=0)
     motion_detect_person: int | None = Field(None, ge=0, le=1)
     motion_detect_dog: int | None = Field(None, ge=0, le=1)
     motion_detect_cat: int | None = Field(None, ge=0, le=1)

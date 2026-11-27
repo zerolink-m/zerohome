@@ -4,8 +4,29 @@ import sys
 from app.core.config import settings
 
 
+class _StripUvicornQuery(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple):
+            return True
+        if record.name == "uvicorn.access" and len(args) == 5:
+            path = args[2]
+            if isinstance(path, str):
+                record.args = (*args[:2], path.partition("?")[0], *args[3:])
+        elif record.name == "uvicorn.error" and isinstance(record.msg, str) and '"WebSocket %s"' in record.msg:
+            if len(args) >= 2 and isinstance(args[1], str):
+                record.args = (args[0], args[1].partition("?")[0], *args[2:])
+        return True
+
+
+_strip_uvicorn_query = _StripUvicornQuery()
+
+
 def setup_logging():
     """Configure logging based on LOGGING_LEVEL and LOGGING_SCOPE settings."""
+
+    for name in ("uvicorn.access", "uvicorn.error"):
+        logging.getLogger(name).addFilter(_strip_uvicorn_query)
 
     # Parse logging level
     level_map = {

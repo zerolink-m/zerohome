@@ -2,125 +2,109 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import time
-from datetime import datetime
-from typing import Dict, Optional
+from weakref import WeakValueDictionary
 
-import cv2
-import numpy as np
+from sqlalchemy import func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.models.cams import Cam
-from app.models.motion_event import MotionEvent
+from app.models.invitation import Invitation
 from app.models.push_settings import PushSettings
 from app.models.user import User
-from app.services import license_plate_ocr, push
-from app.services.object_tracker import ObjectTracker
 from app.services.cluster.identity import worker_enabled
-
-logger = logging.getLogger("app.services.motion_detection")
 from app.services.motion_detection.session import MotionDetectionSession, pool as process_pool
 
+logger = logging.getLogger("app.services.motion_detection")
 
-_active_sessions: Dict[int, 'MotionDetectionSession'] = {}
+_active_sessions: dict[int, MotionDetectionSession] = {}
+_camera_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
 _STOP_ALL_TIMEOUT_SECONDS = 8.0
 
 
+def _lock(cam_id: int) -> asyncio.Lock:
+    return _camera_locks.setdefault(cam_id, asyncio.Lock())
+
+
+def eligible_preferences():
+    """Motion preferences of users who currently have access to a camera."""
+    invitation = select(Invitation.id).where(
+        Invitation.device_type == "cams",
+        Invitation.device_id == Cam.id,
+        Invitation.status == "accepted",
+        func.lower(Invitation.email) == func.lower(User.email),
+    ).correlate(Cam, User).exists()
+    return (
+        select(PushSettings)
+        .select_from(Cam)
+        .join(PushSettings, PushSettings.device_id == Cam.id)
+        .join(User, User.id == PushSettings.user_id)
+        .where(
+            PushSettings.device_type == "cams",
+            PushSettings.motion_detection_enabled == 1,
+            or_(User.id == Cam.ownuser, User.role == "admin", invitation),
+        )
+    )
+
+
+async def _preferences(db: AsyncSession, cam_id: int) -> tuple[Cam | None, list[PushSettings]]:
+    cam = await db.get(Cam, cam_id)
+    if cam is None or cam.enabled != 1 or cam.connection_resource_id is not None:
+        return None, []
+    owner = await db.get(User, cam.ownuser)
+    if owner is None or owner.motion_detection_allowed != 1:
+        return None, []
+    return cam, list((await db.scalars(eligible_preferences().where(Cam.id == cam_id))).all())
+
+
+async def _refresh_preferences(cam_id: int) -> list[PushSettings]:
+    async with AsyncSessionLocal() as db:
+        _, preferences = await _preferences(db, cam_id)
+        return preferences
+
+
 async def start_motion_detection(cam_id: int) -> bool:
-    """Start motion detection for a camera."""
-    # Central gate: startup, explicit API starts and future camera/settings hooks
-    # all pass here. Do not touch the DB, model or ffmpeg while disabled.
+    """Start motion detection for a camera, serializing starts and stops."""
     if not worker_enabled(settings, "motion"):
         return False
-    logger.debug(f"[Cam {cam_id}] start_motion_detection() called")
 
-    existing = _active_sessions.get(cam_id)
-    if existing is not None:
-        task = existing.task
-        alive = existing.is_running and task is not None and not task.done()
-        if alive:
-            logger.info(f"[Cam {cam_id}] Motion detection already running")
+    async with _lock(cam_id):
+        if is_motion_detection_active(cam_id):
             return True
-        # Retries exhausted: the session stays in the map with is_running False.
-        # Starting it again is the only way the next call does not return True and do nothing.
-        logger.info(f"[Cam {cam_id}] Motion detection session is not running, starting again")
-        await existing.start()
-        return bool(existing.is_running)
-
-    try:
-        async with AsyncSessionLocal() as db:
-            # Get camera
-            cam = await db.get(Cam, cam_id)
-            if not cam:
-                logger.warning(f"[Cam {cam_id}] Camera not found in database")
+        try:
+            async with AsyncSessionLocal() as db:
+                cam, preferences = await _preferences(db, cam_id)
+            if cam is None or not preferences:
                 return False
-
-            if cam.enabled != 1:
-                logger.warning(f"[Cam {cam_id}] Camera is disabled (enabled={cam.enabled})")
-                return False
-            if cam.connection_resource_id is not None:
-                logger.info(f"[Cam {cam_id}] Cloud camera is not supported by local motion detection")
-                return False
-
-            logger.debug(f"[Cam {cam_id}] Camera found: {cam.name} at {cam.addr}:{cam.port}")
-
-            # Get all users with motion detection enabled for this camera
-            from sqlalchemy import select
-            stmt = select(PushSettings).where(
-                PushSettings.device_type == "cams",
-                PushSettings.device_id == cam_id,
-                PushSettings.motion_detection_enabled == 1,
-            )
-            result = await db.execute(stmt)
-            user_settings = result.scalars().all()
-
-            if not user_settings:
-                logger.info(f"[Cam {cam_id}] No users have motion_detection_enabled=1 for this camera")
-                return False
-
-            logger.debug(f"[Cam {cam_id}] Found {len(user_settings)} user(s) with motion detection enabled")
-            for ps in user_settings:
-                logger.debug(f"[Cam {cam_id}]   - user_id={ps.user_id}: "
-                           f"person={ps.motion_detect_person}, "
-                           f"dog={ps.motion_detect_dog}, "
-                           f"cat={ps.motion_detect_cat}, "
-                           f"car={ps.motion_detect_car}, "
-                           f"min_conf={ps.motion_min_confidence}, "
-                           f"min_size={ps.motion_min_object_size}, "
-                           f"cooldown={ps.motion_cooldown_seconds}s")
-
-            # Create session
-            logger.debug(f"[Cam {cam_id}] Creating MotionDetectionSession...")
-            session = MotionDetectionSession(cam, user_settings)
-            _active_sessions[cam_id] = session
-
-            # Start
-            logger.debug(f"[Cam {cam_id}] Starting session...")
+            previous = _active_sessions.get(cam_id)
+            if previous is not None:
+                await previous.stop()
+            session = MotionDetectionSession(cam, preferences)
+            session.load_preferences = _refresh_preferences
             await session.start()
-            logger.info(f"[Cam {cam_id}] Motion detection started successfully")
+            _active_sessions[cam_id] = session
             return True
-
-    except Exception as exc:
-        logger.error(f"[Cam {cam_id}] Failed to start motion detection: {exc}", exc_info=True)
-        return False
+        except Exception:
+            logger.exception("[Cam %s] Failed to start motion detection", cam_id)
+            return False
 
 
 async def stop_motion_detection(cam_id: int) -> bool:
     """Stop motion detection for a camera."""
-    session = _active_sessions.pop(cam_id, None)
-    if session:
+    async with _lock(cam_id):
+        session = _active_sessions.get(cam_id)
+        if session is None:
+            return False
         await session.stop()
+        _active_sessions.pop(cam_id, None)
         return True
-    return False
 
 
 def is_motion_detection_active(cam_id: int) -> bool:
-    """Check if motion detection is active for a camera."""
-    return cam_id in _active_sessions
+    session = _active_sessions.get(cam_id)
+    return bool(session and session.is_running and session.task is not None and not session.task.done())
 
 
 async def startup() -> None:

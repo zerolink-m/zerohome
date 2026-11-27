@@ -21,7 +21,7 @@ from app.models.cams import Cam
 from app.models.invitation import Invitation
 from app.models.sharing import Sharing
 from app.schemas.cams import CamCreate, CamPatch
-from app.services import hls_manager, notify_queue, onvif_client, stream_manager
+from app.services import hls_manager, motion_lifecycle, notify_queue, onvif_client, stream_manager
 from app.services.ingest import lifecycle as ingest
 
 from app.routers.cams._common import (
@@ -49,19 +49,12 @@ _FIELD_MAPPING = {
 _READ = Depends(rate_limit("cams_read", capacity=60, per_minute=60))
 _WRITE = Depends(rate_limit("cams_write", capacity=20, per_minute=20))
 
-_IMPORTED_CAM_MUTABLE_FIELDS = frozenset({"name", "enabled", "notify"})
+_STREAM_SOURCE_FIELDS = frozenset({"enabled", "protocol", "address", "port", "path", "username", "password"})
 
 
-def _ensure_imported_cam_fields(cam: Cam, fields: set[str]) -> None:
-    """Imported cameras retain user-facing state, while their source stays owned by the connection."""
-    if cam.connection_resource_id is None:
-        return
-    forbidden = fields - _IMPORTED_CAM_MUTABLE_FIELDS
-    if forbidden:
-        raise AppError(
-            CONNECTION_INVALID,
-            "Параметры источника импортированной камеры управляются соединением",
-        )
+def _ensure_imported_cam_read_only(cam: Cam) -> None:
+    if cam.connection_resource_id is not None:
+        raise AppError(CONNECTION_INVALID, "Импортированная камера доступна только для чтения")
 
 
 def _ensure_imported_cam_not_deleted(cam: Cam) -> None:
@@ -94,31 +87,38 @@ def _new_cam(body: CamCreate, uid: int, now: int) -> Cam:
     )
 
 
-def _apply_patch(cam: Cam, body: CamPatch) -> tuple[bool, bool, bool]:
-    """Set the explicitly passed fields. -> (changed, control_touched, notify_enabled)."""
+def _apply_patch(cam: Cam, body: CamPatch) -> tuple[bool, bool, bool, bool]:
+    """Set the explicitly passed fields. -> (changed, control_touched, notify_enabled, source_changed)."""
     data = body.model_dump()
     fields = {key: data[key] for key in body.model_fields_set}
 
     control_touched = any(f in fields for f in CONTROL_FIELDS)
     notify_enabled = fields.get("notify") == 1 and cam.notify != 1
     changed = False
+    source_changed = False
     for key, value in fields.items():
         db_field = _FIELD_MAPPING.get(key, key)
         if getattr(cam, db_field) != value:
             changed = True
+            source_changed |= key in _STREAM_SOURCE_FIELDS
         setattr(cam, db_field, value)
     if fields:
         cam.updated_at = int(time.time())
-    return changed, control_touched, notify_enabled
+    return changed, control_touched, notify_enabled, source_changed
 
 
 def _push_enabled_message(cam: Cam) -> str:
     return f"Push включён для камеры {cam.name or cam.id}"
 
 
-def _after_patch(cam: Cam, control_touched: bool) -> None:
+async def _after_patch(cam: Cam, control_touched: bool, source_changed: bool, fields: set[str]) -> None:
     if control_touched:
         onvif_client.invalidate(cam.id)
+    if source_changed:
+        await stream_manager.stop(cam.id)
+        await hls_manager.stop(cam.id)
+    await ingest.on_cam_saved(cam, fields)
+    await motion_lifecycle.on_cam_saved(cam, fields)
 
 
 async def _delete_cam(cam: Cam, db: AsyncSession) -> None:
@@ -238,7 +238,7 @@ async def patch_cams_bulk(
             failures.append((cam_id, FORBIDDEN_RESOURCE, "Изменение камеры доступно только владельцу или admin"))
         else:
             try:
-                _ensure_imported_cam_fields(cam, set(item.obj.model_fields_set))
+                _ensure_imported_cam_read_only(cam)
             except AppError as exc:
                 failures.append((cam_id, exc.code, exc.message))
             else:
@@ -248,18 +248,17 @@ async def patch_cams_bulk(
     effects = []
     results = []
     for cam, patch in work:
-        _, control_touched, notify_enabled = _apply_patch(cam, patch)
+        _, control_touched, notify_enabled, source_changed = _apply_patch(cam, patch)
         if notify_enabled:
             await notify_queue.enqueue(
                 db, kind="manual", device_type="cams", device_id=cam.id,
                 message=_push_enabled_message(cam),
             )
-        effects.append((cam, control_touched, set(patch.model_fields_set)))
+        effects.append((cam, control_touched, source_changed, set(patch.model_fields_set)))
         results.append(cam)
     await db.commit()
-    for cam, control_touched, touched in effects:
-        _after_patch(cam, control_touched)
-        await ingest.on_cam_saved(cam, touched)
+    for cam, control_touched, source_changed, touched in effects:
+        await _after_patch(cam, control_touched, source_changed, touched)
     return bulk("cams", [_serialize(c, payload) for c in results], _failed(failures), op="edit",
                 partial=body.partial_allowed, all_failed_code=failures[0][1] if failures else VALIDATION_ERROR)
 
@@ -298,6 +297,7 @@ async def delete_cams_bulk(
     await db.commit()
     for cam in work:
         await ingest.on_cam_deleted(cam.id)
+        await motion_lifecycle.on_cam_deleted(cam.id)
     return bulk("cams", [{"id": c.id} for c in work], _failed(failures), op="delete", partial=partial_allowed,
                 all_failed_code=failures[0][1] if failures else VALIDATION_ERROR)
 
@@ -334,17 +334,16 @@ async def patch_cam(
     cam = await _get_visible_cam(id, payload, db)
     if not _can_manage(cam, payload):
         raise AppError(FORBIDDEN_RESOURCE, "Изменение камеры доступно только владельцу или admin")
-    _ensure_imported_cam_fields(cam, set(body.obj.model_fields_set))
+    _ensure_imported_cam_read_only(cam)
 
-    changed, control_touched, notify_enabled = _apply_patch(cam, body.obj)
+    changed, control_touched, notify_enabled, source_changed = _apply_patch(cam, body.obj)
     if notify_enabled:
         await notify_queue.enqueue(
             db, kind="manual", device_type="cams", device_id=cam.id,
             message=_push_enabled_message(cam),
         )
     await db.commit()
-    _after_patch(cam, control_touched)
-    await ingest.on_cam_saved(cam, set(body.obj.model_fields_set))
+    await _after_patch(cam, control_touched, source_changed, set(body.obj.model_fields_set))
     return edited("cam", _serialize(cam, payload), changed=changed)
 
 
@@ -362,6 +361,7 @@ async def delete_cam(
     await _delete_cam(cam, db)
     await db.commit()
     await ingest.on_cam_deleted(id)
+    await motion_lifecycle.on_cam_deleted(id)
     return deleted("cam", {"id": id})
 
 

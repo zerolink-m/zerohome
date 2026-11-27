@@ -9,7 +9,7 @@ message during a restart.
 One `TuyaPulsarConsumer` is started per enabled Tuya `Connection`. The topic
 is per developer-account, so all devices of one account arrive on one stream.
 Consumers whose region is not Pulsar-capable (`us-e`, `eu-w`, `sg` — the
-`TuyaPulsarConsumer` only knows `cn/us/eu/in`) are skipped with a warning;
+`TuyaPulsarConsumer` only knows `cn/us/eu/in`) are skipped;
 those connections rely on polling alone.
 
 Event handling mirrors `switch_sync._sync_one`: on a DP-report we locate the
@@ -43,8 +43,11 @@ _HOST_TO_REGION: dict[str, str] = {host: code for code, host in TUYA_ENDPOINTS.i
 _PULSAR_REGIONS = frozenset({"cn", "us", "eu", "in"})
 
 _task: asyncio.Task | None = None
+_wake = asyncio.Event()
+_RECONCILE_SECONDS = 10
 # connection_id → running consumer task, so we can restart/stop individually.
 _consumers: dict[int, asyncio.Task] = {}
+_consumer_configs: dict[int, tuple[str, str, str]] = {}
 
 
 def _pulsar_region(endpoint: str) -> str | None:
@@ -56,11 +59,23 @@ def _pulsar_region(endpoint: str) -> str | None:
     return None
 
 
+def _consumer_config(conn: Connection) -> tuple[str, str, str] | None:
+    if conn.provider != "tuya_cloud" or not conn.enabled:
+        return None
+    meta = conn.meta or {}
+    access_id, access_secret, endpoint = (meta.get(key) for key in ("access_id", "access_secret", "endpoint"))
+    if not all(isinstance(value, str) and value for value in (access_id, access_secret, endpoint)):
+        return None
+    region = _pulsar_region(endpoint)
+    return (access_id, access_secret, region) if region else None
+
+
 def _switch_label(switch: Switch) -> str:
     return switch.name or str(switch.id)
 
 
-async def _apply_dp_report(conn_id: int, dev_id: str, status: list[dict]) -> None:
+async def _apply_dp_report(conn_id: int, dev_id: str, status: list[dict],
+                           config: tuple[str, str, str] | None = None) -> None:
     """Update Switch rows for one device from a Pulsar DP-report.
 
     A report carries one or more `{code, value}` entries. We update every
@@ -74,12 +89,18 @@ async def _apply_dp_report(conn_id: int, dev_id: str, status: list[dict]) -> Non
         if not isinstance(entry, dict):
             continue
         code = entry.get("code")
-        if isinstance(code, str):
-            changes[code] = bool(entry.get("value"))
+        value = entry.get("value")
+        if isinstance(code, str) and isinstance(value, bool):
+            changes[code] = value
     if not changes:
         return
 
     async with AsyncSessionLocal() as db:
+        conn = await db.get(Connection, conn_id, with_for_update=True)
+        if conn is None or not conn.enabled or conn.provider != "tuya_cloud":
+            return
+        if config is not None and _consumer_config(conn) != config:
+            return
         rows = (
             await db.execute(
                 select(Switch).where(
@@ -152,14 +173,14 @@ async def _apply_dp_report(conn_id: int, dev_id: str, status: list[dict]) -> Non
             )
 
 
-def _make_handler(conn_id: int):
+def _make_handler(conn_id: int, config: tuple[str, str, str]):
     async def _handler(event: dict[str, Any]) -> None:
         dev_id = event.get("devId")
         if not isinstance(dev_id, str) or not dev_id:
             return
         status = event.get("status")
         if isinstance(status, list):
-            await _apply_dp_report(conn_id, dev_id, status)
+            await _apply_dp_report(conn_id, dev_id, status, config)
             return
         # Business lifecycle events (online/offline/nameUpdate/...) — just log
         # for now; polling still catches state, and inventory is refreshed by
@@ -180,7 +201,7 @@ async def _run_consumer(conn_id: int, access_id: str, access_secret: str, region
     # requires them.
     from app.services.tuya import TuyaPulsarConsumer
 
-    handler = _make_handler(conn_id)
+    handler = _make_handler(conn_id, (access_id, access_secret, region))
     while True:
         consumer = None
         try:
@@ -191,6 +212,7 @@ async def _run_consumer(conn_id: int, access_id: str, access_secret: str, region
             )
             logger.info("pulsar consumer starting for connection_id=%s region=%s", conn_id, region)
             await consumer.run(handler)  # blocks until stop()/error
+            await asyncio.sleep(30)
         except asyncio.CancelledError:
             if consumer is not None:
                 await consumer.stop()
@@ -202,37 +224,44 @@ async def _run_consumer(conn_id: int, access_id: str, access_secret: str, region
             await asyncio.sleep(30)
 
 
-async def _supervise() -> None:
-    """Start a consumer per enabled Tuya connection with a Pulsar-capable
-    region. Started once at boot; individual consumers self-heal via their own
-    reconnect loop. Not a periodic reconciler — connection add/remove during
-    runtime is handled by restarting the app or the router hooks (future)."""
+async def _reconcile_consumers() -> None:
     async with AsyncSessionLocal() as db:
         conns = (
-            await db.execute(select(Connection).where(Connection.enabled == 1))
+            await db.execute(select(Connection).where(
+                Connection.enabled == 1, Connection.provider == "tuya_cloud",
+            ))
         ).scalars().all()
 
-    for conn in conns:
-        if conn.provider != "tuya_cloud":
-            continue
-        m = conn.meta or {}
-        access_id = m.get("access_id")
-        access_secret = m.get("access_secret")
-        endpoint = m.get("endpoint")
-        if not (access_id and access_secret and endpoint):
-            continue
-        region = _pulsar_region(endpoint)
-        if region is None:
-            logger.warning(
-                "connection_id=%s endpoint=%s has no Pulsar broker; "
-                "relying on polling only", conn.id, endpoint,
-            )
-            continue
-        if conn.id in _consumers and not _consumers[conn.id].done():
-            continue
-        _consumers[conn.id] = asyncio.create_task(
-            _run_consumer(conn.id, access_id, access_secret, region)
-        )
+    desired = {conn.id: config for conn in conns if (config := _consumer_config(conn)) is not None}
+    for conn_id, task in list(_consumers.items()):
+        if task.done() or _consumer_configs.get(conn_id) != desired.get(conn_id):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            _consumers.pop(conn_id, None)
+            _consumer_configs.pop(conn_id, None)
+
+    for conn_id, config in desired.items():
+        if conn_id not in _consumers:
+            _consumers[conn_id] = asyncio.create_task(_run_consumer(conn_id, *config))
+            _consumer_configs[conn_id] = config
+
+
+async def _supervise() -> None:
+    while True:
+        _wake.clear()
+        try:
+            await _reconcile_consumers()
+        except Exception:
+            logger.exception("Tuya Pulsar subscription refresh failed")
+        try:
+            await asyncio.wait_for(_wake.wait(), timeout=_RECONCILE_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+
+
+def request_refresh() -> None:
+    if _task is not None and not _task.done():
+        _wake.set()
 
 
 def start() -> None:
@@ -250,6 +279,7 @@ async def stop_all() -> None:
     global _task
     tasks = list(_consumers.values())
     _consumers.clear()
+    _consumer_configs.clear()
     if _task is not None and not _task.done():
         tasks.append(_task)
     _task = None

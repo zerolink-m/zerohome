@@ -199,6 +199,7 @@ _NO_CACHE_HEADERS = {
     "Expires": "0",
 }
 
+# Intentionally allow shared caches to reuse media for the full TTL after access changes.
 _LONG_CACHE_SECONDS = 24 * 24 * 60 * 60  # 24 дня
 _LONG_CACHE_HEADERS = {"Cache-Control": f"public, max-age={_LONG_CACHE_SECONDS}"}
 

@@ -5,6 +5,14 @@ from typing import Any, Literal
 from pydantic import Field, model_validator
 
 from app.schemas.base import NonNullablePatch, StrictModel
+from app.schemas.connection import TUYA_ENDPOINTS
+
+
+def tuya_cloud_endpoint(value: str) -> str:
+    endpoint = value.lower().removeprefix("https://").removeprefix("http://").rstrip("/")
+    if endpoint not in TUYA_ENDPOINTS and endpoint not in TUYA_ENDPOINTS.values():
+        raise ValueError("endpoint должен быть адресом OpenAPI Tuya или кодом региона Tuya")
+    return TUYA_ENDPOINTS.get(endpoint, endpoint)
 
 
 class TuyaLocalMeta(StrictModel):
@@ -39,6 +47,7 @@ class TuyaCloudMeta(StrictModel):
 
     @model_validator(mode="after")
     def _validate(self):
+        tuya_cloud_endpoint(self.endpoint)
         if self.dp_codes is not None and self.dp_code is not None:
             raise ValueError("controlmeta: dp_codes и dp_code взаимоисключающи")
         if self.dp_codes is not None:
@@ -130,7 +139,7 @@ class SwitchCreate(StrictModel):
 
 
 class SwitchPatch(NonNullablePatch, StrictModel):
-    non_nullable = ("name", "enabled", "notify")
+    non_nullable = ("name", "enabled", "notify", "control_protocol", "control_metadata")
 
     name: str | None = Field(default=None, max_length=255)
     enabled: Literal[0, 1] | None = None

@@ -82,6 +82,7 @@ def _new_session(user: User, request: Request, now: int, token: str) -> SessionM
 async def register(request: Request,
                    req: SingleBody[RegisterRequest] = Depends(_request_body("user", RegisterRequest)),
                    db: AsyncSession = Depends(get_db)):
+    # Registration intentionally accepts unverified email addresses, including for invitations.
     body = req.obj
     if await db.scalar(select(User.id).where(User.email == body.email)) is not None:
         raise AppError(EMAIL_TAKEN, "Email уже занят")

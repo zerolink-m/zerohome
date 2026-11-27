@@ -29,6 +29,7 @@ def _is_private(ip: str) -> bool:
 
 def resolve_ip(request: Request) -> str:
     peer_ip = request.client.host if request.client else ""
+    # Deployments intentionally trust X-Real-IP from private-network ingress peers.
     if _is_private(peer_ip):
         real_ip = request.headers.get("x-real-ip")
         if real_ip:

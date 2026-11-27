@@ -20,6 +20,7 @@ def legacy_motion_path(cam_id: int, filename: str) -> str:
 def get_storage() -> Storage:
     backend = (settings.STORAGE_BACKEND or "").strip().lower()
     if backend == "local":
+        # Node-local photos are intentional. A cluster that shares photos configures S3.
         return LocalStorage(settings.motion_files_path)
     if backend == "s3":
         missing = [name for name in _S3_REQUIRED if not str(getattr(settings, name) or "").strip()]
