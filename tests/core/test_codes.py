@@ -1,4 +1,5 @@
 import pytest
+from cursedapi.protocols import get_profile
 
 from app.core import codes
 
@@ -37,3 +38,22 @@ def test_custom_codes_in_reserved_ranges():
 
 def test_legacy_aliases():
     assert codes.TOKEN_ERROR == "167" and codes.EMAIL_TAKEN == "115" and codes.LOCKED == "302"
+
+
+def test_zero_home_registry_preserves_codes_for_schema_and_responses():
+    registry = get_profile("1.2").new_codes()
+    codes.register_cursed_codes(registry)
+    assert codes.CODES == {entry.code: (entry.http_status, entry.code_detail) for entry in registry}
+    assert codes.cursed_code(registry, codes.BAD_REQUEST) is registry.INVALID_REQUEST
+    assert codes.cursed_code(registry, codes.PARTIAL_CONTENT) is registry.PARTIAL_CONTENT
+    assert codes.code_for_http_status(206) == codes.PARTIAL_CONTENT
+    assert codes.code_for_http_status(204) == codes.NO_CONTENT
+
+
+def test_zero_home_rejects_existing_code_assignment_before_registration():
+    registry = get_profile("1.2").new_codes()
+    registry.register("UNRELATED_CODE", codes.CONNECTION_INVALID, "Unrelated code.", 400)
+    with pytest.raises(ValueError, match="CONNECTION_INVALID"):
+        codes.register_cursed_codes(registry)
+    assert registry.by_number(codes.FRONTEND_UPDATE_AVAILABLE) is None
+    assert registry.by_number(codes.CONNECTION_INVALID) is registry.UNRELATED_CODE

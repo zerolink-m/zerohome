@@ -72,7 +72,7 @@ def route_info(route) -> dict[str, Any]:
         if getattr(call, "__module__", "") == "app.deps.auth":
             qs = call.__name__.endswith("_qs") or "resolve" in call.__name__
             auth = "bearer,token" if qs else ("bearer" if auth == "off" else auth)
-    return {"functions": functions, "meta": meta, "auth": auth}
+    return {"functions": functions, "meta": meta, "auth": meta.get("auth", auth)}
 
 
 def _flatten(routes) -> Iterable[Any]:
@@ -96,10 +96,11 @@ def match_routes(scope) -> list:
     return out
 
 
-def options_info(scope) -> dict[str, Any] | None:
+def options_info(scope, *, template: str | None = None) -> dict[str, Any] | None:
     # WebSocket routes are not HTTP resources and must not make OPTIONS appear
     # successful on paths that have no matching HTTP route.
-    routes = [r for r in match_routes(scope) if not isinstance(r, WebSocketRoute)]
+    routes = [r for r in match_routes(scope)
+              if not isinstance(r, WebSocketRoute) and (template is None or r.path == template)]
     if not routes:
         return None
     methods: set[str] = set()

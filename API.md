@@ -135,7 +135,7 @@ Share-токен не даёт доступа к остальным эндпои
 | `search` | — | Искомые значения, разделённые запятыми |
 | `search_column` | — | Поля из белого списка; обязательно вместе с `search`, иначе `066`; недопустимое поле — `127` |
 | `search_method` | `include` | Только методы сравнения: `equals`, `exactly`, `include`, `starts`, `ends`, `exclude`; неверный метод — `066` |
-| `filter` | не поддерживается | Любая передача отклоняется кодом `153`; функция не объявляется в `cursed-supported-functions` |
+| `filter` | — | Поддерживается в списках сессий и подключений. Формат — Base64url без `=`. Ошибка выражения — `066`. На списках без поддержки — `153` |
 | `expand` | endpoint-specific | Неподдерживаемое имя отношения — `160` (`EXPAND_NOT_SUPPORTED`); если expansion вообще не реализован на endpoint-е — `351` (`EXPAND_NOT_IMPLEMENTED`) |
 
 Списки параметров разделяются запятыми. Значение с запятой заключайте в кавычки, например `search='Smith, John'`; одинаковые кавычки внутри значения удваиваются. Пустая позиция (`a,,b` или хвостовая запятая) — `297`; незакрытые/неправильно расположенные кавычки — `066`.
@@ -150,11 +150,11 @@ Share-токен не даёт доступа к остальным эндпои
 | `ends` | заканчивается на (`LIKE %value`) |
 | `exclude` | не содержит подстроку (`NOT LIKE %value%`) |
 
-Одиночное значение `search_column` или `search_method` применяется ко всем значениям `search`. В остальных случаях длины списков должны совпадать; несовпадение — `300`. `search` и `search_column` должны передаваться вместе. Все простые условия соединяются через **AND**. `and`, `or`, `and_not`, `or_not` и другие логические связки не являются допустимыми значениями `search_method`; сложный `filter` сейчас не реализован.
+Одиночное значение `search_column` или `search_method` применяется ко всем значениям `search`. В остальных случаях длины списков должны совпадать; несовпадение — `300`. `search` и `search_column` должны передаваться вместе. Все простые условия соединяются через **AND**. Для логических выражений в списках сессий и подключений используйте [расширенный фильтр](docs/cursedapi/docs/filter.md). `OPTIONS` объявляет `GET.filter` и ссылку на схему с разрешёнными полями, операторами и пределами. Фильтр применяется вместе с правилами доступа и простым поиском до подсчёта `total`.
 
 Пример: `?search=john,doe&search_column=name,surname&search_method=equals,include` означает `name = john AND surname LIKE %doe%`.
 
-**Ответ списка.** Обычный list GET возвращает `data.settings` и массив ресурса. `settings` содержит `total`, `limit`, `offset`, нормализованный `order` (`asc`/`desc`), а также `sort_by`, `search`, `search_method`, `search_column` и `filter` (всегда `null`, поскольку фильтр не поддерживается). Пустой список возвращается с кодом `019`; `metadata.page` не используется. Bulk GET возвращает выбранный массив без `settings` (см. [Bulk](#16-bulk)).
+**Ответ списка.** Обычный list GET возвращает `data.settings` и массив ресурса. `settings` содержит `total`, `limit`, `offset`, нормализованный `order` (`asc`/`desc`), а также `sort_by`, `search`, `search_method`, `search_column` и `filter`. Если фильтр передан, `settings.filter` содержит его нормализованное представление Base64url, иначе `null`. Пустой список возвращается с кодом `019`; `metadata.page` не используется. Bulk GET возвращает выбранный массив без `settings` (см. [Bulk](#16-bulk)).
 
 ### 1.6 Bulk
 
@@ -244,7 +244,9 @@ Share-токен не даёт доступа к остальным эндпои
 
 Дополнительные объявленные функции `x-*`: `GET /config` — `x-client-version`; `GET /cams/{id}/snapshot` и `GET /cams/{id}/recordings/{rid}/snapshot` — `x-snapshot`; `GET /cams/{id}/recordings` — `x-time_range`; `GET /cams/{id}/recordings/{rid}/file` — `x-file`; `GET /stats` и `GET /stats/motion` — `x-period`; `POST /cams/{id}/motion/start` — `x-start`; `POST /cams/{id}/motion/stop` — `x-stop`.
 
-Спецификация v1.2 описывает `cursed-request-type` и `cursed-response-type`, однако текущий `options_headers()` их пока не формирует. Отдельный `cursed-filter` также не публикуется: `filter` не поддерживается и не объявляется. Для конкретного метода источником опубликованных возможностей является `cursed-supported-functions`.
+Для маршрутов с зарегистрированным контрактом `OPTIONS` проверяет доступность описанных методов для текущей сессии и добавляет `cursed-schema-url`, если есть доступный контракт. GET по этой ссылке возвращает `data.schema` с запросами и ответами доступных методов. Для защищённых методов передавайте тот же bearer. Схемы возвращаются с `Cache-Control: private, no-store`. Поддержка фильтра определяется по `GET.filter` в `cursed-supported-functions`.
+
+Спецификация v1.2 описывает `cursed-request-type` и `cursed-response-type`, однако текущий `options_headers()` их пока не формирует.
 
 OPTIONS учитывает глобальный rate limit.
 
@@ -257,7 +259,8 @@ OPTIONS учитывает глобальный rate limit.
 | GET | `/v1/health` | `data = {"status": "ok"}` |
 | GET | `/v1/version` | `data.version = {"api": "v1", "supported": ["v1"], "cursed": "1.2", "app": "<версия приложения>"}` |
 | GET | `/v1/docs` | Swagger UI (FastAPI), custom, не CursedJSON |
-| GET | `/v1/openapi.json` | OpenAPI-схема FastAPI, custom |
+| GET | `/v1/openapi.json` | OpenAPI-схема. Зарегистрированные контракты включают модели CursedJSON и варианты ответа с кодами |
+| GET | `/v1/cursedapi.md` | Markdown, автоматически собранный из зарегистрированных контрактов |
 
 ---
 
@@ -723,7 +726,8 @@ HLS-сессия запускается первым запросом плейл
 
 ## 14. Известные границы реализации cursedapi v1.2
 
-- Продвинутый query-параметр `filter` не реализован: его передача отклоняется кодом `153` и он не объявляется в `cursed-supported-functions`.
+- Интеграция библиотеки покрывает служебные маршруты, стандартные списки сессий и подключений и автоматическое описание зарегистрированных контрактов. Остальные CRUD-операции выполняются существующими обработчиками. OpenAPI также показывает обычные маршруты FastAPI, а автоматически собранный Markdown включает только зарегистрированные контракты.
+- Расширенный `filter` доступен в `GET /v1/users/{user_id}/sessions` и `GET /v1/connections`.
 - Спецификация описывает `cursed-request-type` и `cursed-response-type`, но текущий OPTIONS middleware их пока не формирует.
 - Мутации `/v1/assignments` не предоставлены: назначениями управляет кластерный координатор.
 - Числовые коды изменились относительно v1.1; используйте актуальный справочник и константы `app/core/codes.py`.

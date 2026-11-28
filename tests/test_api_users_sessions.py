@@ -1,3 +1,6 @@
+from base64 import urlsafe_b64encode
+import time
+
 import pytest
 
 from tests.conftest import bearer, login_access
@@ -224,3 +227,75 @@ async def test_session_delete_single(client, user):
     sid = (await client.get(f"/v1/users/{uid}/sessions", headers=h)).json()["data"]["sessions"][0]["id"]
     r = await client.delete(f"/v1/users/{uid}/sessions/{sid}", headers=h)
     assert ok_env(r, "009")["data"] == {"session": {"id": sid}}
+
+
+async def test_generated_session_list_filter_access_and_schema(client, admin, user):
+    uid, h = user
+    path = f"/v1/users/{uid}/sessions"
+    admin_path = f"/v1/users/{admin[0]}/sessions"
+    sid = ok_env(await client.get(path, headers=h), "000")["data"]["sessions"][0]["id"]
+
+    result = await client.options(path, headers=h)
+    assert "GET.filter" in result.headers["cursed-supported-functions"].split(",")
+    schema_url = result.headers["cursed-schema-url"]
+    method = ok_env(await client.get(schema_url, headers=h), "000")["data"]["schema"]["methods"]["GET"]
+    fields = method["query"]["filter"]["fields"]
+    assert set(fields) == {"id", "uid", "last_login", "last_seen", "added_at", "updated_at"}
+    assert all(field["type"] == "int" for field in fields.values())
+    response = next(variant for variant in method["responses"]["200"] if variant["code"] == "000")
+    response_schema = response["body_schema"]
+    assert response_schema["properties"]["code"]["const"] == "000"
+    assert "token_hash" not in str(response_schema)
+    ok_env(await client.get(schema_url), "177")
+    for response in (await client.options(path), await client.options(admin_path, headers=h)):
+        assert "GET.filter" not in response.headers["cursed-supported-functions"].split(",")
+        assert "cursed-schema-url" not in response.headers
+
+    def encoded(expr):
+        return urlsafe_b64encode(expr.encode()).decode().rstrip("=")
+
+    # The owner scope remains in effect even when the filter includes another user.
+    filter_ = encoded(f"id == {sid} OR uid == {admin[0]}")
+    result = await client.get(path, params={"filter": filter_, "search": "pytest", "search_column": "ua"}, headers=h)
+    data = ok_env(result, "000")["data"]
+    assert [session["id"] for session in data["sessions"]] == [sid]
+    assert data["settings"]["total"] == 1 and data["settings"]["filter"] == filter_
+    assert data["settings"]["search_method"] == "include"
+    ok_env(await client.get(admin_path, params={"filter": filter_}, headers=h), "189")
+
+    result = await client.get(path, params={"filter": encoded("token_hash IS NULL")}, headers=h)
+    assert "filter" in ok_env(result, "066")["error"]["query"]
+
+
+async def test_session_delete_contract_describes_optional_request_and_partial_result(client, user):
+    uid, h = user
+    path = f"/v1/users/{uid}/sessions/bulk/1,2"
+    options = await client.options(path, headers=h)
+    schema_url = options.headers["cursed-schema-url"]
+    methods = ok_env(await client.get(schema_url, headers=h), "000")["data"]["schema"]["methods"]
+    delete_ = methods["DELETE"]
+    assert delete_["request"]["required"] is False
+    assert delete_["request"]["body_schema"]["required"] == ["data"]
+    variants = {variant["code"]: variant for rows in delete_["responses"].values() for variant in rows}
+    assert {"009", "012", "215", "269"} <= variants.keys()
+    assert "succeeded" in str(variants["012"]["body_schema"])
+    assert "failed" in str(variants["012"]["body_schema"])
+
+
+async def test_generated_session_list_deletes_expired_sessions(client, user, sessionmaker_):
+    from app.deps.auth import IDLE_SECONDS
+    from app.models.session import Session
+
+    uid, h = user
+    timestamp = int(time.time()) - IDLE_SECONDS - 1
+    async with sessionmaker_() as db:
+        old = Session(uid=uid, ua="expired", ip="127.0.0.1", last_login=timestamp,
+                      last_seen=timestamp, added_at=timestamp, updated_at=timestamp)
+        db.add(old)
+        await db.commit()
+        old_id = old.id
+
+    result = await client.get(f"/v1/users/{uid}/sessions", headers=h)
+    assert ok_env(result, "000")["data"]["settings"]["total"] == 1
+    async with sessionmaker_() as db:
+        assert await db.get(Session, old_id) is None

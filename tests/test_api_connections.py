@@ -1,10 +1,11 @@
-from tests.conftest import mint_test_token
+from base64 import urlsafe_b64encode
+
 import pytest
 
 from app.core.codes import (
     BULK_LIMIT_EXCEEDED, CONNECTION_INVALID, EMPTY_BODY, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR,
 )
-from tests.conftest import bearer
+from tests.conftest import bearer, mint_test_token
 
 
 async def tok(uid, role="user"):
@@ -65,6 +66,32 @@ async def test_create_redacts_and_syncs(client, users, _mock_ext):
     assert _mock_ext["sync"] == [c["id"]]
     r = await client.post("/v1/connections", headers=bearer(await tok(o)), json=body(**conn(enabled=0)))
     assert r.json()["code"] == "039" and _mock_ext["sync"] == [c["id"]]
+
+
+async def test_generated_connection_list_filter_and_contract(client, users):
+    owner, other, admin = users
+    mine = await create(client, owner, name="Mine", enabled=0)
+    theirs = await create(client, other, name="Theirs", enabled=0)
+    headers = bearer(await tok(owner))
+    admin_headers = bearer(await tok(admin, "admin"))
+    query = urlsafe_b64encode(f"id IN [{mine}, {theirs}]".encode()).decode().rstrip("=")
+    for auth, ids in ((headers, [mine]), (admin_headers, [mine, theirs])):
+        response = await client.get("/v1/connections", headers=auth, params={"filter": query})
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        assert [row["id"] for row in data["connections"]] == ids
+        assert data["settings"]["total"] == len(ids)
+        assert all("access_secret" not in row["meta"] for row in data["connections"])
+
+    options = await client.options("/v1/connections", headers=headers)
+    assert {"GET", "POST"} <= set(options.headers["allow"].split(", "))
+    schema = await client.get(options.headers["cursed-schema-url"], headers=headers)
+    methods = schema.json()["data"]["schema"]["methods"]
+    assert "meta" not in methods["GET"]["query"]["filter"]["fields"]
+    assert "access_secret" not in str(methods["GET"]["responses"])
+    create_body = methods["POST"]["request"]["body_schema"]
+    assert create_body["required"] == ["data"]
+    assert all(key in str(create_body) for key in ("access_secret", "password", "writeOnly"))
 
 
 async def test_ufanet_credentials_create_patch_and_delete(client, users, sessionmaker_, _mock_ext):

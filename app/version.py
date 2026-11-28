@@ -1,3 +1,3 @@
 """Build version for the ZeroCams application (separate from the API version)."""
 
-APP_VERSION = "4.9.0"
+APP_VERSION = "5.0.0"

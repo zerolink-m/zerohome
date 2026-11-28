@@ -6,6 +6,9 @@ their values now follow v1.2.
 """
 from __future__ import annotations
 
+from cursedapi.codes import Code, CodeRegistry
+from cursedapi.protocols import get_profile
+
 SUCCESS = '000'
 CREATED = '039'
 PARTIALLY_CREATED = '041'
@@ -182,183 +185,51 @@ SERVICE_OVERLOADED = '375'
 GATEWAY_TIMEOUT = '380'
 EXTERNAL_API_TIMEOUT = '383'
 
-# Every assigned standard code from the v1.2 table.
+# Only ZeroHome extensions are defined here. The protocol owns standard codes.
+_SERVICE_CODES = (
+    ("FRONTEND_UPDATE_AVAILABLE", FRONTEND_UPDATE_AVAILABLE, 200, "A frontend update is available."),
+    ("TUYA_LOCAL_NOT_ALLOWED", TUYA_LOCAL_NOT_ALLOWED, 403, "Local Tuya control is not allowed for this device."),
+    ("RECORDING_NOT_ALLOWED", RECORDING_NOT_ALLOWED, 403, "Recording is not allowed for this camera."),
+    ("FRONTEND_UPDATE_NEEDED", FRONTEND_UPDATE_NEEDED, 403, "The frontend version is outdated: update required."),
+    ("PTZ_NOT_CONFIGURED", PTZ_NOT_CONFIGURED, 409, "PTZ control is not configured for this camera."),
+    ("RECORDING_NOT_CONFIGURED", RECORDING_NOT_CONFIGURED, 409, "Recording is not configured for this camera."),
+    ("INVITATION_INVALID", INVITATION_INVALID, 400, "The invitation is invalid."),
+    ("PUSH_INVALID", PUSH_INVALID, 400, "Invalid push subscription or settings."),
+    ("SHARE_INVALID", SHARE_INVALID, 400, "The share link is invalid."),
+    ("CONNECTION_INVALID", CONNECTION_INVALID, 400, "The connection is invalid or its parameters are wrong."),
+    ("PARTIAL_CONTENT", PARTIAL_CONTENT, 206, "Partial content."),
+    ("NO_CONTENT", NO_CONTENT, 204, "No content."),
+)
+
+
+def register_cursed_codes(registry: CodeRegistry) -> None:
+    """Register ZeroHome extensions on a new v1.2 registry before route setup."""
+    success = registry.by_number(SUCCESS)
+    if success is None or success.version != "1.2":
+        raise ValueError("ZeroHome codes require a cursedapi 1.2 registry")
+    # Check every extension before mutating the registry so collisions cannot
+    # leave a partially registered service.
+    for name, number, _, _ in _SERVICE_CODES:
+        if getattr(registry, name, None) is not None or registry.by_number(number) is not None:
+            raise ValueError(f"ZeroHome code {name} ({number}) conflicts with an existing registration")
+    for name, number, status, detail in _SERVICE_CODES:
+        registry.register(name, number, detail, status)
+
+
+def cursed_code(registry: CodeRegistry, code: str | int) -> Code:
+    """Resolve a ZeroHome code constant to the library's Code object."""
+    number = _norm(code)
+    registered = registry.by_number(number)
+    if registered is None:
+        raise ValueError(f"Unknown ZeroHome response code {number!r}")
+    return registered
+
+
+_registry = get_profile("1.2").new_codes()
+register_cursed_codes(_registry)
+_registry.freeze()
 CODES: dict[str, tuple[int, str]] = {
-    '000': (200, 'Success.'),
-    '002': (200, 'Edited successfully.'),
-    '004': (200, 'Partially edited successfully.'),
-    '007': (200, 'Not changed.'),
-    '009': (200, 'Deleted successfully.'),
-    '012': (200, 'Partially deleted successfully.'),
-    '014': (200, 'Authorized successfully.'),
-    '017': (200, 'Streaming response.'),
-    '019': (200, 'Empty result.'),
-    '022': (200, 'Cached response.'),
-    '024': (200, 'The object is already in the requested state.'),
-    '026': (200, 'File uploaded successfully.'),
-    '029': (200, 'Email sent successfully.'),
-    '031': (200, 'Password changed successfully.'),
-    '034': (200, 'Logged out successfully.'),
-    '036': (200, 'Token refreshed successfully.'),
-    '039': (201, 'Created successfully.'),
-    '041': (201, 'Partially created successfully.'),
-    '044': (202, 'Accepted for work.'),
-    '045': (301, 'Moved permanently.'),
-    '047': (302, 'Moved temporarily.'),
-    '050': (303, 'See other.'),
-    '052': (304, 'File not modified.'),
-    '055': (307, 'Temporarily relocated while retaining the method.'),
-    '058': (308, 'Permanently relocated while retaining the method.'),
-    '059': (400, 'Invalid request.'),
-    '061': (400, 'These fields cannot be edited for one or more objects.'),
-    '063': (400, 'Invalid JSON body.'),
-    '066': (400, 'Invalid query parameters.'),
-    '068': (400, 'A required field is missing.'),
-    '070': (400, 'Field type mismatch.'),
-    '073': (400, 'The request body is empty.'),
-    '075': (400, 'The file is too large.'),
-    '077': (400, 'Unsupported file type.'),
-    '080': (400, 'Invalid file content.'),
-    '082': (400, 'Invalid email format.'),
-    '085': (400, 'The password is too weak.'),
-    '087': (400, 'Passwords do not match.'),
-    '089': (400, 'Invalid date format.'),
-    '092': (400, 'Invalid phone number format.'),
-    '094': (400, 'Invalid URL format.'),
-    '096': (400, 'The field value is out of range.'),
-    '099': (400, 'Too many fields in the request.'),
-    '101': (400, 'Duplicate values in the request.'),
-    '103': (400, 'Captcha verification failed.'),
-    '106': (400, 'Invalid one-time code (OTP).'),
-    '108': (400, 'The one-time code (OTP) has expired.'),
-    '111': (400, 'Too many one-time code (OTP) attempts.'),
-    '113': (400, 'Invalid credentials.'),
-    '115': (400, 'An account with this email already exists.'),
-    '118': (400, 'An account with this username already exists.'),
-    '120': (400, 'The old password is invalid.'),
-    '122': (400, 'You cannot perform this action on yourself.'),
-    '125': (400, 'Invalid sort field.'),
-    '127': (400, 'Invalid search column.'),
-    '129': (400, 'Invalid limit or offset value.'),
-    '132': (400, 'The bulk operation size limit has been exceeded.'),
-    '134': (400, 'There is nothing to update.'),
-    '137': (400, 'There is nothing to delete.'),
-    '139': (400, 'Invalid token format.'),
-    '141': (400, 'The token has been revoked.'),
-    '144': (400, 'The refresh token is missing.'),
-    '146': (400, 'Invalid locale or language.'),
-    '148': (400, 'Unsupported media type for this endpoint.'),
-    '151': (400, 'The request was cancelled by the client.'),
-    '153': (400, 'The requested function is not supported by this API server.'),
-    '155': (400, 'The requested function is disabled on this API server.'),
-    '158': (400, 'Limit value is above the maximum allowed by this API server.'),
-    '160': (400, 'Expansion is not supported for one or more requested relations.'),
-    '163': (400, 'The stream was interrupted before completion.'),
-    '165': (400, 'The request combines functions that cannot be used together.'),
-    '167': (401, 'Token error.'),
-    '170': (401, 'The token has expired.'),
-    '172': (401, 'The token is signed with an incorrect key.'),
-    '174': (401, 'The token has an invalid algorithm.'),
-    '177': (401, 'No header or query containing the token was found.'),
-    '179': (402, 'Payment required.'),
-    '181': (403, 'Forbidden.'),
-    '184': (403, 'This resource is not available for retrieval. Forbidden.'),
-    '186': (403, 'Forbidden due to an incorrect role.'),
-    '189': (403, 'Access to this resource is denied for this object.'),
-    '191': (403, 'Actor is blocked.'),
-    '193': (403, 'You are blocked.'),
-    '196': (403, 'Email is not confirmed.'),
-    '198': (403, 'The account is not activated.'),
-    '200': (403, 'A subscription is required to access this resource.'),
-    '203': (403, 'The rate limit for the current plan has been exceeded.'),
-    '205': (403, 'The object is read-only.'),
-    '208': (403, 'Editing your own account this way is forbidden.'),
-    '210': (403, 'Your IP address is blocked.'),
-    '212': (404, 'Not found.'),
-    '215': (404, 'Object not found.'),
-    '217': (404, 'Route not found.'),
-    '219': (404, 'File not found.'),
-    '222': (404, 'Field not found.'),
-    '224': (404, 'Endpoint not found.'),
-    '226': (405, 'The method is not permitted for one or more objects.'),
-    '229': (406, 'This response format cannot be returned.'),
-    '231': (408, 'The request from the user timed out.'),
-    '234': (409, 'Conflict.'),
-    '236': (409, 'The field already exists for this object or one of the objects.'),
-    '238': (409, 'The object has child objects.'),
-    '241': (409, 'The object is being edited by another user.'),
-    '243': (409, 'Stale data: the object has changed since it was last fetched.'),
-    '245': (409, 'The object cannot be deleted because it is referenced by other objects.'),
-    '248': (409, 'The operation is already in progress.'),
-    '250': (409, 'Duplicate request (idempotency conflict).'),
-    '252': (410, 'The object is unavailable or has been permanently deleted.'),
-    '255': (411, 'Length Required.'),
-    '257': (412, 'Precondition Failed.'),
-    '260': (413, 'The request field contains extra elements, or the total request size has been exceeded.'),
-    '262': (414, 'URI Too Long.'),
-    '264': (415, 'Unsupported body format.'),
-    '267': (416, 'Range not satisfiable.'),
-    '269': (422, 'Validation error.'),
-    '271': (422, 'A required query parameter is missing.'),
-    '274': (422, 'The field value is too long.'),
-    '276': (422, 'The field value is too short.'),
-    '278': (422, 'The field contains forbidden characters.'),
-    '281': (422, 'Invalid enum value.'),
-    '283': (422, 'The field is immutable.'),
-    '286': (422, 'Too many decimal places.'),
-    '288': (422, 'Negative values are not allowed.'),
-    '290': (422, 'Empty values are not allowed.'),
-    '293': (422, 'Invalid nested object.'),
-    '295': (422, 'Unknown field in the request.'),
-    '297': (422, 'A multi search list contains an empty position.'),
-    '300': (422, 'The search values, columns and methods lists have different lengths.'),
-    '302': (423, 'Locked.'),
-    '304': (423, 'Object locked to edit.'),
-    '307': (423, 'Object locked to delete.'),
-    '309': (423, 'The object is locked by an administrator.'),
-    '312': (428, 'Precondition required.'),
-    '314': (429, 'Too many requests.'),
-    '316': (429, 'Too many requests for object.'),
-    '319': (429, 'Too many login attempts.'),
-    '321': (429, 'Too many requests to this endpoint.'),
-    '323': (429, 'The upload rate limit has been exceeded.'),
-    '326': (429, 'The bulk request rate limit has been exceeded.'),
-    '328': (451, 'Unavailable for legal reasons.'),
-    '331': (451, 'The content is not available in your region.'),
-    '332': (500, 'Internal server error.'),
-    '334': (500, 'Database error.'),
-    '336': (500, 'File storage error.'),
-    '339': (500, 'Email service error.'),
-    '341': (500, 'Cache error.'),
-    '344': (500, 'A database migration is in progress.'),
-    '346': (501, 'The bulk operation is not implemented.'),
-    '349': (501, 'Search is not implemented.'),
-    '351': (501, 'The expansion feature is not implemented on this server.'),
-    '353': (501, 'Function not implemented.'),
-    '356': (502, 'Payment gateway error.'),
-    '358': (502, 'External auth provider error.'),
-    '361': (502, 'Bad gateway.'),
-    '363': (502, 'The external API is unavailable.'),
-    '366': (502, 'The external service returned an unexpected response format.'),
-    '368': (503, 'The service is under maintenance.'),
-    '370': (503, 'The database is starting up.'),
-    '373': (503, 'The service is unavailable.'),
-    '375': (503, 'The service is under load.'),
-    '378': (504, 'The external file service request timed out.'),
-    '380': (504, 'Gateway timeout.'),
-    '383': (504, 'The external API request timed out.'),
-    '384': (200, 'A frontend update is available.'),  # FRONTEND_UPDATE_AVAILABLE
-    '385': (403, 'Local Tuya control is not allowed for this device.'),  # TUYA_LOCAL_NOT_ALLOWED
-    '386': (403, 'Recording is not allowed for this camera.'),  # RECORDING_NOT_ALLOWED
-    '387': (403, 'The frontend version is outdated: update required.'),  # FRONTEND_UPDATE_NEEDED
-    '388': (409, 'PTZ control is not configured for this camera.'),  # PTZ_NOT_CONFIGURED
-    '389': (409, 'Recording is not configured for this camera.'),  # RECORDING_NOT_CONFIGURED
-    '390': (400, 'The invitation is invalid.'),  # INVITATION_INVALID
-    '391': (400, 'Invalid push subscription or settings.'),  # PUSH_INVALID
-    '392': (400, 'The share link is invalid.'),  # SHARE_INVALID
-    '393': (400, 'The connection is invalid or its parameters are wrong.'),  # CONNECTION_INVALID
-    '394': (206, 'Partial content.'),  # PARTIAL_CONTENT
-    '395': (204, 'No content.'),  # NO_CONTENT
+    code.code: (code.http_status, code.code_detail) for code in _registry
 }
 
 HTTP_STATUS_BY_CODE: dict[str, int] = {code: item[0] for code, item in CODES.items()}
@@ -388,24 +259,12 @@ def is_success(code: str | int) -> bool:
     return http_status(code) < 300
 
 
-_HTTP_MAIN_CODE = {
-    200: SUCCESS, 201: CREATED, 202: ACCEPTED,
-    301: MOVED_PERMANENTLY, 302: MOVED_TEMPORARILY, 303: SEE_OTHER,
-    304: NOT_MODIFIED, 307: TEMPORARY_REDIRECT, 308: PERMANENT_REDIRECT,
-    400: BAD_REQUEST, 401: TOKEN_ERROR, 402: PAYMENT_REQUIRED, 403: FORBIDDEN,
-    404: NOT_FOUND, 405: METHOD_NOT_ALLOWED, 406: NOT_ACCEPTABLE, 408: REQUEST_TIMEOUT,
-    409: CONFLICT, 410: GONE, 411: LENGTH_REQUIRED, 412: PRECONDITION_FAILED,
-    413: PAYLOAD_TOO_LARGE, 414: URI_TOO_LONG, 415: UNSUPPORTED_BODY_FORMAT,
-    416: RANGE_NOT_SATISFIABLE, 422: VALIDATION_ERROR, 423: LOCKED,
-    428: PRECONDITION_REQUIRED, 429: RATE_LIMITED, 451: LEGAL_REASONS,
-    500: SERVER_ERROR, 501: NOT_IMPLEMENTED, 502: BAD_GATEWAY,
-    503: SERVICE_UNAVAILABLE, 504: GATEWAY_TIMEOUT,
-}
-
-
 def code_for_http_status(status: int) -> str:
     """Return the v1.2 main code for an HTTP status, including service statuses."""
-    code = _HTTP_MAIN_CODE.get(status)
-    if code is not None:
-        return code
-    return next((c for c, (s, _) in CODES.items() if 384 <= int(c) <= 511 and s == status), SERVER_ERROR)
+    standard = _registry.by_http(status)
+    if standard is not None:
+        return standard.code
+    return next(
+        (number for _, number, custom_status, _ in _SERVICE_CODES if custom_status == status),
+        SERVER_ERROR,
+    )

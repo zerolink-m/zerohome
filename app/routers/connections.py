@@ -16,6 +16,8 @@ including the owner — if you need to change it, PATCH a new one.
 
 import time
 
+from cursedapi.filtering import FilterField
+from cursedapi.sqlalchemy import SQLAlchemyBackend
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,16 +29,17 @@ from app.core.codes import (
     OBJECT_NOT_FOUND,
     VALIDATION_ERROR,
 )
+from app.core.cursed_api import Authenticated, declare_generated_route, describe_generated_route
 from app.core.errors import AppError
 from app.core.introspection import declare
 from app.core.rate_limit import rate_limit
-from app.core.response import bulk, bulk_listing, created, deleted, edited, failed_item, listing, single
+from app.core.response import bulk, bulk_listing, created, deleted, edited, failed_item, single
 from app.core.security import TokenPayload
 from app.deps.ids import parse_ids
 from app.core.validation import field_error
 from app.db.session import get_db
 from app.deps.auth import require_access
-from app.deps.list_query import ListQuery, list_query
+from app.deps.cursed_crud import CrudContract, ListQueryContract
 from app.deps.request_body import BulkBody, SingleBody, bulk_body, read_envelope, single_body
 from app.models.connection import Connection, ConnectionCredentials
 from app.models.cams import Cam
@@ -64,8 +67,18 @@ CONNECTIONS_COLUMNS = {
     "added_at": Connection.added_at,
     "updated_at": Connection.updated_at,
 }
-connections_query = list_query(model=Connection, sortable=CONNECTIONS_COLUMNS, searchable=CONNECTIONS_COLUMNS)
 MAX_BULK = 50
+_CONNECTION_DOC = CrudContract("connection", "connections", ConnectionOut, id_name="connection_id", max_bulk=MAX_BULK)
+_READ_BUDGET = rate_limit("connections_read", capacity=60, per_minute=60)
+_LIST_PATH = "/v1/connections"
+_FILTER_FIELDS = {
+    "id": FilterField(int, {"==", "!=", "IN", "NOT IN"}),
+    "provider": FilterField(str, {"==", "!=", "IN", "NOT IN"}),
+    "name": FilterField(str, {"==", "!=", "CONTAINS", "STARTS_WITH", "ENDS_WITH"}),
+    "enabled": FilterField(int, {"==", "!="}),
+    "added_at": FilterField(int, {"==", "!=", "<", "<=", ">", ">=", "BETWEEN"}),
+    "updated_at": FilterField(int, {"==", "!=", "<", "<=", ">", ">=", "BETWEEN"}),
+}
 
 
 def _single_body(key, schema):
@@ -298,25 +311,44 @@ async def _evict_deleted(key: tuple | None) -> None:
 # --- list / get ----------------------------------------------------------------
 
 
-@router.get("", dependencies=[Depends(rate_limit("connections_read", capacity=60, per_minute=60))])
-async def list_connections(
-    q: ListQuery = Depends(connections_query),
-    payload: TokenPayload = Depends(require_access),
-    db: AsyncSession = Depends(get_db),
-):
-    stmt = select(Connection)
-    condition = _visibility_where(payload)
-    if condition is not None:
-        stmt = stmt.where(condition)
+class ConnectionListPolicy(Authenticated):
+    def scope(self, ctx):
+        return _visibility_where(ctx.principal)
 
-    rows, total = await q.paginate(db, stmt)
-    return listing("connections", [_serialize(c) for c in rows], query=q, total=total)
+
+def register_connection_list(api):
+    connections = api.add_resource(
+        _LIST_PATH,
+        singular="connection", plural="connections", read_schema=ConnectionOut,
+        backend=SQLAlchemyBackend(Connection), policy=ConnectionListPolicy(),
+        operations={"list"}, search_fields=CONNECTIONS_COLUMNS, sort_fields=CONNECTIONS_COLUMNS,
+        filter_fields=_FILTER_FIELDS,
+    )
+
+    @connections.hook("after_authenticate")
+    async def charge_read_budget(ctx):
+        await _READ_BUDGET(ctx.request)
+
+    @connections.hook("after_list")
+    def redact_connection_secrets(ctx, rows):
+        return [_serialize(connection) for connection in rows]
+
+    describe_generated_route(
+        api, _LIST_PATH, "GET", summary="Список подключений",
+        description="Обычный пользователь видит только собственные подключения. Секреты провайдера не возвращаются.",
+        query_schema=ListQueryContract, responses=_CONNECTION_DOC.list_responses(),
+    )
+    declare_generated_route(
+        api, _LIST_PATH, "GET", "limit", "offset", "pagination", "order", "sort_by",
+        "search", "search_column", "search_method", "multi_search", "filter", max_limit=255, auth="bearer",
+    )
 
 
 @router.get(
     "/bulk/{ids}",
     dependencies=[Depends(rate_limit("connections_read", capacity=60, per_minute=60))],
 )
+@_CONNECTION_DOC.route("get", summary="Получить несколько подключений", bulk=True, errors=(OBJECT_NOT_FOUND,))
 async def get_connections_bulk(
     ids: str,
     payload: TokenPayload = Depends(require_access),
@@ -334,6 +366,7 @@ declare(get_connections_bulk, "bulk")
     "/{connection_id}",
     dependencies=[Depends(rate_limit("connections_read", capacity=60, per_minute=60))],
 )
+@_CONNECTION_DOC.route("get", summary="Получить подключение", errors=(OBJECT_NOT_FOUND,))
 async def get_connection(
     connection_id: int,
     payload: TokenPayload = Depends(require_access),
@@ -347,6 +380,7 @@ async def get_connection(
 
 
 @router.post("", dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))])
+@_CONNECTION_DOC.route("create", summary="Создать подключение", request=ConnectionCreate)
 async def create_connection(
     body: SingleBody[ConnectionCreate] = Depends(_single_body("connection", ConnectionCreate)),
     payload: TokenPayload = Depends(require_access),
@@ -365,6 +399,7 @@ async def create_connection(
 
 
 @router.post("/bulk", dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))])
+@_CONNECTION_DOC.route("create", summary="Создать несколько подключений", bulk=True, request=ConnectionCreate)
 async def create_connections_bulk(
     body: BulkBody[ConnectionCreate] = Depends(bulk_body("connections", ConnectionCreate, max_items=MAX_BULK)),
     payload: TokenPayload = Depends(require_access),
@@ -391,6 +426,10 @@ async def create_connections_bulk(
 
 
 @router.patch("/bulk/{ids}", dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))])
+@_CONNECTION_DOC.route(
+    "patch", summary="Изменить несколько подключений", bulk=True, request=ConnectionPatch,
+    errors=(OBJECT_NOT_FOUND, FORBIDDEN_RESOURCE, CONNECTION_INVALID),
+)
 async def patch_connections_bulk(
     ids: str,
     body: BulkBody[ConnectionPatch] = Depends(bulk_body("connections", ConnectionPatch, max_items=MAX_BULK)),
@@ -443,6 +482,10 @@ async def patch_connections_bulk(
     "/{connection_id}",
     dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))],
 )
+@_CONNECTION_DOC.route(
+    "patch", summary="Изменить подключение", request=ConnectionPatch,
+    errors=(OBJECT_NOT_FOUND, FORBIDDEN_RESOURCE, CONNECTION_INVALID),
+)
 async def patch_connection(
     connection_id: int,
     body: SingleBody[ConnectionPatch] = Depends(_single_body("connection", ConnectionPatch)),
@@ -473,6 +516,8 @@ async def patch_connection(
     "/bulk/{ids}",
     dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))],
 )
+@_CONNECTION_DOC.route("delete", summary="Удалить несколько подключений", bulk=True,
+                       errors=(OBJECT_NOT_FOUND, FORBIDDEN_RESOURCE))
 async def delete_connections_bulk(
     ids: str,
     options=Depends(_partial_option),
@@ -509,6 +554,7 @@ async def delete_connections_bulk(
     "/{connection_id}",
     dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))],
 )
+@_CONNECTION_DOC.route("delete", summary="Удалить подключение", errors=(OBJECT_NOT_FOUND, FORBIDDEN_RESOURCE))
 async def delete_connection(
     connection_id: int,
     payload: TokenPayload = Depends(require_access),
@@ -529,6 +575,8 @@ async def delete_connection(
     "/{connection_id}/sync",
     dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))],
 )
+@_CONNECTION_DOC.route("action", summary="Синхронизировать подключение",
+                       errors=(OBJECT_NOT_FOUND, FORBIDDEN_RESOURCE, CONNECTION_INVALID))
 async def sync_connection_now(
     connection_id: int,
     payload: TokenPayload = Depends(require_access),

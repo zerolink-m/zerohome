@@ -76,6 +76,10 @@ class CursedMiddleware:
                 return
 
             if scope["method"] == "OPTIONS":
+                has_contract = getattr(scope["app"].state, "cursed_has_contract", None)
+                if has_contract and has_contract(scope["path"]):
+                    await self.app(scope, receive, send_wrapper)
+                    return
                 info = options_info(scope)
                 if info is None:
                     exc = AppError(codes.ROUTE_NOT_FOUND, "Route not found")

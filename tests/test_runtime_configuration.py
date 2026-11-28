@@ -39,7 +39,7 @@ def test_runtime_environment_is_limited_to_database_bootstrap(monkeypatch):
     monkeypatch.setenv("BOOTSTRAP_JWT_SECRET_SESSION", "explicit-import-secret")
     assert Settings(_env_file=None).JWT_SECRET_SESSION == "explicit-import-secret"
     assert "VERSION" not in Settings.model_fields
-    assert APP_VERSION == "4.9.0"
+    assert APP_VERSION == "5.0.0"
 
 
 def test_local_capability_and_global_switch_both_gate_workers():

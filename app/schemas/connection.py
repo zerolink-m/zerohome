@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, WithJsonSchema, model_validator
 
 from app.schemas.base import NonNullablePatch, StrictModel
 
@@ -24,6 +24,34 @@ TUYA_ENDPOINTS: dict[str, str] = {
     "in":   "openapi.tuyain.com",
     "sg":   "openapi-sg.iotbing.com",
 }
+
+
+_NONEMPTY = {"type": "string", "minLength": 1}
+_TUYA_META = {
+    "type": "object", "additionalProperties": False,
+    "required": ["access_id", "access_secret", "endpoint"],
+    "properties": {
+        "access_id": _NONEMPTY,
+        "access_secret": {**_NONEMPTY, "writeOnly": True},
+        "endpoint": {"type": "string", "enum": sorted(set(TUYA_ENDPOINTS) | set(TUYA_ENDPOINTS.values()))},
+        "tuya_uid": {},
+    },
+}
+_UFANET_META = {
+    "type": "object", "additionalProperties": False,
+    "required": ["contract", "password"],
+    "properties": {
+        "contract": {**_NONEMPTY, "pattern": r"\S"},
+        "password": {**_NONEMPTY, "pattern": r"\S", "writeOnly": True},
+    },
+}
+_InputMeta = Annotated[dict[str, Any], WithJsonSchema({"oneOf": [_TUYA_META, _UFANET_META]})]
+_OutputMeta = Annotated[dict[str, Any], WithJsonSchema({
+    "type": "object",
+    "description": "Provider identifiers only. Access secrets and passwords are omitted.",
+    "properties": {name: {} for name in ("access_id", "endpoint", "tuya_uid", "contract")},
+    "additionalProperties": False,
+})]
 
 
 def _validate_tuya_meta(meta: dict) -> None:
@@ -65,9 +93,15 @@ def _validate_ufanet_meta(meta: dict) -> None:
 
 
 class ConnectionCreate(StrictModel):
+    model_config = ConfigDict(json_schema_extra={"allOf": [
+        {"if": {"required": ["provider"], "properties": {"provider": {"const": provider}}},
+         "then": {"properties": {"meta": schema}}}
+        for provider, schema in (("tuya_cloud", _TUYA_META), ("ufanet-smart-home", _UFANET_META))
+    ]})
+
     provider: Literal["tuya_cloud", "ufanet-smart-home"]
     name: str = Field(min_length=1, max_length=255)
-    meta: dict[str, Any]
+    meta: _InputMeta
     enabled: Literal[0, 1] = 1
 
     @model_validator(mode="after")
@@ -84,7 +118,7 @@ class ConnectionPatch(NonNullablePatch, StrictModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
     enabled: Literal[0, 1] | None = None
-    meta: dict[str, Any] | None = None
+    meta: _InputMeta | None = Field(default=None, description="New credentials for the existing provider.")
 
 
 class ConnectionOut(StrictModel):
@@ -92,7 +126,7 @@ class ConnectionOut(StrictModel):
     uid: int
     provider: str
     name: str
-    meta: dict[str, Any]
+    meta: _OutputMeta
     enabled: int
     status: str
     last_checked_at: int | None

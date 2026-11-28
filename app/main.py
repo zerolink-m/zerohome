@@ -5,6 +5,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import settings
+from app.core.cursed_api import create_cursed_api, integrate_contracts
 from app.db.session import AsyncSessionLocal
 from app.core.errors import (
     AppError,
@@ -22,6 +23,7 @@ from app.services.storage import get_storage
 from app.services.runtime_configuration import initialize_runtime_configuration
 from app.services.cluster import media_server, runner as cluster_runner
 from app.services.cluster.identity import worker_enabled
+from app.version import APP_VERSION
 from app.services import (
     connection_sync,
     healthcheck,
@@ -130,6 +132,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="ZeroCams",
+        version=APP_VERSION,
         lifespan=lifespan,
         docs_url="/v1/docs",
         redoc_url=None,
@@ -152,14 +155,17 @@ def create_app() -> FastAPI:
             response.headers["Expires"] = "0"
         return response
 
-    app.include_router(service.router)
+    cursed_api = create_cursed_api()
+    service.register_cursed_routes(cursed_api)
     app.include_router(config.router)
     app.include_router(auth.router)
     app.include_router(users.router)
     app.include_router(sessions.router)
+    sessions.register_session_list(cursed_api)
     app.include_router(cams.router)
     app.include_router(switches.router)
     app.include_router(connections.router)
+    connections.register_connection_list(cursed_api)
     app.include_router(invitations.router)
     app.include_router(shares.router)
     app.include_router(push_settings.router)
@@ -167,6 +173,7 @@ def create_app() -> FastAPI:
     app.include_router(stats.router)
     app.include_router(cluster.router)
     app.include_router(webrtc.router)
+    integrate_contracts(app, cursed_api)
 
     return app
 

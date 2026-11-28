@@ -22,6 +22,7 @@ click==8.5.0
 colorama==0.4.6
 contourpy==1.4.0
 cryptography==50.0.2
+cursedapi-server[sqlalchemy]==0.2.0
 cuda-bindings==13.4.4
 cuda-pathfinder==1.8.4
 cuda-toolkit==13.0.3.0
