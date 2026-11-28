@@ -162,6 +162,14 @@ SEARCH_LENGTH_MISMATCH = '300'
 CONNECTION_INVALID = '393'
 PARTIAL_CONTENT = '394'
 NO_CONTENT = '395'
+INVITATION_ALREADY_EXISTS = '396'
+INVITATION_OWNER_FORBIDDEN = '397'
+CONNECTION_DISABLED = '398'
+IMPORTED_CAMERA_READ_ONLY = '399'
+IMPORTED_CAMERA_DELETE_VIA_CONNECTION = '400'
+ONVIF_CAMERA_AUTH_REJECTED = '401'
+ONVIF_CAMERA_TIMEOUT = '402'
+CLOUD_CAMERA_REQUIRES_HLS = '403'
 SERVER_ERROR = '332'
 DATABASE_ERROR = '334'
 FILE_STORAGE_ERROR = '336'
@@ -199,6 +207,14 @@ _SERVICE_CODES = (
     ("CONNECTION_INVALID", CONNECTION_INVALID, 400, "The connection is invalid or its parameters are wrong."),
     ("PARTIAL_CONTENT", PARTIAL_CONTENT, 206, "Partial content."),
     ("NO_CONTENT", NO_CONTENT, 204, "No content."),
+    ("INVITATION_ALREADY_EXISTS", INVITATION_ALREADY_EXISTS, 400, "The recipient is already invited to this device."),
+    ("INVITATION_OWNER_FORBIDDEN", INVITATION_OWNER_FORBIDDEN, 400, "The device owner cannot be invited to the device."),
+    ("CONNECTION_DISABLED", CONNECTION_DISABLED, 400, "The connection is disabled."),
+    ("IMPORTED_CAMERA_READ_ONLY", IMPORTED_CAMERA_READ_ONLY, 400, "The imported camera is read-only."),
+    ("IMPORTED_CAMERA_DELETE_VIA_CONNECTION", IMPORTED_CAMERA_DELETE_VIA_CONNECTION, 400, "The imported camera can only be deleted with its connection."),
+    ("ONVIF_CAMERA_AUTH_REJECTED", ONVIF_CAMERA_AUTH_REJECTED, 409, "The camera rejected ONVIF authentication or locked the account."),
+    ("ONVIF_CAMERA_TIMEOUT", ONVIF_CAMERA_TIMEOUT, 409, "The camera did not respond to the ONVIF request in time."),
+    ("CLOUD_CAMERA_REQUIRES_HLS", CLOUD_CAMERA_REQUIRES_HLS, 400, "Use HLS to stream this cloud camera."),
 )
 
 
@@ -209,9 +225,14 @@ def register_cursed_codes(registry: CodeRegistry) -> None:
         raise ValueError("ZeroHome codes require a cursedapi 1.2 registry")
     # Check every extension before mutating the registry so collisions cannot
     # leave a partially registered service.
+    names: set[str] = set()
+    numbers: set[str] = set()
     for name, number, _, _ in _SERVICE_CODES:
-        if getattr(registry, name, None) is not None or registry.by_number(number) is not None:
+        if (name in names or number in numbers or getattr(registry, name, None) is not None
+                or registry.by_number(number) is not None):
             raise ValueError(f"ZeroHome code {name} ({number}) conflicts with an existing registration")
+        names.add(name)
+        numbers.add(number)
     for name, number, status, detail in _SERVICE_CODES:
         registry.register(name, number, detail, status)
 

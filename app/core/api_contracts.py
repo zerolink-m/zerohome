@@ -254,13 +254,15 @@ def _raw(endpoint, summary, media, *, description="", streaming=False, errors=()
                       header_schema=RangeHeaders if file_range else None)(endpoint)
 
 
-def _crud(module, prefix, singular, plural, read, create=None, patch=None, *, id_name="id", errors=(), note="", create_response=None, names=None, optional_delete_body=False):
+def _crud(module, prefix, singular, plural, read, create=None, patch=None, *, id_name="id", errors=(), operation_errors=None, note="", create_response=None, names=None, optional_delete_body=False):
     contract = CrudContract(singular, plural, read, id_name=id_name)
     names = names or {}
+    operation_errors = operation_errors or {}
     def apply(name, operation, summary, **kwargs):
         endpoint = getattr(module, names.get(name, name + "_" + prefix), None)
         if endpoint is not None:
-            contract.route(operation, summary=summary, description=note, errors=errors, **kwargs)(endpoint)
+            contract.route(operation, summary=summary, description=note,
+                           errors=(*errors, *operation_errors.get(operation, ())), **kwargs)(endpoint)
     apply("list", "list", f"Список: {plural}")
     apply("get", "get", f"Получить: {singular}")
     apply("get_bulk", "get", f"Получить несколько: {plural}", bulk=True)
@@ -283,7 +285,9 @@ def register_contracts():
           names={"list": "list_users", "create_bulk": "create_users_bulk", "get_bulk": "get_users_bulk", "patch_bulk": "patch_users_bulk", "delete_bulk": "delete_users_bulk"})
     _action(users.get_current_user, "Данные текущего пользователя", response=UserOut, result_key="user", errors=(codes.OBJECT_NOT_FOUND,))
     _crud(cams, "cam", "cam", "cams", CamRead, CamCreate, CamPatch,
-          errors=(codes.OBJECT_NOT_FOUND, codes.FORBIDDEN_RESOURCE, codes.CONNECTION_INVALID),
+          errors=(codes.OBJECT_NOT_FOUND, codes.FORBIDDEN_RESOURCE),
+          operation_errors={"patch": (codes.IMPORTED_CAMERA_READ_ONLY,),
+                            "delete": (codes.IMPORTED_CAMERA_DELETE_VIA_CONNECTION,)},
           note="Владелец и admin получают полную запись, включая учётные данные; приглашённый получает ограниченную. Импортированную камеру нельзя изменять и удалять отдельно.",
           names={"list":"list_cams", "create_bulk":"create_cams", "get_bulk":"get_cams_bulk", "patch_bulk":"patch_cams_bulk", "delete_bulk":"delete_cams_bulk"})
     _crud(switches, "switch", "switch", "switches", SwitchRead, SwitchCreateContract, SwitchPatchContract, id_name="switch_id",
@@ -291,7 +295,9 @@ def register_contracts():
           note="Владелец и admin получают полную запись, включая control_metadata; приглашённый получает ограниченную. Импортированные устройства доступны для чтения и управления.",
           names={"list":"list_switches", "create_bulk":"create_switches_bulk", "get_bulk":"get_switches_bulk", "patch_bulk":"patch_switches_bulk", "delete_bulk":"delete_switches_bulk"})
     _crud(invitations, "invitation", "invitation", "invitations", InvitationOut, InvitationCreate,
-          errors=(codes.OBJECT_NOT_FOUND, codes.FORBIDDEN_RESOURCE, codes.INVITATION_INVALID),
+          errors=(codes.OBJECT_NOT_FOUND, codes.FORBIDDEN_RESOURCE),
+          operation_errors={"create": (codes.INVITATION_INVALID, codes.INVITATION_ALREADY_EXISTS,
+                                       codes.INVITATION_OWNER_FORBIDDEN)},
           optional_delete_body=True,
           note="Создать приглашение может владелец устройства или admin; принять его может адресат или admin.",
           names={"list":"list_invitations", "create_bulk":"create_invitations_bulk", "get_bulk":"get_invitations_bulk", "delete_bulk":"delete_invitations_bulk"})
@@ -337,8 +343,8 @@ def register_contracts():
     _action(cluster.get_cluster, "Состояние кластера", response=ClusterResult, result_key="cluster", errors=(codes.FORBIDDEN_ROLE,), description="Только admin; показывает ноды, назначения и ресурсы без владельца.")
     _action(cluster.get_assignment, "Получить назначение функции", response=AssignmentOut, result_key="assignment", errors=(codes.FORBIDDEN_ROLE, codes.OBJECT_NOT_FOUND))
 
-    _action(stream_ptz.get_ptz, "Получить позицию PTZ", response=PTZPositionOut, result_key="ptz", errors=(codes.OBJECT_NOT_FOUND, codes.PTZ_NOT_CONFIGURED, codes.EXTERNAL_API_UNAVAILABLE))
-    _action(stream_ptz.move_ptz, "Передать команду PTZ", request=PTZCommandIn, key="ptz", response=PtzMoved, result_key="ptz", errors=(codes.BAD_REQUEST, codes.OBJECT_NOT_FOUND, codes.PTZ_NOT_CONFIGURED, codes.EXTERNAL_API_UNAVAILABLE),
+    _action(stream_ptz.get_ptz, "Получить позицию PTZ", response=PTZPositionOut, result_key="ptz", errors=(codes.OBJECT_NOT_FOUND, codes.PTZ_NOT_CONFIGURED, codes.ONVIF_CAMERA_AUTH_REJECTED, codes.ONVIF_CAMERA_TIMEOUT, codes.EXTERNAL_API_UNAVAILABLE))
+    _action(stream_ptz.move_ptz, "Передать команду PTZ", request=PTZCommandIn, key="ptz", response=PtzMoved, result_key="ptz", errors=(codes.BAD_REQUEST, codes.OBJECT_NOT_FOUND, codes.PTZ_NOT_CONFIGURED, codes.ONVIF_CAMERA_AUTH_REJECTED, codes.ONVIF_CAMERA_TIMEOUT, codes.EXTERNAL_API_UNAVAILABLE),
             request_example={"ptz": {"pan": 0.25, "tilt": 0.0}}, examples={"id": 1, "pan": 0.25, "tilt": 0.0, "zoom": None})
     _action(stream_ptz.update_onvif_settings, "Обновить настройки ONVIF", request=CamOnvifPatch, key="onvif", response=OnvifResult, result_key="onvif", code=codes.EDITED,
             errors=(codes.BAD_REQUEST, codes.OBJECT_NOT_FOUND, codes.FORBIDDEN_RESOURCE))
@@ -348,7 +354,7 @@ def register_contracts():
     CrudContract("recording", "recordings", RecordingOut).route("list", summary="Список записей камеры", description="Фильтры from и to задаются в секундах Unix; записи локальные.", request_query=RecordingsQuery, errors=(codes.OBJECT_NOT_FOUND, codes.VALIDATION_ERROR, codes.RECORDING_NOT_CONFIGURED))(recordings_routes.list_cam_recordings)
     _action(recordings_routes.get_cam_recording_meta, "Получить сведения о записи", response=RecordingOut, result_key="recording", errors=(codes.OBJECT_NOT_FOUND, codes.VALIDATION_ERROR, codes.RECORDING_NOT_CONFIGURED))
 
-    _raw(stream_ptz.stream_cam, "Непрерывный fragmented MP4 поток", ("video/mp4",), streaming=True, errors=(codes.BAD_REQUEST, codes.SERVER_ERROR), description="Поток читается до отключения клиента; облачным камерам доступен HLS.")
+    _raw(stream_ptz.stream_cam, "Непрерывный fragmented MP4 поток", ("video/mp4",), streaming=True, errors=(codes.BAD_REQUEST, codes.CLOUD_CAMERA_REQUIRES_HLS, codes.SERVER_ERROR), description="Поток читается до отключения клиента; облачным камерам доступен HLS.")
     _raw(stream_ptz.get_live_snapshot, "JPEG-снимок камеры", ("image/jpeg",), errors=(codes.BAD_GATEWAY, codes.SERVER_ERROR))
     _raw(recordings_routes.get_cam_recording_file, "Скачать файл записи", ("video/mp4",), file_range=True, errors=(codes.VALIDATION_ERROR, codes.RECORDING_NOT_CONFIGURED), description="Поддерживаются Range и If-Range. Доступны только локальные MP4-записи.")
     _raw(recordings_routes.get_cam_recording_snapshot, "Получить JPEG-кадр записи", ("image/jpeg",), errors=(codes.INVALID_QUERY, codes.VALIDATION_ERROR, codes.RECORDING_NOT_CONFIGURED, codes.SERVER_ERROR), description="Необязательный at задаёт позицию в секундах.")

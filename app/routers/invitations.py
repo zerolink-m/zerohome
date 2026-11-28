@@ -5,7 +5,10 @@ from sqlalchemy import func, select, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import FORBIDDEN_RESOURCE, INVITATION_INVALID, OBJECT_NOT_FOUND
+from app.core.codes import (
+    FORBIDDEN_RESOURCE, INVITATION_ALREADY_EXISTS, INVITATION_INVALID,
+    INVITATION_OWNER_FORBIDDEN, OBJECT_NOT_FOUND,
+)
 from app.core.errors import AppError
 from app.core.introspection import supports
 from app.core.response import bulk, bulk_listing, created, deleted, edited, failed_item, listing, single
@@ -72,6 +75,16 @@ async def _get_visible_invitation(id: int, payload: TokenPayload, db: AsyncSessi
     return invitation, user
 
 
+async def _invitation_exists(body: InvitationCreate, db: AsyncSession) -> bool:
+    return (await db.execute(
+        select(Invitation.id).where(
+            Invitation.device_type == body.device_type,
+            Invitation.device_id == body.device_id,
+            func.lower(Invitation.email) == body.email.lower(),
+        )
+    )).first() is not None
+
+
 async def _build_invitation(body: InvitationCreate, payload: TokenPayload, db: AsyncSession) -> Invitation:
     if body.device_type == "cams":
         device = await db.get(Cam, body.device_id)
@@ -85,19 +98,10 @@ async def _build_invitation(body: InvitationCreate, payload: TokenPayload, db: A
 
     owner = await db.get(User, device.ownuser)
     if owner is not None and owner.email.lower() == body.email.lower():
-        raise AppError(INVITATION_INVALID, "Нельзя пригласить владельца устройства")
+        raise AppError(INVITATION_OWNER_FORBIDDEN, "Нельзя пригласить владельца устройства")
 
-    existing = (
-        await db.execute(
-            select(Invitation).where(
-                Invitation.device_type == body.device_type,
-                Invitation.device_id == body.device_id,
-                func.lower(Invitation.email) == body.email.lower(),
-            )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        raise AppError(INVITATION_INVALID, "Этот email уже приглашён на устройство")
+    if await _invitation_exists(body, db):
+        raise AppError(INVITATION_ALREADY_EXISTS, "Этот email уже приглашён на устройство")
 
     return Invitation(
         device_type=body.device_type,
@@ -167,7 +171,8 @@ async def create_invitation(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise AppError(INVITATION_INVALID, "Этот email уже приглашён на устройство") from exc
+        code = INVITATION_ALREADY_EXISTS if await _invitation_exists(body, db) else INVITATION_INVALID
+        raise AppError(code, "Этот email уже приглашён на устройство") from exc
 
     return created("invitation", _to_out(invitation))
 
@@ -188,19 +193,23 @@ async def create_invitations_bulk(
         key = (item.device_type, item.device_id, item.email.lower())
         try:
             if key in seen:
-                raise AppError(INVITATION_INVALID, "Этот email повторяется в запросе для устройства")
+                # Partial writes are committed per item; an earlier successful
+                # item is already invited. Atomic duplicates are still 390.
+                code = INVITATION_ALREADY_EXISTS if partial else INVITATION_INVALID
+                raise AppError(code, "Этот email повторяется в запросе для устройства")
             invitation = await _build_invitation(item, payload, db)
-            seen.add(key)
             if partial:
                 db.add(invitation)
                 try:
                     await db.commit()
                 except IntegrityError as exc:
                     await db.rollback()
-                    raise AppError(INVITATION_INVALID, "Этот email уже приглашён на устройство") from exc
+                    code = INVITATION_ALREADY_EXISTS if await _invitation_exists(item, db) else INVITATION_INVALID
+                    raise AppError(code, "Этот email уже приглашён на устройство") from exc
                 succeeded.append(_to_out(invitation))
             else:
                 pending.append((index, invitation))
+            seen.add(key)
         except AppError as exc:
             if not partial:
                 await db.rollback()
@@ -213,11 +222,24 @@ async def create_invitations_bulk(
             await db.commit()
         except IntegrityError as exc:
             await db.rollback()
-            raise AppError(INVITATION_INVALID, "Приглашение уже существует") from exc
+            code = INVITATION_INVALID
+            for _, item in body.valid():
+                if await _invitation_exists(item, db):
+                    code = INVITATION_ALREADY_EXISTS
+                    break
+            raise AppError(code, "Приглашение уже существует") from exc
         succeeded = [_to_out(invitation) for _, invitation in pending]
 
     failed.sort(key=lambda entry: entry["id"])
-    return bulk("invitations", succeeded, failed, op="create", partial=partial)
+    all_failed_code = None
+    if partial and failed and not succeeded:
+        causes = {getattr(item, "code", None) for item in failed}
+        invitation_codes = {INVITATION_INVALID, INVITATION_ALREADY_EXISTS, INVITATION_OWNER_FORBIDDEN}
+        if len(causes) > 1 and causes <= invitation_codes:
+            # These causes all returned 390/400 before their dedicated codes.
+            all_failed_code = INVITATION_INVALID
+    return bulk("invitations", succeeded, failed, op="create", partial=partial,
+                all_failed_code=all_failed_code)
 
 @router.post("/{id}/accept", dependencies=[Depends(rate_limit("invitations_write", capacity=20, per_minute=20))])
 async def accept_invitation(

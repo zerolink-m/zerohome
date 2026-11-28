@@ -3,7 +3,7 @@ from base64 import urlsafe_b64encode
 import pytest
 
 from app.core.codes import (
-    BULK_LIMIT_EXCEEDED, CONNECTION_INVALID, EMPTY_BODY, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR,
+    BULK_LIMIT_EXCEEDED, CONNECTION_DISABLED, CONNECTION_INVALID, EMPTY_BODY, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR,
 )
 from tests.conftest import bearer, mint_test_token
 
@@ -275,7 +275,8 @@ async def test_sync_endpoint(client, users, _mock_ext):
     assert r.json()["code"] == "000" and r.json()["data"]["connection"]["id"] == cid
     assert _mock_ext["sync"] == [cid]
     r = await client.post(f"/v1/connections/{dis}/sync", headers=bearer(await tok(o)))
-    assert r.json()["code"] == CONNECTION_INVALID
+    assert r.status_code == 400 and r.json()["code"] == CONNECTION_DISABLED == "398"
+    assert _mock_ext["sync"] == [cid]
 
 
 async def test_bulk_create_get(client, users):

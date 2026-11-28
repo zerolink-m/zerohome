@@ -1,9 +1,13 @@
 """onvif_client: protocol errors -> AppError, auth-denied backoff (no network)."""
+import asyncio
+
 import httpx
 import pytest
 import zeep.exceptions
 
-from app.core.codes import EXTERNAL_API_UNAVAILABLE, PTZ_NOT_CONFIGURED
+from app.core.codes import (
+    EXTERNAL_API_UNAVAILABLE, ONVIF_CAMERA_AUTH_REJECTED, ONVIF_CAMERA_TIMEOUT, PTZ_NOT_CONFIGURED,
+)
 from app.core.config import settings
 from app.core.errors import AppError
 from app.services import onvif_client, snapshot
@@ -63,7 +67,8 @@ async def test_fault_locked_is_not_500(fake):
     fake.error = zeep.exceptions.Fault(LOCKED)
     with pytest.raises(AppError) as ei:
         await onvif_client.get_status(FakeCam())
-    assert ei.value.code == PTZ_NOT_CONFIGURED
+    assert ei.value.code == ONVIF_CAMERA_AUTH_REJECTED == "401"
+    assert isinstance(ei.value, onvif_client._AuthDenied)
     assert "secret" not in str(ei.value)
 
 
@@ -72,11 +77,14 @@ async def test_fault_auth_variants(fake, msg):
     fake.error = zeep.exceptions.Fault(msg)
     with pytest.raises(AppError) as ei:
         await onvif_client.get_status(FakeCam())
-    assert ei.value.code == PTZ_NOT_CONFIGURED
+    assert ei.value.code == ONVIF_CAMERA_AUTH_REJECTED
     assert 9 in onvif_client._auth_denied
 
 
-@pytest.mark.parametrize("err", [httpx.ConnectError("boom"), OSError("net"), zeep.exceptions.XMLParseError("bad xml")])
+@pytest.mark.parametrize("err", [
+    httpx.ConnectError("boom"), httpx.ReadTimeout("transport timeout"),
+    OSError("net"), zeep.exceptions.XMLParseError("bad xml"),
+])
 async def test_other_errors_map_to_unavailable_without_backoff(fake, err):
     fake.error = err
     with pytest.raises(AppError) as ei:
@@ -94,10 +102,85 @@ async def test_backoff_skips_camera(fake):
     for fn in (onvif_client.get_status, onvif_client.get_snapshot_uri, onvif_client.get_snapshot):
         with pytest.raises(AppError) as ei:
             await fn(cam)
-        assert ei.value.code == PTZ_NOT_CONFIGURED
+        assert ei.value.code == ONVIF_CAMERA_AUTH_REJECTED
+        assert isinstance(ei.value, onvif_client._AuthDenied)
     with pytest.raises(AppError):
         await onvif_client.absolute_move(cam, 0.1, None, None)
     assert (fake.calls, fake.inits) == (1, 1)
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_ptz_auth_error_and_backoff_are_cursed_responses(client, mk_user, mk_cam, fake, method):
+    from tests.conftest import bearer, mint_test_token
+
+    owner = await mk_user("onvif-auth@example.org")
+    camera_id = await mk_cam(owner, control_proto="onvif")
+    headers = bearer(await mint_test_token(owner))
+    fake.error = zeep.exceptions.Fault("not authorized: sensitive-camera-password")
+    for _ in range(2):
+        kwargs = {"headers": headers}
+        if method == "POST":
+            kwargs["json"] = {"data": {"ptz": {"pan": 0.5}}}
+        response = await client.request(method, f"/v1/cams/{camera_id}/ptz", **kwargs)
+        assert response.status_code == 409 and response.json()["code"] == ONVIF_CAMERA_AUTH_REJECTED
+        assert "sensitive-camera-password" not in response.text
+    assert (fake.calls, fake.inits) == (1, 1)
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_ptz_timeout_is_cursed_response(client, mk_user, mk_cam, fake, method):
+    from tests.conftest import bearer, mint_test_token
+
+    owner = await mk_user("onvif-timeout@example.org")
+    camera_id = await mk_cam(owner, control_proto="onvif")
+    fake.error = TimeoutError("sensitive-camera-password")
+    kwargs = {"headers": bearer(await mint_test_token(owner))}
+    if method == "POST":
+        kwargs["json"] = {"data": {"ptz": {"pan": 0.5}}}
+    response = await client.request(method, f"/v1/cams/{camera_id}/ptz", **kwargs)
+    assert response.status_code == 409 and response.json()["code"] == ONVIF_CAMERA_TIMEOUT == "402"
+    assert "sensitive-camera-password" not in response.text
+
+
+async def test_onvif_deadline_emits_timeout_code(monkeypatch):
+    monkeypatch.setattr(settings, "ONVIF_TIMEOUT_SECONDS", 0.001)
+
+    async def slow_camera():
+        await asyncio.sleep(1)
+
+    with pytest.raises(onvif_client._CameraTimeout) as exc:
+        await onvif_client._with_timeout(slow_camera(), 9)
+    assert exc.value.code == ONVIF_CAMERA_TIMEOUT and exc.value.http_status == 409
+
+
+@pytest.mark.parametrize("error,kind,code", [
+    (TimeoutError("private transport details"), onvif_client._CameraTimeout, ONVIF_CAMERA_TIMEOUT),
+    (zeep.exceptions.Fault("not authorized: private transport details"), onvif_client._AuthDenied,
+     ONVIF_CAMERA_AUTH_REJECTED),
+])
+async def test_error_during_ptz_initialization_is_not_swallowed(fake, monkeypatch, error, kind, code):
+    class Media:
+        async def GetProfiles(self):
+            return [type("Profile", (), {"PTZConfiguration": object(), "token": "t"})()]
+
+    class Camera:
+        def __init__(self, *args):
+            pass
+
+        async def update_xaddrs(self):
+            pass
+
+        async def create_media_service(self):
+            return Media()
+
+        async def create_ptz_service(self):
+            raise error
+
+    monkeypatch.setattr(onvif_client, "ONVIFCamera", Camera)
+    with pytest.raises(kind) as exc:
+        await onvif_client.get_status(FakeCam())
+    assert exc.value.code == code
+    assert "private transport details" not in str(exc.value)
 
 
 async def test_invalidate_resets_backoff(fake):
@@ -173,7 +256,7 @@ async def test_download_401_final_is_denied_and_remembered(fake, monkeypatch):
     seen = _patch_http(monkeypatch, [401])
     with pytest.raises(AppError) as ei:
         await onvif_client.get_snapshot(FakeCam())
-    assert ei.value.code == PTZ_NOT_CONFIGURED and 9 in onvif_client._auth_denied
+    assert ei.value.code == ONVIF_CAMERA_AUTH_REJECTED and 9 in onvif_client._auth_denied
     with pytest.raises(AppError):
         await onvif_client.get_snapshot(FakeCam())
     assert len(seen) == 1

@@ -8,7 +8,10 @@ from dataclasses import dataclass
 
 from onvif import ONVIFCamera
 
-from app.core.codes import BAD_REQUEST, EXTERNAL_API_UNAVAILABLE, PTZ_NOT_CONFIGURED
+from app.core.codes import (
+    BAD_REQUEST, EXTERNAL_API_UNAVAILABLE, ONVIF_CAMERA_AUTH_REJECTED,
+    ONVIF_CAMERA_TIMEOUT, PTZ_NOT_CONFIGURED,
+)
 from app.core.config import settings
 from app.core.errors import AppError
 from app.models.cams import Cam
@@ -39,6 +42,10 @@ _cache_locks: dict[int, asyncio.Lock] = {}
 
 class _AuthDenied(AppError):
     """The camera rejected the ONVIF credentials (or locked the account)."""
+
+
+class _CameraTimeout(AppError):
+    """An ONVIF request timed out, including while initializing PTZ."""
 
 
 # cam.id -> monotonic deadline until which the camera is not contacted over ONVIF
@@ -73,7 +80,7 @@ def _is_auth_error(exc: BaseException) -> bool:
 
 
 def _auth_denied_error() -> AppError:
-    return _AuthDenied(PTZ_NOT_CONFIGURED, _AUTH_MESSAGE)
+    return _AuthDenied(ONVIF_CAMERA_AUTH_REJECTED, _AUTH_MESSAGE)
 
 
 def _check_backoff(cam_id: int) -> None:
@@ -108,7 +115,7 @@ async def _with_timeout(coro, cam_id: int | None = None):
     except AppError:
         raise
     except asyncio.TimeoutError as exc:
-        raise AppError(PTZ_NOT_CONFIGURED, "Камера не отвечает (ONVIF)") from exc
+        raise _CameraTimeout(ONVIF_CAMERA_TIMEOUT, "Камера не отвечает (ONVIF)") from exc
     except Exception as exc:
         raise _translate(cam_id, exc) from exc
     if cam_id is not None:
@@ -174,7 +181,7 @@ async def _build_context(cam: Cam) -> _PTZContext:
                 pan_range = _Range(pt_space.XRange.Min, pt_space.XRange.Max)
                 tilt_range = _Range(pt_space.YRange.Min, pt_space.YRange.Max)
                 zoom_range = _Range(zoom_space.XRange.Min, zoom_space.XRange.Max)
-        except _AuthDenied:
+        except (_AuthDenied, _CameraTimeout):
             raise
         except Exception as exc:
             logger.warning(f"[ONVIF] Cam {cam.id}: не удалось инициализировать PTZ ({exc})")

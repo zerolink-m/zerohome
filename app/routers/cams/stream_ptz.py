@@ -6,7 +6,10 @@ from fastapi import Depends, Request
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import BAD_REQUEST, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, PTZ_NOT_CONFIGURED, SERVER_ERROR
+from app.core.codes import (
+    BAD_REQUEST, CLOUD_CAMERA_REQUIRES_HLS, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND,
+    PTZ_NOT_CONFIGURED, SERVER_ERROR,
+)
 from app.core.errors import AppError
 from app.core.introspection import supports
 from app.core.rate_limit import PointBudget, rate_limit
@@ -51,7 +54,7 @@ async def stream_cam(
     cam = await _get_cam_for_access(id, ctx, db)
 
     if cam.connection_resource_id is not None:
-        raise AppError(BAD_REQUEST, "Для облачной камеры доступен HLS")
+        raise AppError(CLOUD_CAMERA_REQUIRES_HLS, "Для облачной камеры доступен HLS")
 
     cost = STREAM_ATTACH_COST if await stream_manager.has_active_session(cam.id) else STREAM_OPEN_COST
     await STREAM_BUDGET.charge(request, cost)

@@ -57,3 +57,66 @@ def test_zero_home_rejects_existing_code_assignment_before_registration():
         codes.register_cursed_codes(registry)
     assert registry.by_number(codes.FRONTEND_UPDATE_AVAILABLE) is None
     assert registry.by_number(codes.CONNECTION_INVALID) is registry.UNRELATED_CODE
+
+
+def test_service_codes_are_unique_and_keep_published_assignments():
+    expected = {
+        "FRONTEND_UPDATE_AVAILABLE": ("384", 200),
+        "TUYA_LOCAL_NOT_ALLOWED": ("385", 403),
+        "RECORDING_NOT_ALLOWED": ("386", 403),
+        "FRONTEND_UPDATE_NEEDED": ("387", 403),
+        "PTZ_NOT_CONFIGURED": ("388", 409),
+        "RECORDING_NOT_CONFIGURED": ("389", 409),
+        "INVITATION_INVALID": ("390", 400),
+        "PUSH_INVALID": ("391", 400),
+        "SHARE_INVALID": ("392", 400),
+        "CONNECTION_INVALID": ("393", 400),
+        "PARTIAL_CONTENT": ("394", 206),
+        "NO_CONTENT": ("395", 204),
+        "INVITATION_ALREADY_EXISTS": ("396", 400),
+        "INVITATION_OWNER_FORBIDDEN": ("397", 400),
+        "CONNECTION_DISABLED": ("398", 400),
+        "IMPORTED_CAMERA_READ_ONLY": ("399", 400),
+        "IMPORTED_CAMERA_DELETE_VIA_CONNECTION": ("400", 400),
+        "ONVIF_CAMERA_AUTH_REJECTED": ("401", 409),
+        "ONVIF_CAMERA_TIMEOUT": ("402", 409),
+        "CLOUD_CAMERA_REQUIRES_HLS": ("403", 400),
+    }
+    names = [entry[0] for entry in codes._SERVICE_CODES]
+    numbers = [entry[1] for entry in codes._SERVICE_CODES]
+    assert len(names) == len(set(names)) and len(numbers) == len(set(numbers))
+    standard = get_profile("1.2").new_codes()
+    assert all(getattr(standard, name, None) is None for name in names)
+    assert all(standard.by_number(number) is None for number in numbers)
+    codes.register_cursed_codes(standard)
+    for name, (number, status) in expected.items():
+        entry = getattr(standard, name)
+        assert getattr(codes, name) == entry.code == number
+        assert entry.http_status == codes.http_status(number) == status
+        assert entry.code_detail == codes.code_detail(number) and entry.code_detail
+
+
+@pytest.mark.parametrize("number,detail", [
+    ("396", "The recipient is already invited to this device."),
+    ("397", "The device owner cannot be invited to the device."),
+    ("398", "The connection is disabled."),
+    ("399", "The imported camera is read-only."),
+    ("400", "The imported camera can only be deleted with its connection."),
+    ("401", "The camera rejected ONVIF authentication or locked the account."),
+    ("402", "The camera did not respond to the ONVIF request in time."),
+    ("403", "Use HLS to stream this cloud camera."),
+])
+def test_new_service_code_details(number, detail):
+    assert codes.code_detail(number) == detail
+
+
+@pytest.mark.parametrize("duplicate", [
+    ("FRONTEND_UPDATE_AVAILABLE", "511", 200, "Duplicate name."),
+    ("UNRELATED_CODE", "384", 200, "Duplicate number."),
+])
+def test_duplicate_service_entries_do_not_partially_register(monkeypatch, duplicate):
+    registry = get_profile("1.2").new_codes()
+    monkeypatch.setattr(codes, "_SERVICE_CODES", (*codes._SERVICE_CODES, duplicate))
+    with pytest.raises(ValueError, match="conflicts"):
+        codes.register_cursed_codes(registry)
+    assert registry.by_number("384") is None

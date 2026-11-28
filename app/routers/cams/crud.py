@@ -4,7 +4,10 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.codes import CONNECTION_INVALID, FORBIDDEN_RESOURCE, OBJECT_NOT_FOUND, VALIDATION_ERROR
+from app.core.codes import (
+    FORBIDDEN_RESOURCE, IMPORTED_CAMERA_DELETE_VIA_CONNECTION, IMPORTED_CAMERA_READ_ONLY,
+    OBJECT_NOT_FOUND, VALIDATION_ERROR,
+)
 from app.core.config import settings
 from app.core.errors import AppError
 from app.core.introspection import supports
@@ -54,13 +57,13 @@ _STREAM_SOURCE_FIELDS = frozenset({"enabled", "protocol", "address", "port", "pa
 
 def _ensure_imported_cam_read_only(cam: Cam) -> None:
     if cam.connection_resource_id is not None:
-        raise AppError(CONNECTION_INVALID, "Импортированная камера доступна только для чтения")
+        raise AppError(IMPORTED_CAMERA_READ_ONLY, "Импортированная камера доступна только для чтения")
 
 
 def _ensure_imported_cam_not_deleted(cam: Cam) -> None:
     if cam.connection_resource_id is not None:
         raise AppError(
-            CONNECTION_INVALID,
+            IMPORTED_CAMERA_DELETE_VIA_CONNECTION,
             "Импортированную камеру можно удалить только вместе с соединением",
         )
 
@@ -151,7 +154,7 @@ def _bulk_reject(failures: list[tuple], partial: bool):
 
 
 def _failed(failures: list[tuple]) -> list[dict]:
-    return [failed_item(i, msg) for i, _, msg in failures]
+    return [failed_item(i, msg, code) for i, code, msg in failures]
 
 
 # --- single -------------------------------------------------------------------

@@ -1,6 +1,8 @@
 import pytest
 
-from app.core.codes import CONNECTION_INVALID
+from app.core.codes import (
+    CLOUD_CAMERA_REQUIRES_HLS, IMPORTED_CAMERA_DELETE_VIA_CONNECTION, IMPORTED_CAMERA_READ_ONLY,
+)
 from app.models.connection import Connection, ConnectionResource
 from app.services.connection_sync.ufanet_cameras import materialize_ufanet_cameras
 from tests.conftest import bearer, mint_test_token
@@ -25,7 +27,21 @@ async def test_imported_camera_is_enabled_and_read_only(client, mk_user, session
     response = await client.get(f'/v1/cams/{camera_id}', headers=headers)
     assert response.status_code == 200, response.text
     response = await client.patch(f'/v1/cams/{camera_id}', headers=headers, json={'data': {'cam': {'enabled': 0}}})
-    assert response.json()['code'] == CONNECTION_INVALID, response.text
+    assert response.status_code == 400 and response.json()['code'] == IMPORTED_CAMERA_READ_ONLY == '399', response.text
+    response = await client.delete(f'/v1/cams/{camera_id}', headers=headers)
+    assert response.status_code == 400 and response.json()['code'] == IMPORTED_CAMERA_DELETE_VIA_CONNECTION == '400', response.text
+    response = await client.get(f'/v1/cams/{camera_id}/stream', headers=headers)
+    assert response.status_code == 400 and response.json()['code'] == CLOUD_CAMERA_REQUIRES_HLS == '403', response.text
+
+    for partial in (False, True):
+        response = await client.patch(f'/v1/cams/bulk/{camera_id}', headers=headers, json={
+            'data': {'cams': [{'name': 'forbidden'}]}, 'options': {'partial_allowed': partial},
+        })
+        assert response.status_code == 400 and response.json()['code'] == IMPORTED_CAMERA_READ_ONLY
+        response = await client.delete(f'/v1/cams/bulk/{camera_id}', headers=headers,
+                                       params={'partial_allowed': str(partial).lower()})
+        assert response.status_code == 400 and response.json()['code'] == IMPORTED_CAMERA_DELETE_VIA_CONNECTION
+
     response = await client.get('/v1/cams', headers=headers)
     assert response.status_code == 200, response.text
     assert any(cam['id'] == camera_id and cam['enabled'] == 1 for cam in response.json()['data']['cams'])

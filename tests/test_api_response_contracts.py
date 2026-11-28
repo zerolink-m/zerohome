@@ -158,6 +158,56 @@ async def test_discovery_parameters_auth_and_actual_json(client, mk_user):
     assert any(v['code'] == codes.TOKEN_FORMAT_INVALID for response in refresh.values() for v in response.get('x-cursedapi-variants', []))
 
 
+async def test_new_service_errors_are_documented_with_their_http_status(client):
+    document = (await client.get('/v1/openapi.json')).json()['paths']
+    names = {getattr(codes, name): name for name in (
+        'INVITATION_ALREADY_EXISTS', 'INVITATION_OWNER_FORBIDDEN', 'CONNECTION_DISABLED',
+        'IMPORTED_CAMERA_READ_ONLY', 'IMPORTED_CAMERA_DELETE_VIA_CONNECTION',
+        'ONVIF_CAMERA_AUTH_REJECTED', 'ONVIF_CAMERA_TIMEOUT', 'CLOUD_CAMERA_REQUIRES_HLS',
+    )}
+    cases = [
+        ('/v1/invitations', 'post', 400, {codes.INVITATION_ALREADY_EXISTS, codes.INVITATION_OWNER_FORBIDDEN}),
+        ('/v1/invitations/bulk', 'post', 400, {codes.INVITATION_ALREADY_EXISTS, codes.INVITATION_OWNER_FORBIDDEN}),
+        ('/v1/connections/{connection_id}/sync', 'post', 400, {codes.CONNECTION_DISABLED}),
+        ('/v1/cams/{id}', 'patch', 400, {codes.IMPORTED_CAMERA_READ_ONLY}),
+        ('/v1/cams/{id}', 'delete', 400, {codes.IMPORTED_CAMERA_DELETE_VIA_CONNECTION}),
+        ('/v1/cams/bulk/{ids}', 'patch', 400, {codes.IMPORTED_CAMERA_READ_ONLY}),
+        ('/v1/cams/bulk/{ids}', 'delete', 400, {codes.IMPORTED_CAMERA_DELETE_VIA_CONNECTION}),
+        ('/v1/cams/{id}/ptz', 'get', 409, {codes.ONVIF_CAMERA_AUTH_REJECTED, codes.ONVIF_CAMERA_TIMEOUT}),
+        ('/v1/cams/{id}/ptz', 'post', 409, {codes.ONVIF_CAMERA_AUTH_REJECTED, codes.ONVIF_CAMERA_TIMEOUT}),
+        ('/v1/cams/{id}/stream', 'get', 400, {codes.CLOUD_CAMERA_REQUIRES_HLS}),
+    ]
+    for path, method, status, expected in cases:
+        responses = document[path][method]['responses']
+        variants = responses[str(status)]['x-cursedapi-variants']
+        assert expected <= {variant['code'] for variant in variants}, (path, method)
+        for variant in variants:
+            if variant['code'] in expected:
+                assert variant['code_name'] == names[variant['code']]
+                assert variant['content_type'] == 'application/json'
+        for other_status, response in responses.items():
+            if other_status != str(status):
+                assert not expected.intersection(variant['code'] for variant in response.get('x-cursedapi-variants', []))
+
+
+async def test_invitation_bulk_partial_and_failure_contracts(client):
+    paths = (await client.get('/v1/openapi.json')).json()['paths']
+    responses = paths['/v1/invitations/bulk']['post']['responses']
+    expected = {
+        '201': {codes.PARTIALLY_CREATED},
+        '400': {codes.INVITATION_INVALID, codes.INVITATION_ALREADY_EXISTS, codes.INVITATION_OWNER_FORBIDDEN},
+        '422': {codes.VALIDATION_ERROR},
+    }
+    for status, code_set in expected.items():
+        variants = responses[status]['x-cursedapi-variants']
+        assert code_set <= {variant['code'] for variant in variants}
+        for variant in variants:
+            if variant['code'] in code_set:
+                assert variant['content_type'] == 'application/json'
+                assert variant['schema']['properties']['code']['const'] == variant['code']
+                assert codes.http_status(variant['code']) == int(status)
+
+
 async def test_global_rate_limit_matches_public_and_raw_contracts(client, monkeypatch):
     from app.core import middleware
     from app.core.errors import AppError

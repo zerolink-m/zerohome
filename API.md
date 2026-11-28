@@ -38,7 +38,7 @@ Base URL: `/v1`. JSON-ответы и общие соглашения соотв
 - `data` всегда присутствует. Обычный list GET возвращает `settings` и массив ресурса; bulk GET возвращает массив ресурса без `settings`.
 - Для не-JSON ответа конверта нет: код передаётся в `cursed-code`; `cursed-version` обязателен и там. Для CursedJSON заголовок `cursed-code` не дублирует поле `code`.
 
-Полный справочник — [`docs/cursedapi/docs/codes.md`](docs/cursedapi/docs/codes.md). ZeroHome использует именованные константы `app/core/codes.py`; номера стандартных кодов отличаются от v1.1.
+Справочник стандартных кодов — [`docs/cursedapi/docs/codes.md`](docs/cursedapi/docs/codes.md), реестр сервисных кодов — [`docs/migration_codes.md`](docs/migration_codes.md). ZeroHome использует именованные константы `app/core/codes.py`; номера стандартных кодов отличаются от v1.1.
 
 ### 1.2 Request object
 
@@ -72,11 +72,24 @@ JSON-тела с данными используют Request object:
 | `167`, `170`, `177` | 401 | Ошибка токена / токен истёк / токен не передан |
 | `186`, `189` | 403 | Недостаточно роли / доступ к объекту запрещён |
 | `215`, `217`, `226` | 404 / 404 / 405 | Объект не найден / маршрут не найден / метод не разрешён |
-| `297`, `300` | 400 | Пустая позиция списка / длины списков поиска не совпадают |
+| `297`, `300` | 422 | Пустая позиция списка / длины списков поиска не совпадают |
 | `314`, `319`, `321` | 429 | Общий лимит / лимит попыток входа / лимит endpoint-а |
 | `384–511` | зависит от кода | Пространство сервисных кодов; см. справочник и `app/core/codes.py` |
 
-Это краткая выборка, не полный список. Для интеграций сверяйтесь с актуальным справочником v1.2 и именованными константами проекта.
+Это краткая выборка, не полный список. Для интеграций сверяйтесь со стандартом v1.2 и [реестром сервисных кодов](docs/migration_codes.md). Код — строка из трёх цифр, не HTTP-статус. Новые прикладные ошибки:
+
+| Код | HTTP | Константа | Ситуация |
+|---|---:|---|---|
+| `396` | 400 | `INVITATION_ALREADY_EXISTS` | Этот адрес уже приглашён к устройству. |
+| `397` | 400 | `INVITATION_OWNER_FORBIDDEN` | Попытка пригласить владельца устройства. |
+| `398` | 400 | `CONNECTION_DISABLED` | Ручная синхронизация отключённого соединения. |
+| `399` | 400 | `IMPORTED_CAMERA_READ_ONLY` | Попытка изменить импортированную камеру. |
+| `400` | 400 | `IMPORTED_CAMERA_DELETE_VIA_CONNECTION` | Попытка удалить импортированную камеру отдельно от соединения. |
+| `401` | 409 | `ONVIF_CAMERA_AUTH_REJECTED` | Камера отклонила ONVIF-авторизацию или заблокировала её; включая период backoff. |
+| `402` | 409 | `ONVIF_CAMERA_TIMEOUT` | Время ожидания ONVIF-ответа от камеры истекло. |
+| `403` | 400 | `CLOUD_CAMERA_REQUIRES_HLS` | Для обычного stream облачной камеры вместо этого следует использовать HLS. |
+
+Эти коды заменяют более общие в перечисленных случаях; старые коды `384–395` остаются зарегистрированными для остальных сценариев. Например, `"401"` в поле `code` означает ошибку ONVIF с HTTP 409, а не HTTP 401.
 
 ### 1.4 Аутентификация
 
@@ -414,11 +427,11 @@ OPTIONS учитывает глобальный rate limit.
 | POST | `/v1/cams` | access | `data.cam = {…}` | `039`, `data.cam` (владелец — вызвавший) | `269` |
 | POST | `/v1/cams/bulk` | access | `data.cams[]` | Bulk `039`/`041` | `269`, `073`, `132` |
 | GET | `/v1/cams/bulk/{ids}` | access | — | `data.cams[]` в порядке ids; любой отсутствующий/невидимый id → `215` для всего запроса | `215`, `269`, `132` |
-| PATCH | `/v1/cams/bulk/{ids}` | access (владелец/admin) | `data.cams[]` — i-й патч к i-му id | Bulk `002`/`004` | `189`, `215`, `269`, `132` |
-| DELETE | `/v1/cams/bulk/{ids}` | access (владелец/admin) | необязательный Request body с `options.partial_allowed` или `?partial_allowed` | Bulk `009`/`012`, `[{id}]` | `189`, `215`, `269`, `132` |
+| PATCH | `/v1/cams/bulk/{ids}` | access (владелец/admin) | `data.cams[]` — i-й патч к i-му id | Bulk `002`/`004` | `189`, `215`, `269`, `132`, `399` |
+| DELETE | `/v1/cams/bulk/{ids}` | access (владелец/admin) | необязательный Request body с `options.partial_allowed` или `?partial_allowed` | Bulk `009`/`012`, `[{id}]` | `189`, `215`, `269`, `132`, `400` |
 | GET | `/v1/cams/{id}` | access (видимая) | — | `data.cam` | `215` |
-| PATCH | `/v1/cams/{id}` | access (владелец/admin) | `data.cam = {…}` | `002`/`007`, `data.cam` | `189`, `215`, `269` |
-| DELETE | `/v1/cams/{id}` | access (владелец/admin) | — | `009`, `data.cam = {"id": n}` | `189`, `215` |
+| PATCH | `/v1/cams/{id}` | access (владелец/admin) | `data.cam = {…}` | `002`/`007`, `data.cam` | `189`, `215`, `269`, `399` |
+| DELETE | `/v1/cams/{id}` | access (владелец/admin) | — | `009`, `data.cam = {"id": n}` | `189`, `215`, `400` |
 
 Сортировка/поиск по: `id, name, address, protocol, enabled, added_at, updated_at`. Без `sort_by` порядок по `id`. Удаление камеры останавливает стрим/HLS, удаляет приглашения и share-ссылки. Rate limit: чтение 60 / 60 (`cams_read`), запись 20 / 20 (`cams_write`).
 
@@ -428,14 +441,15 @@ OPTIONS учитывает глобальный rate limit.
 
 | Метод | Путь | Тело | Ответ | Ошибки |
 |---|---|---|---|---|
-| GET | `/v1/cams/{id}/stream` | — | **custom**: поток `video/mp4` (fragmented MP4) | `167`–`177`, `215`, `321`, `332` |
-| GET | `/v1/cams/{id}/ptz` | — | `data.ptz = {"pan": 0.0, "tilt": 0.0, "zoom": 0.0}` | `388`, `363`, `215`, auth-коды |
-| POST | `/v1/cams/{id}/ptz` | `data.ptz = {pan?, tilt?, zoom?}` (хотя бы одно, float, без NaN/Inf) | `data.ptz = {"id", "pan", "tilt", "zoom"}` (echo команды) | `388`, `363`, `059`, `269`, auth-коды |
+| GET | `/v1/cams/{id}/stream` | — | **custom**: поток `video/mp4` (fragmented MP4) | `167`–`177`, `215`, `321`, `332`, `403` |
+| GET | `/v1/cams/{id}/ptz` | — | `data.ptz = {"pan": 0.0, "tilt": 0.0, "zoom": 0.0}` | `388`, `401`, `402`, `363`, `215`, auth-коды |
+| POST | `/v1/cams/{id}/ptz` | `data.ptz = {pan?, tilt?, zoom?}` (хотя бы одно, float, без NaN/Inf) | `data.ptz = {"id", "pan", "tilt", "zoom"}` (echo команды) | `388`, `401`, `402`, `363`, `059`, `269`, auth-коды |
 | GET | `/v1/cams/{id}/snapshot` | — | **custom**: `image/jpeg` (ONVIF-снимок; иначе при `INGEST_ENABLED` и живом хабе — последний GOP хаба, декодированный локальным ffmpeg без нового подключения к камере (кадр может быть старше «сейчас» до длины GOP, ~3 с); иначе кадр через ffmpeg из RTSP). Формат ответа не меняется | `215`, `321`, `332`, auth-коды |
 
 - Стрим: ёмкость бюджета `cams_stream` 30 / 30 в мин.; открытие нового стрима стоит 10 очков, подключение к уже активному — 3.
 - Стрим при `INGEST_ENABLED`: источник — постоянный ingest камеры (перекодировка по требованию, общая для всех зрителей). Формат ответа не меняется. При перезапуске ingest (смена настроек камеры, сбой, плановый перезапуск без зрителей) поток завершается штатно, клиент должен переподключиться (новый init-сегмент).
-- PTZ: `388` — не задан `control_protocol`, камера не отвечает по ONVIF, PTZ не поддерживается или камера отклонила учётные данные ONVIF (после отказа/блокировки камера не опрашивается по ONVIF `ONVIF_AUTH_BACKOFF_SECONDS` (1800 с), ошибка отдаётся сразу; сбрасывается сменой `control_*` или ONVIF-настроек); `363` — прочая ошибка связи/протокола ONVIF; `059` — значение вне диапазона камеры. Rate limit: GET 60 / 60 (`cams_read`), POST 15 / 15 (`cams_ptz_move`).
+- PTZ: `388` — не задан `control_protocol` или PTZ не настроен/не поддерживается; `401` / HTTP 409 — камера отклонила учётные данные ONVIF или заблокировала доступ; `402` / HTTP 409 — таймаут ONVIF; `363` — прочая ошибка связи/протокола ONVIF; `059` — значение вне диапазона камеры. После отказа/блокировки камера не опрашивается по ONVIF в течение `ONVIF_AUTH_BACKOFF_SECONDS` (1800 с), код `401` отдаётся сразу; backoff сбрасывается сменой `control_*` или ONVIF-настроек. Rate limit: GET 60 / 60 (`cams_read`), POST 15 / 15 (`cams_ptz_move`).
+- Код `402` охватывает истечение `ONVIF_TIMEOUT_SECONDS` и `TimeoutError` операции ONVIF. Транспортные исключения, не являющиеся `TimeoutError` (например, `httpx.ReadTimeout`), как и прежде, преобразуются в `363` / HTTP 502, если не распознаны как отказ авторизации.
 - Снимок: 600 / 600 (`cams_snapshot_live`). Любая ошибка ONVIF-снимка (включая отказ авторизации и backoff) не отдаётся клиенту: используется фолбэк (хаб / RTSP).
 
 Ошибка до начала отдачи потока/файла — обычный конверт (например `332` при неудачном запуске стрима); после старта потока ошибка конвертом не передаётся.
@@ -579,7 +593,7 @@ HLS-сессия запускается первым запросом плейл
 | GET | `/v1/connections/{connection_id}` | access | — | `data.connection` | `215` |
 | PATCH | `/v1/connections/{connection_id}` | access (владелец/admin) | `data.connection = {…}` | `002`/`007`, `data.connection` | `189`, `215`, `269`, `393` |
 | DELETE | `/v1/connections/{connection_id}` | access (владелец/admin) | — | `009`, `data.connection = {"id": n}` | `189`, `215` |
-| POST | `/v1/connections/{connection_id}/sync` | access (владелец/admin) | — | `000`, `data.connection` | `215`, `189`, `393` (соединение выключено) |
+| POST | `/v1/connections/{connection_id}/sync` | access (владелец/admin) | — | `000`, `data.connection` | `215`, `189`, `398` (соединение выключено) |
 
 Удаление соединения удаляет его авто-выключатели и импортированные камеры вместе с их приглашениями и share-ссылками. Сортировка/поиск по: `id, provider, name, enabled, added_at, updated_at`. Rate limit: чтение 60 / 60 (`connections_read`), запись и sync 10 / 10 (`connections_write`).
 
@@ -597,15 +611,15 @@ HLS-сессия запускается первым запросом плейл
 |---|---|---|---|---|---|
 | GET | `/v1/invitations` | access | list-query | `data.invitations[]` + `settings` | query-коды |
 | GET | `/v1/invitations/{id}` | access (видимое) | — | `data.invitation` | `215` |
-| POST | `/v1/invitations/bulk` | access (владелец устройств/admin) | `data.invitations[]` (≤ 100) | Bulk: создание приглашений | `215`, `189`, `390`, `269`, `132` |
+| POST | `/v1/invitations/bulk` | access (владелец устройств/admin) | `data.invitations[]` (≤ 100) | Bulk: создание приглашений | `215`, `189`, `390`, `396`, `397`, `269`, `132` |
 | GET | `/v1/invitations/bulk/{ids}` | access | — | `data.invitations[]` без `settings` (до 100 ids) | `215`, `269`, `132` |
-| POST | `/v1/invitations` | access (владелец устройства/admin) | `data.invitation = {device_type: "cams"\|"switches", device_id, email}` | `039`, `data.invitation` (`status = pending`) | `215`, `189`, `390`, `269` |
+| POST | `/v1/invitations` | access (владелец устройства/admin) | `data.invitation = {device_type: "cams"\|"switches", device_id, email}` | `039`, `data.invitation` (`status = pending`) | `215`, `189`, `390`, `396`, `397`, `269` |
 | POST | `/v1/invitations/{id}/accept` | access (адресат или admin) | — | `002`/`007`, `data.invitation` | `215`, `189` |
 | POST | `/v1/invitations/{id}/decline` | access (адресат или admin) | — | `009`, `data.invitation = {"id": n}` (приглашение удаляется) | `215`, `189` |
 | DELETE | `/v1/invitations/bulk/{ids}` | access (отправитель/admin) | необязательный Request body с `options.partial_allowed` или `?partial_allowed` (до 100 ids) | Bulk `009`/`012` | `215`, `189`, `269`, `132` |
 | DELETE | `/v1/invitations/{id}` | access (отправитель, адресат или admin) | — | `009`, `data.invitation = {"id": n}` | `215`, `189` |
 
-`390` — приглашение владельца устройства или повторное приглашение того же email на то же устройство. `accept` отправителем (не адресатом и не admin) → `189`; повторный `accept` → `007`. Сортировка/поиск по: `id, device_type, device_id, email, status, invited_by, added_at, updated_at`. Rate limit: чтение 60 / 60, запись (включая accept/decline) 20 / 20.
+`396` / HTTP 400 — адрес уже приглашён к этому устройству (сравнение email без учёта регистра); `397` / HTTP 400 — попытка пригласить владельца. `390` / HTTP 400 сохраняется, например, для повтора одного адреса в ещё не выполненном атомарном bulk-запросе. При частичном bulk-успехе корневой код — `041`, причины отдельных элементов приведены в `failed[].error` без отдельного машинного кода. При полном отказе с `partial_allowed=true` однородные причины дают их общий код; разные причины только из `390`/`396`/`397` дают прежний общий `390` / HTTP 400. При смешении с другими причинами, например ошибкой валидации или прав, используется общий fallback `269` / HTTP 422. `accept` отправителем (не адресатом и не admin) → `189`; повторный `accept` → `007`. Сортировка/поиск по: `id, device_type, device_id, email, status, invited_by, added_at, updated_at`. Rate limit: чтение 60 / 60, запись (включая accept/decline) 20 / 20.
 
 ---
 

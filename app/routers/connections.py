@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.codes import (
     BULK_LIMIT_EXCEEDED,
+    CONNECTION_DISABLED,
     CONNECTION_INVALID,
     FORBIDDEN_RESOURCE,
     OBJECT_NOT_FOUND,
@@ -576,7 +577,7 @@ async def delete_connection(
     dependencies=[Depends(rate_limit("connections_write", capacity=10, per_minute=10))],
 )
 @_CONNECTION_DOC.route("action", summary="Синхронизировать подключение",
-                       errors=(OBJECT_NOT_FOUND, FORBIDDEN_RESOURCE, CONNECTION_INVALID))
+                       errors=(OBJECT_NOT_FOUND, FORBIDDEN_RESOURCE, CONNECTION_DISABLED))
 async def sync_connection_now(
     connection_id: int,
     payload: TokenPayload = Depends(require_access),
@@ -590,7 +591,7 @@ async def sync_connection_now(
         raise AppError(FORBIDDEN_RESOURCE, "Синхронизация доступна только владельцу или admin")
 
     if conn.enabled != 1:
-        raise AppError(CONNECTION_INVALID, "Соединение отключено (enabled=0)")
+        raise AppError(CONNECTION_DISABLED, "Соединение отключено (enabled=0)")
 
     await connection_sync.sync_connection_now(conn.id)
     await db.refresh(conn)
