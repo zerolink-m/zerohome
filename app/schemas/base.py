@@ -18,6 +18,28 @@ class NonNullablePatch(BaseModel):
 
     non_nullable: ClassVar[tuple[str, ...]] = ()
 
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema, handler):
+        # These fields use None as the Python default so omission is allowed;
+        # the validator below rejects an explicitly supplied JSON null. Reflect
+        # that distinction in the generated request schema too.
+        schema = handler(core_schema)
+        for name in cls.non_nullable:
+            prop = schema.get("properties", {}).get(name)
+            if not prop:
+                continue
+            choices = prop.get("anyOf")
+            if choices:
+                choices = [choice for choice in choices if choice != {"type": "null"}]
+                if len(choices) == 1:
+                    prop.pop("anyOf")
+                    prop.update(choices[0])
+                else:
+                    prop["anyOf"] = choices
+            if prop.get("default", ...) is None:
+                prop.pop("default")
+        return schema
+
     @field_validator("*", mode="after")
     @classmethod
     def _reject_null(cls, v, info):

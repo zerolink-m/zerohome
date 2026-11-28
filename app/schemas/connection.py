@@ -45,7 +45,14 @@ _UFANET_META = {
         "password": {**_NONEMPTY, "pattern": r"\S", "writeOnly": True},
     },
 }
-_InputMeta = Annotated[dict[str, Any], WithJsonSchema({"oneOf": [_TUYA_META, _UFANET_META]})]
+_InputMeta = Annotated[dict[str, Any], WithJsonSchema({
+    "oneOf": [_TUYA_META, _UFANET_META],
+    "description": (
+        "Форма зависит от provider: для tuya_cloud обязательны access_id, access_secret и endpoint, "
+        "tuya_uid необязателен; для ufanet-smart-home обязательны contract и password. "
+        "access_secret и password — секреты и не возвращаются при чтении подключения."
+    ),
+})]
 _OutputMeta = Annotated[dict[str, Any], WithJsonSchema({
     "type": "object",
     "description": "Provider identifiers only. Access secrets and passwords are omitted.",

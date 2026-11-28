@@ -173,6 +173,15 @@ def create_app() -> FastAPI:
     app.include_router(stats.router)
     app.include_router(cluster.router)
     app.include_router(webrtc.router)
+    # These declarations describe the existing handlers; they do not replace them.
+    from app.core.api_contracts import register_contracts
+    from app.core.introspection import _flatten
+    for route in _flatten(app.router.routes):
+        endpoint = getattr(route, "endpoint", None)
+        if endpoint is not None and not getattr(endpoint, "zerohome_contract", None):
+            # Preserve OPTIONS advertising that existed before the new contracts.
+            endpoint.zerohome_existing_options = True
+    register_contracts()
     integrate_contracts(app, cursed_api)
 
     return app

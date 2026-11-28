@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 from cursedapi.fastapi import ResponseSpec
 
-from app.core.codes import SUCCESS, cursed_code
+from app.core.codes import RATE_LIMITED, SUCCESS, cursed_code
 from app.core.response import CURSED_VERSION, success
 from app.version import APP_VERSION
 
@@ -30,10 +30,13 @@ def version_info() -> VersionInfo:
 
 def register_cursed_routes(api):
     success_code = cursed_code(api.codes, SUCCESS)
+    global_limit = ResponseSpec(cursed_code(api.codes, RATE_LIMITED),
+                                "Общий лимит запросов исчерпан; повторите позже.")
 
     @api.public_action(
         "GET", "/v1/health", summary="Готовность API",
-        responses={"healthy": ResponseSpec(success_code, "API доступен.", schema=HealthData)},
+        responses={"healthy": ResponseSpec(success_code, "API доступен.", schema=HealthData),
+                   "rate_limited": global_limit},
     )
     async def health_action(ctx):
         return ctx.respond("healthy", data=HealthData(status="ok"))
@@ -41,7 +44,8 @@ def register_cursed_routes(api):
     @api.public_action(
         "GET", "/v1/version", summary="Версии приложения и API",
         responses={"version": ResponseSpec(success_code, "Версии API и приложения.",
-                                          schema=VersionInfo, response_key="version")},
+                                          schema=VersionInfo, response_key="version"),
+                   "rate_limited": global_limit},
     )
     async def version_action(ctx):
         return ctx.respond("version", data=version_info())

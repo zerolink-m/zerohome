@@ -16,6 +16,7 @@ from cursedapi.filtering import FilterLimits, filter_schema
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.security import HTTPBearer
+from pydantic import Field, create_model
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.exceptions import HTTPException
 from starlette.responses import Response
@@ -25,6 +26,7 @@ from app.core import codes
 from app.core.errors import AppError, error_response, http_exception_handler, validation_error_handler
 from app.core.introspection import CANONICAL_FUNCTIONS, _flatten, declare, options_headers, options_info, route_info
 from app.core.response import CURSED_ENVELOPE_MARKER, build_metadata, success
+from app.core.websocket_docs import WEBSOCKET_CONTRACT, websocket_markdown
 from app.db.session import get_db
 from app.deps.auth import get_bearer_token, require_access
 from app.deps.cursed_query import ZeroHomeProfile12
@@ -78,6 +80,11 @@ class ZeroHomeAPI(CursedAPI):
 
     def public_action(self, method, path, **config):
         """Register a public action that does not attempt bearer authentication."""
+        config["responses"] = _common_response_specs(
+            self, config.get("responses", {}), public=True,
+            validation=any(config.get(key) for key in ("path_schema", "query_schema", "header_schema", "input_schema")),
+            body=config.get("input_schema") is not None,
+        )
         register = self.action(method, path, principal=lambda: None, **config)
 
         def decorate(handler):
@@ -154,6 +161,27 @@ def _response_specs(api: ZeroHomeAPI, responses: Mapping[str, ResponseSpec]):
     return {name: resolve(spec) for name, spec in responses.items()}
 
 
+def _common_response_specs(api: ZeroHomeAPI, responses: Mapping[str, ResponseSpec], *, public=False,
+                           validation=False, body=False):
+    """Override the library's generic descriptions through named ResponseSpecs."""
+    result = _response_specs(api, responses)
+    common = [(codes.SERVER_ERROR, "Сервер не смог выполнить запрос; повторите позже или передайте request_id администратору.")]
+    if not public:
+        common.append((codes.FORBIDDEN, "Доступ к действию запрещён; проверьте права пользователя."))
+    if validation:
+        common.append((codes.VALIDATION_ERROR, "Поля запроса неверны; проверьте error.fields, error.query и error.path."))
+    if body:
+        common.append((codes.EMPTY_BODY, "Не передано обязательное тело запроса либо массив объектов пуст."))
+    for code, description in common:
+        if any(spec.resolve(api.codes).code == code and spec.content_type == "application/json" for spec in result.values()):
+            continue
+        name = f"zerohome_common_{code}"
+        while name in result:
+            name += "_"
+        result[name] = ResponseSpec(codes.cursed_code(api.codes, code), description)
+    return result
+
+
 def describe_generated_route(
     api: ZeroHomeAPI, path: str, method: str, *, summary="", description="",
     query_schema=None, header_schema=None, path_schema=None, responses=None,
@@ -165,7 +193,7 @@ def describe_generated_route(
     entry.parameters = {location: model for location, model in (
         ("path", path_schema), ("query", query_schema), ("headers", header_schema),
     ) if model is not None}
-    entry.responses = _response_specs(api, responses or {})
+    entry.responses = _common_response_specs(api, responses or {}, validation=True)
 
 
 def _documented_handler():
@@ -226,10 +254,56 @@ def _envelope_details(schema, status):
     }
 
 
+def _hls_raw_header(path, status, variant):
+    """FileResponse on the streaming HLS route keeps the streaming header.
+
+    ResponseSpec maps each code to one status. The actual middleware uses 017
+    for every raw status of this streaming route, including 206, 400 and 416.
+    """
+    if (path == "/v1/cams/{id}/hls/{segment}" and int(status) in (206, 400, 416)
+            and variant.get("content_type") != "application/json"):
+        variant["code"] = codes.STREAMING
+        variant["code_name"] = "STREAMING"
+
+
+def _example_metadata(example):
+    """Examples need the metadata always added by ZeroHome's envelope builder."""
+    if isinstance(example, dict) and {"code", "data", "metadata"} <= example.keys():
+        example["metadata"] = {
+            "request_id": "00000000-0000-4000-8000-000000000000",
+            "generated_at": 1760000000,
+            "duration": 0.001,
+            "cursed_version": "1.2",
+        }
+
+
+def _drop_public_forbidden(variants):
+    """The library adds a generic forbidden response even to public actions."""
+    return [variant for variant in variants if variant.get("code") != codes.FORBIDDEN]
+
+
+def _drop_openapi_code(responses, status, code):
+    response = responses.get(status)
+    if not response or "x-cursedapi-variants" not in response:
+        return
+    remaining = [variant for variant in response["x-cursedapi-variants"] if variant.get("code") != code]
+    if not remaining:
+        del responses[status]
+        return
+    response["x-cursedapi-variants"] = remaining
+    response["description"] = "\n\n".join(dict.fromkeys(v["description"] for v in remaining))
+    media = response.get("content", {}).get("application/json")
+    shapes = [variant["schema"] for variant in remaining
+              if variant.get("content_type") == "application/json" and "schema" in variant]
+    if media and shapes:
+        media["schema"] = shapes[0] if len(shapes) == 1 else {"oneOf": shapes}
+
+
 def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
     """Add generated contracts to the existing OpenAPI and per-path discovery."""
     legacy = create_cursed_api()
     contracts: dict[tuple[str, str], tuple[LegacyContract, str]] = {}
+    existing_options: set[tuple[str, str]] = set()
     known_paths = set()
     for route in _flatten(app.router.routes):
         methods = getattr(route, "methods", None)
@@ -243,12 +317,53 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
         if contract is None:
             continue
         args = dict(contract.arguments)
-        args["responses"] = _response_specs(legacy, args.get("responses", {}))
+        auth = route_info(route)["auth"]
+        # The live HLS dependency performs authorization inside a wrapper,
+        # which route_info cannot see. Discovery must not treat it as public.
+        if route.endpoint.__module__ == "app.routers.cams.hls":
+            auth = "bearer,token"
+        # FastAPI already validates these parameters. Reuse its declarations in
+        # discovery instead of replacing typed ids by generic strings.
+        dependent = getattr(route, "dependant", None)
+        if dependent is not None and not args.get("path_schema") and dependent.path_params:
+            args["path_schema"] = create_model(
+                f"LegacyPath{len(contracts)}",
+                **{field.name: (field.field_info.annotation, field.field_info)
+                   for field in dependent.path_params},
+            )
+
+        def query_fields(dep):
+            yield from dep.query_params
+            for child in dep.dependencies:
+                yield from query_fields(child)
+
+        if dependent is not None:
+            base = args.get("query_schema")
+            existing = set(base.model_fields) if base else set()
+            extra = {field.name: (field.field_info.annotation, field.field_info)
+                     for field in query_fields(dependent) if field.name not in existing}
+            # The legacy envelope parser accepts this query on every body route;
+            # options.partial_allowed in the JSON body takes precedence.
+            if args.get("input_schema") is not None and "partial_allowed" not in existing and "partial_allowed" not in extra:
+                extra["partial_allowed"] = (str | None, Field(
+                    default=None, description="true/false (также 1/0, yes/no, on/off); options.partial_allowed в теле имеет приоритет.",
+                ))
+            if extra:
+                args["query_schema"] = create_model(
+                    f"LegacyQuery{len(contracts)}", __base__=base, **extra,
+                ) if base else create_model(f"LegacyQuery{len(contracts)}", **extra)
+        args["responses"] = _common_response_specs(
+            legacy, args.get("responses", {}), public=auth == "off",
+            validation=any(args.get(key) for key in ("path_schema", "query_schema", "header_schema", "input_schema")),
+            body=args.get("input_schema") is not None and contract.body_required,
+        )
         for method in methods:
             key = (path, method)
             if key in contracts:
                 raise ValueError(f"Duplicate cursedapi contract: {method} {path}")
-            contracts[key] = (contract, route_info(route)["auth"])
+            contracts[key] = (contract, auth)
+            if getattr(route.endpoint, "zerohome_existing_options", False):
+                existing_options.add(key)
             legacy.action(method, path, **args)(_documented_handler)
 
     # Publish schemas solely for routes with declared contracts.
@@ -291,6 +406,12 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
                     continue
                 methods[method] = api._describe(*capability)
                 entry, _, filters, _, _ = capability
+                if type(entry.policy) is Policy and "403" in methods[method]["responses"]:
+                    remaining = _drop_public_forbidden(methods[method]["responses"]["403"])
+                    if remaining:
+                        methods[method]["responses"]["403"] = remaining
+                    else:
+                        del methods[method]["responses"]["403"]
                 if filters:
                     limits = entry.resource.filter_limits or FilterLimits()
                     methods[method].setdefault("query", {})["filter"] = filter_schema(filters, limits)
@@ -308,6 +429,20 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
                 methods[method] = None
                 continue
             method_schema = endpoint_schema(entry, {}, legacy.codes)
+            if not contract.body_required:
+                status = str(codes.http_status(codes.EMPTY_BODY))
+                variants = [variant for variant in method_schema["responses"].get(status, ())
+                            if variant.get("code") != codes.EMPTY_BODY]
+                if variants:
+                    method_schema["responses"][status] = variants
+                else:
+                    method_schema["responses"].pop(status, None)
+            if auth == "off" and "403" in method_schema["responses"]:
+                remaining = _drop_public_forbidden(method_schema["responses"]["403"])
+                if remaining:
+                    method_schema["responses"]["403"] = remaining
+                else:
+                    del method_schema["responses"]["403"]
             if method_schema.get("request"):
                 method_schema["request"]["required"] = contract.body_required
                 _legacy_request_shape(method_schema["request"]["body_schema"])
@@ -317,7 +452,9 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
         for schema in methods.values():
             for status, variants in schema["responses"].items():
                 for variant in variants:
-                    if "body_schema" in variant:
+                    _hls_raw_header(template, status, variant)
+                    _example_metadata(variant.get("example"))
+                    if variant.get("content_type") == "application/json" and "body_schema" in variant:
                         _envelope_details(variant["body_schema"], int(status))
         return methods
 
@@ -353,8 +490,28 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
             "methods": methods,
         }}, headers={"Cache-Control": "private, no-store"})
 
+    async def options_principal(
+        request: Request, db: AsyncSession = Depends(get_db),
+        bearer=Depends(_bearer_scheme),
+    ):
+        template, _ = match(request.scope["path"])
+        methods = set(legacy._paths.get(template, {})) | set(api._paths.get(template, {}))
+        keys = {(template, method) for method in methods}
+        only_old_options = bool(keys) and keys <= existing_options
+        if only_old_options and all(contracts[key][1] == "off" for key in keys):
+            # Previously public OPTIONS ignored an unrelated Authorization header.
+            return None
+        try:
+            return await _optional_principal(request, db, bearer)
+        except AppError:
+            if only_old_options:
+                # Preserve the old advertised OPTIONS for bad credentials, but
+                # withhold protected schema URLs unless the token is valid.
+                return None
+            raise
+
     async def endpoint_options(
-        request: Request, principal=Depends(_optional_principal),
+        request: Request, principal=Depends(options_principal),
         db: AsyncSession = Depends(get_db),
     ):
         target_path = request.scope["path"]
@@ -362,9 +519,16 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
         methods = await describe_methods(request, target_path, template, path_params, principal, db, detailed=False)
         info = options_info(request.scope, template=template)
         declared = set(api._paths.get(template, {})) | set(legacy._paths.get(template, {}))
+        if (info["auth"] == "off" and any(
+                contracts.get((template, method), (None, "off"))[1] == "bearer,token"
+                for method in declared)):
+            # HLS authenticates inside a nested resolver that the legacy
+            # introspector cannot follow; report its actual requirement.
+            info["auth"] = "bearer,token"
         # Hand-written methods without a declaration retain their existing
         # discovery behaviour. Declared methods are restricted by their policy.
-        unavailable = declared - methods.keys()
+        unavailable = {method for method in declared - methods.keys()
+                       if (template, method) not in existing_options}
         info["methods"] = [method for method in info["methods"] if method not in unavailable]
         info["method_functions"] = {
             method: (methods[method] if methods.get(method) is not None else features)
@@ -413,6 +577,11 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
             )
             for path, methods in source["paths"].items():
                 for method, operation in methods.items():
+                    contract = contracts.get((path, method.upper()))
+                    if (contract and contract[1] == "off") or (not contract and not operation.get("security")):
+                        _drop_openapi_code(operation.get("responses", {}), "403", codes.FORBIDDEN)
+                    if contract and not contract[0].body_required:
+                        _drop_openapi_code(operation.get("responses", {}), str(codes.http_status(codes.EMPTY_BODY)), codes.EMPTY_BODY)
                     # OPTIONS and schema helper paths are excluded by the library.
                     current = document.setdefault("paths", {}).setdefault(path, {}).setdefault(method, {})
                     current_parameters = current.get("parameters", [])
@@ -425,18 +594,37 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
                     current.update(operation)
                     if generated_parameters:
                         current["parameters"] = list(generated_parameters.values())
-                    contract = contracts.get((path, method.upper()))
+                    if contract:
+                        auth = contract[1]
+                        if auth == "off":
+                            current.pop("security", None)
+                        elif auth == "bearer,token" and path != "/v1/webrtc/ice":
+                            document.setdefault("components", {}).setdefault("securitySchemes", {})[
+                                "ZeroHomeQueryToken"
+                            ] = {"type": "apiKey", "in": "query", "name": "token",
+                                 "description": "Токен сессии или ссылка с правом на запрошенный ресурс."}
+                            current["security"] = [{"ZeroHomeBearer": []}, {"ZeroHomeQueryToken": []}]
                     if contract and "requestBody" in current:
                         current["requestBody"]["required"] = contract[0].body_required
                         _legacy_request_shape(current["requestBody"]["content"]["application/json"]["schema"])
                     for status, response in operation.get("responses", {}).items():
                         for variant in response.get("x-cursedapi-variants", []):
-                            if "schema" in variant:
+                            _hls_raw_header(path, status, variant)
+                            _example_metadata(variant.get("example"))
+                            if variant.get("content_type") == "application/json" and "schema" in variant:
                                 _envelope_details(variant["schema"], int(status))
+                        if path == "/v1/cams/{id}/hls/{segment}" and int(status) in (206, 400, 416):
+                            header = response.get("headers", {}).get("cursed-code")
+                            if header:
+                                header["schema"]["enum"] = [codes.STREAMING]
                         media = response.get("content", {}).get("application/json", {})
+                        for example in media.get("examples", {}).values():
+                            _example_metadata(example.get("value"))
+                        _example_metadata(media.get("example"))
                         shape = media.get("schema", {})
                         for schema in shape.get("oneOf", [shape]):
                             _envelope_details(schema, int(status))
+        document["x-websocket"] = {WEBSOCKET_CONTRACT["path"]: WEBSOCKET_CONTRACT}
         last_document = document
         return document
 
@@ -462,4 +650,4 @@ def integrate_contracts(app: FastAPI, api: ZeroHomeAPI) -> None:
             },
             "paths": declared_paths,
         })
-        return Response(markdown, media_type="text/markdown")
+        return Response(markdown + websocket_markdown(), media_type="text/markdown")
